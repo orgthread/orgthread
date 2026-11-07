@@ -140,6 +140,13 @@ impl Login {
         }
     }
 
+    /// The path part of the public address, which may hold a long secret. Everything
+    /// lives under it, so without it a stranger finds no door and cannot cause a lock.
+    pub fn prefix(&self) -> &str {
+        let after = self.base.strip_prefix("https://").unwrap_or(&self.base);
+        after.find('/').map_or("", |i| &after[i..])
+    }
+
     pub fn resource(&self) -> String {
         format!("{}/mcp", self.base)
     }
@@ -237,10 +244,11 @@ impl Login {
             "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
              <title>orgthread login</title><body style=\"font:16px sans-serif;margin:2em auto;max-width:24em;padding:0 1em\">\
              <h1 style=\"font-size:20px\">orgthread login</h1><p>{}</p>\
-             <form method=\"post\" action=\"/authorize\">{fields}\
+             <form method=\"post\" action=\"{}/authorize\">{fields}\
              <p><input name=\"password\" type=\"password\" autofocus autocomplete=\"current-password\" style=\"width:100%;font-size:16px;padding:.5em;box-sizing:border-box\"></p>\
              <p><button style=\"font-size:16px;padding:.5em 1em\">Allow Claude to use orgthread</button></p></form>",
-            escape(message)
+            escape(message),
+            escape(self.prefix())
         ))
     }
 
@@ -491,6 +499,30 @@ mod tests {
         );
         let page = l.page(&q, "x").unwrap();
         assert!(!page.contains("<script>"));
+    }
+
+    #[test]
+    fn a_secret_in_the_address_is_the_prefix() {
+        let l = Login::new("https://door.test/s3cret/", "x");
+        assert_eq!(l.prefix(), "/s3cret");
+        assert_eq!(l.resource(), "https://door.test/s3cret/mcp");
+        assert_eq!(l.server_metadata()["issuer"], "https://door.test/s3cret");
+        assert_eq!(login().prefix(), "");
+    }
+
+    #[test]
+    fn the_login_form_posts_under_the_secret() {
+        let l = Login::new("https://door.test/s3cret", &password_hash("p"));
+        let c = client(&l);
+        let q = request(&c, "v").replace(
+            &encode("https://door.test/mcp"),
+            &encode("https://door.test/s3cret/mcp"),
+        );
+        assert!(
+            l.page(&q, "x")
+                .unwrap()
+                .contains("action=\"/s3cret/authorize\"")
+        );
     }
 
     #[test]

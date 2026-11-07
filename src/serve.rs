@@ -113,6 +113,19 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path) -> io::Result<()> {
     reader.read_exact(&mut body)?;
     let text = String::from_utf8_lossy(&body);
 
+    // The standards also look for these two with the path behind the fixed part.
+    let prefix = login.prefix();
+    if method == "GET" && path == format!("/.well-known/oauth-authorization-server{prefix}") {
+        return respond_json(&mut stream, "200 OK", &login.server_metadata());
+    }
+    if method == "GET" && path == format!("/.well-known/oauth-protected-resource{prefix}/mcp") {
+        return respond_json(&mut stream, "200 OK", &login.resource_metadata());
+    }
+    // A wrong address learns nothing, not even that this is the right server.
+    let Some(path) = path.strip_prefix(prefix) else {
+        return respond(&mut stream, "404 Not Found", "", b"");
+    };
+
     match (method, path) {
         (
             "GET",

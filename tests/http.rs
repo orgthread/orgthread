@@ -38,6 +38,9 @@ fn encode(text: &str) -> String {
 
 impl Door {
     fn open(name: &str) -> Self {
+        Self::open_at(name, BASE)
+    }
+    fn open_at(name: &str, base: &str) -> Self {
         let root =
             std::env::temp_dir().join(format!("orgthread-http-{name}-{}", std::process::id()));
         fs::create_dir_all(root.join("org/.locks")).unwrap();
@@ -49,7 +52,7 @@ impl Door {
         };
         let child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
             .args(["serve", "--http", &format!("127.0.0.1:{port}")])
-            .env("ORGTHREAD_PUBLIC_URL", BASE)
+            .env("ORGTHREAD_PUBLIC_URL", base)
             .env("ORGTHREAD_LOGIN_HASH", password_hash(PASSWORD))
             .env("ORGTHREAD_ROOT", &root)
             .env("ORGTHREAD_LOG", root.join("log"))
@@ -271,4 +274,127 @@ fn the_door_needs_its_settings() {
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
+}
+
+const SECRET_BASE: &str = "https://door.test/invented-long-secret";
+const SECRET: &str = "/invented-long-secret";
+
+#[test]
+fn without_the_secret_there_is_no_door_at_all() {
+    let d = Door::open_at("hidden", SECRET_BASE);
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+    for (method, path) in [
+        ("POST", "/mcp"),
+        ("GET", "/authorize"),
+        ("POST", "/authorize"),
+        ("POST", "/token"),
+        ("POST", "/register"),
+        ("GET", "/.well-known/oauth-protected-resource"),
+        ("GET", "/.well-known/oauth-authorization-server"),
+        ("POST", "/wrong-secret/mcp"),
+        (
+            "GET",
+            "/.well-known/oauth-authorization-server/wrong-secret",
+        ),
+    ] {
+        let r = d.raw(method, path, "", &list);
+        assert_eq!(r.status, 404, "{method} {path}");
+        assert!(r.body.is_empty());
+    }
+}
+
+#[test]
+fn claude_finds_the_login_behind_the_secret_every_standard_way() {
+    let d = Door::open_at("found", SECRET_BASE);
+    let r = d.raw("POST", &format!("{SECRET}/mcp"), "", "{}");
+    assert_eq!(r.status, 401);
+    assert!(r.head.contains(&format!(
+        "resource_metadata=\"{SECRET_BASE}/.well-known/oauth-protected-resource\""
+    )));
+    for path in [
+        format!("{SECRET}/.well-known/oauth-protected-resource"),
+        format!("/.well-known/oauth-protected-resource{SECRET}/mcp"),
+    ] {
+        let r = d.raw("GET", &path, "", "");
+        assert_eq!(r.status, 200, "{path}");
+        let v: Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["resource"], format!("{SECRET_BASE}/mcp"));
+        assert_eq!(v["authorization_servers"][0], SECRET_BASE);
+    }
+    for path in [
+        format!("{SECRET}/.well-known/oauth-authorization-server"),
+        format!("/.well-known/oauth-authorization-server{SECRET}"),
+    ] {
+        let r = d.raw("GET", &path, "", "");
+        assert_eq!(r.status, 200, "{path}");
+        let v: Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["issuer"], SECRET_BASE);
+        assert_eq!(v["token_endpoint"], format!("{SECRET_BASE}/token"));
+    }
+}
+
+#[test]
+fn the_whole_login_and_a_write_work_behind_the_secret() {
+    let d = Door::open_at("whole", SECRET_BASE);
+    let reg = d.raw(
+        "POST",
+        &format!("{SECRET}/register"),
+        "",
+        &json!({"redirect_uris": [REDIRECT]}).to_string(),
+    );
+    assert_eq!(reg.status, 201, "{}", reg.body);
+    let v: Value = serde_json::from_str(&reg.body).unwrap();
+    let client = v["client_id"].as_str().unwrap().to_string();
+    let resource = encode(&format!("{SECRET_BASE}/mcp"));
+    let query = format!(
+        "client_id={client}&redirect_uri={}&response_type=code&code_challenge={}&code_challenge_method=S256&resource={resource}",
+        encode(REDIRECT),
+        challenge_of("v2"),
+    );
+    let page = d.raw("GET", &format!("{SECRET}/authorize?{query}"), "", "");
+    assert!(
+        page.body
+            .contains(&format!("action=\"{SECRET}/authorize\""))
+    );
+    let sent = d.raw(
+        "POST",
+        &format!("{SECRET}/authorize"),
+        "",
+        &format!("{query}&password={}", encode(PASSWORD)),
+    );
+    assert_eq!(sent.status, 302, "{}", sent.body);
+    let location = sent
+        .head
+        .lines()
+        .find_map(|l| l.strip_prefix("Location: "))
+        .unwrap();
+    let code = location
+        .split("code=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let token = d.raw(
+        "POST",
+        &format!("{SECRET}/token"),
+        "",
+        &format!(
+            "grant_type=authorization_code&code={code}&client_id={client}&redirect_uri={}&code_verifier=v2&resource={resource}",
+            encode(REDIRECT)
+        ),
+    );
+    assert_eq!(token.status, 200, "{}", token.body);
+    let v: Value = serde_json::from_str(&token.body).unwrap();
+    let t = v["access_token"].as_str().unwrap();
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "write", "arguments": {"file": d.file(), "who": "c", "text": "ok\n"}},
+    });
+    let extra = format!("Authorization: Bearer {t}\r\n");
+    let r = d.raw("POST", &format!("{SECRET}/mcp"), &extra, &call.to_string());
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(fs::read(d.file()).unwrap(), b"ok\n");
+    // The right token at the address with no secret still finds nothing.
+    assert_eq!(d.raw("POST", "/mcp", &extra, &call.to_string()).status, 404);
 }
