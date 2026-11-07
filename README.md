@@ -19,3 +19,9 @@ The fingerprint is the content hash that Dropbox reports. Today the tool writes 
 `orgthread watch` is a read-only screen: the locks held now, the latest writes and refusals, and the reason for each. It cannot change a file. `orgthread watch --once` prints the same screen as plain text.
 
 Run the tests with `cargo test`. They use invented files in a temporary folder.
+
+## Licence
+
+Licensed under either of the [MIT licence](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+Unless you say otherwise, any contribution you submit for inclusion in this work is licensed under both, with no added terms or conditions.
