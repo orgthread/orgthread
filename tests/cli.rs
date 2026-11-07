@@ -203,7 +203,12 @@ fn a_held_lock_gives_exit_3() {
     fs::write(&lock, "other writer\n").unwrap();
     let o = p.write("chat", b"new\n");
     assert_eq!(code(&o), 3, "{o:?}");
-    assert!(String::from_utf8_lossy(&o.stderr).contains("other writer"));
+    let said = String::from_utf8_lossy(&o.stderr).to_lowercase();
+    assert!(said.contains("other writer"), "{said}");
+    assert!(
+        !said.contains("lock"),
+        "a chat need not know about locks: {said}"
+    );
     assert_eq!(p.text(), b"old\n");
     assert!(lock.exists());
 }

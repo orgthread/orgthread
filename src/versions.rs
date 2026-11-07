@@ -13,11 +13,27 @@ const KEEP: Duration = Duration::from_secs(30 * 24 * 3600);
 
 pub struct Versions {
     dir: PathBuf,
+    keeps: bool,
 }
 
 impl Versions {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Versions { dir: dir.into() }
+        Versions {
+            dir: dir.into(),
+            keeps: true,
+        }
+    }
+
+    /// For a place that keeps no copies, so that no text stays on its disk.
+    pub fn none() -> Self {
+        Versions {
+            dir: PathBuf::new(),
+            keeps: false,
+        }
+    }
+
+    pub fn keeps_copies(&self) -> bool {
+        self.keeps
     }
 
     fn make_dir(&self) -> io::Result<()> {

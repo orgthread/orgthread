@@ -11,10 +11,11 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 const GOOD_TOKEN: &str = "invented-token-for-tests";
 const FILE: &str = "/org/notes/invented.md";
-const LOCK: &str = "/org/.locks/org--notes--invented.md.lock";
+const LOCK: &str = "org--notes--invented.md.lock";
 
 struct Stored {
     bytes: Vec<u8>,
@@ -192,6 +193,7 @@ impl Fake {
             .env("ORGTHREAD_STORAGE", "dropbox")
             .env("ORGTHREAD_DROPBOX_API", &self.url)
             .env("ORGTHREAD_DROPBOX_CONTENT", &self.url)
+            .env("ORGTHREAD_LOCK_DIR", self.dir.join("locks"))
             .env("ORGTHREAD_LOG", self.dir.join("log"))
             .env("ORGTHREAD_READS", self.dir.join("reads"))
             .env("ORGTHREAD_VERSIONS", self.dir.join("versions"))
@@ -313,37 +315,194 @@ fn a_fresh_lock_is_respected_and_a_stale_one_taken_over() {
     let f = Fake::new();
     f.put(FILE, b"old\n");
     f.read("chat");
-    f.put(LOCK, b"other writer\n");
-    let now = std::process::Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .unwrap();
-    let now = String::from_utf8(now.stdout).unwrap().trim().to_string();
-    f.state
-        .lock()
-        .unwrap()
-        .files
-        .get_mut(LOCK)
-        .unwrap()
-        .modified = now;
+    fs::create_dir_all(f.dir.join("locks")).unwrap();
+    let lock = f.dir.join("locks").join(LOCK);
+    fs::write(&lock, "other writer\n").unwrap();
     let o = f.write("chat", b"new\n");
     assert_eq!(code(&o), 3, "{o:?}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("other writer"));
     assert_eq!(f.get(FILE).unwrap(), b"old\n");
-    assert!(f.get(LOCK).is_some());
+    assert!(lock.exists());
 
-    // The stand-in's old time makes the lock stale.
-    f.state
-        .lock()
+    // An old time makes the lock stale.
+    let old = SystemTime::now() - Duration::from_secs(3_600);
+    fs::File::options()
+        .write(true)
+        .open(&lock)
         .unwrap()
-        .files
-        .get_mut(LOCK)
-        .unwrap()
-        .modified = "2020-01-01T00:00:00Z".to_string();
+        .set_modified(old)
+        .unwrap();
     let o = f.write("chat", b"new\n");
     assert_eq!(code(&o), 0, "{o:?}");
-    assert!(String::from_utf8_lossy(&o.stderr).contains("other writer"));
+    let said = String::from_utf8_lossy(&o.stderr).to_lowercase();
+    assert!(said.contains("other writer"), "{said}");
+    assert!(
+        !said.contains("lock"),
+        "a chat need not know about locks: {said}"
+    );
     assert_eq!(f.names(), [FILE]);
+    assert!(!lock.exists());
+}
+
+#[test]
+fn a_lock_in_the_old_dropbox_folder_no_longer_counts() {
+    let f = Fake::new();
+    let s = Server::new(&f);
+    s.dropbox_settings(&f);
+    f.put(FILE, b"old\n");
+    f.put(
+        "/org/.locks/org--notes--invented.md.lock",
+        b"a cloud task\n",
+    );
+    assert_eq!(code(&s.run(&["read", FILE, "--who", "chat"], b"")), 0);
+    let o = s.run(&["write", FILE, "--who", "chat"], b"new\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(FILE).unwrap(), b"new\n");
+}
+
+/// The program alone in a folder, as on a server, with an invented home and no settings.
+struct Server {
+    folder: PathBuf,
+    home: PathBuf,
+}
+
+impl Server {
+    fn new(f: &Fake) -> Self {
+        let folder = f.dir.join("server");
+        let home = f.dir.join("home");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let folder = fs::canonicalize(folder).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_orgthread"), folder.join("orgthread")).unwrap();
+        Server { folder, home }
+    }
+    fn settings(&self, text: &str) {
+        fs::write(self.folder.join(".env"), text).unwrap();
+    }
+    fn dropbox_settings(&self, f: &Fake) {
+        // A key from outside orgthread must not be taken: this would break curl.
+        self.settings(&format!(
+            "# invented\n\nORGTHREAD_STORAGE=dropbox\nORGTHREAD_DROPBOX_API={0}\nORGTHREAD_DROPBOX_CONTENT={0}\nORGTHREAD_DROPBOX_TOKEN={GOOD_TOKEN}\nPATH=/nowhere\n",
+            f.url
+        ));
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(self.folder.join("orgthread"));
+        c.args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &self.home)
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .current_dir(&self.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    }
+    fn run(&self, args: &[&str], text: &[u8]) -> Output {
+        let mut child = self.command(args).spawn().unwrap();
+        let _ = child.stdin.take().unwrap().write_all(text);
+        child.wait_with_output().unwrap()
+    }
+}
+
+#[test]
+fn on_a_server_with_no_settings_the_message_says_what_to_set() {
+    let f = Fake::new();
+    let s = Server::new(&f);
+    for args in [
+        &["watch", "--once"][..],
+        &["read", FILE, "--who", "c"][..],
+        &["write", FILE, "--who", "c"][..],
+    ] {
+        let o = s.run(args, b"");
+        assert_eq!(code(&o), 2, "{args:?} {o:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("ORGTHREAD_ROOT"), "{err}");
+        assert!(err.contains("ORGTHREAD_STORAGE=dropbox"), "{err}");
+        assert!(
+            err.contains(s.folder.join(".env").to_str().unwrap()),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn settings_beside_the_program_let_every_command_work_there() {
+    let f = Fake::new();
+    let s = Server::new(&f);
+    s.dropbox_settings(&f);
+
+    let o = s.run(&["write", FILE, "--who", "phone"], b"secret marker\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let o = s.run(&["read", FILE, "--who", "phone"], b"");
+    assert_eq!(o.stdout, b"secret marker\n", "{o:?}");
+
+    // The lock stayed off Dropbox, and all else lives beside the program.
+    assert_eq!(f.names(), [FILE]);
+    assert!(s.folder.join(".locks").is_dir());
+    assert_eq!(fs::read_dir(s.folder.join(".locks")).unwrap().count(), 0);
+    let log = fs::read_to_string(s.folder.join("state/writes.log")).unwrap();
+    assert!(log.contains("org/notes/invented.md"), "{log}");
+    assert!(s.folder.join("state/reads").is_dir());
+    assert_eq!(fs::read_dir(&s.home).unwrap().count(), 0, "nothing at home");
+
+    // The screen shows that write and a held lock.
+    fs::write(s.folder.join(".locks").join(LOCK), "other writer\n").unwrap();
+    let o = s.run(&["watch", "--once"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let screen = String::from_utf8_lossy(&o.stdout);
+    assert!(screen.contains("written"), "{screen}");
+    assert!(screen.contains("org/notes/invented.md"), "{screen}");
+    assert!(screen.contains("other writer"), "{screen}");
+    assert!(!screen.contains("cannot read"), "{screen}");
+    fs::remove_file(s.folder.join(".locks").join(LOCK)).unwrap();
+
+    // No text stays in that folder.
+    let mut todo = vec![s.folder.clone()];
+    while let Some(dir) = todo.pop() {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                todo.push(path);
+            } else if path.file_name().unwrap() != "orgthread" {
+                let bytes = fs::read(&path).unwrap();
+                let found = bytes.windows(6).any(|w| w == b"secret");
+                assert!(!found, "text found in {}", path.display());
+            }
+        }
+    }
+}
+
+#[test]
+fn the_screen_on_a_server_needs_no_key_and_no_network() {
+    let f = Fake::new();
+    let s = Server::new(&f);
+    s.settings("ORGTHREAD_STORAGE=dropbox\n");
+    let o = s.run(&["watch", "--once"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let screen = String::from_utf8_lossy(&o.stdout);
+    assert!(screen.contains("No writes yet"), "{screen}");
+    assert!(!screen.contains("cannot read"), "{screen}");
+}
+
+#[test]
+fn the_environment_wins_over_the_settings_file() {
+    let f = Fake::new();
+    let s = Server::new(&f);
+    s.dropbox_settings(&f);
+    let elsewhere = f.dir.join("elsewhere.log");
+    let mut child = s
+        .command(&["write", FILE, "--who", "phone"])
+        .env("ORGTHREAD_LOG", &elsewhere)
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(b"text\n");
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(elsewhere.exists());
+    assert!(!s.folder.join("state/writes.log").exists());
 }
 
 #[test]
@@ -412,6 +571,7 @@ fn a_refresh_token_gets_a_fresh_key_for_a_service() {
             .env("ORGTHREAD_STORAGE", "dropbox")
             .env("ORGTHREAD_DROPBOX_API", &f.url)
             .env("ORGTHREAD_DROPBOX_CONTENT", &f.url)
+            .env("ORGTHREAD_LOCK_DIR", f.dir.join("locks"))
             .env("ORGTHREAD_LOG", f.dir.join("log"))
             .env("ORGTHREAD_READS", f.dir.join("reads"))
             .env("NO_PROXY", "127.0.0.1")
@@ -450,6 +610,7 @@ fn the_limits_hold_for_reads_and_writes() {
             .env("ORGTHREAD_DROPBOX_API", &f.url)
             .env("ORGTHREAD_DROPBOX_CONTENT", &f.url)
             .env("ORGTHREAD_DROPBOX_TOKEN", GOOD_TOKEN)
+            .env("ORGTHREAD_LOCK_DIR", f.dir.join("locks"))
             .env("ORGTHREAD_LOG", f.dir.join("log"))
             .env("ORGTHREAD_READS", f.dir.join("reads"))
             .env("ORGTHREAD_ALLOW", "/org")

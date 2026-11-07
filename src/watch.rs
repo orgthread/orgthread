@@ -246,6 +246,12 @@ pub fn diff_of(entry: &Entry, versions: &Versions) -> Result<Vec<Row>, String> {
             why(&entry.outcome)
         ));
     }
+    if !versions.keeps_copies() {
+        return Err(
+            "This server keeps no copies, so that no text stays on its disk. Dropbox keeps the old versions in its history."
+                .to_string(),
+        );
+    }
     const NO_COPY: &str = "No copy of this version. Writes from before the diff screen have none, and copies go after 30 days.";
     let load = |print: &str| match versions.load(print) {
         Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
@@ -396,6 +402,13 @@ mod tests {
         let e = diff_of(&refused, &v).unwrap_err();
         assert!(e.contains("Nothing was written"), "{e}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_diff_on_a_server_says_why_there_is_no_copy() {
+        let e = diff_of(&written("-", "abc"), &Versions::none()).unwrap_err();
+        assert!(e.contains("keeps no copies"), "{e}");
+        assert!(!e.contains("30 days"), "{e}");
     }
 
     #[test]

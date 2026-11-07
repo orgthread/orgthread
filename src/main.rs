@@ -43,12 +43,17 @@ Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
 
 Settings, from the environment:
+  A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
+  setting of this list that the environment does not hold.
+
   ORGTHREAD_ROOT      the folder all paths live in (default: ~/Library/CloudStorage/Dropbox)
   ORGTHREAD_LOCK_DIR  the lock folder inside it (default: org/.locks)
   ORGTHREAD_LOG       the log file (default: ~/.local/state/orgthread/writes.log)
   ORGTHREAD_READS     the notes of what was read (default: ~/.local/state/orgthread/reads)
   ORGTHREAD_STORAGE   dropbox: use the Dropbox API, with paths from its root, such as /org/a.md.
-                      Needs ORGTHREAD_DROPBOX_TOKEN in the environment. Keeps no copies.
+                      Needs ORGTHREAD_DROPBOX_TOKEN. Keeps no copies. For one gateway:
+                      locks, log and notes stay beside the program, in .locks and state,
+                      unless the settings above name other places on this machine.
   ORGTHREAD_ALLOW, ORGTHREAD_DENY, ORGTHREAD_READ_ONLY
                       comma-separated folders or files: what a door may touch,
                       what it may not, and what it may only read
@@ -59,12 +64,13 @@ Exit codes:
   0  done                    6  missing: this name read it, but it is gone
   1  failed, file unchanged  7  check failed, old state put back
   2  wrong use, or not text  8  written, but the log line failed
-  3  locked by a writer      9  check failed, old state NOT put back
-  4  changed: read it again  10 written, but the lock was not released or not ours
+  3  busy: another writer   9  check failed, old state NOT put back
+  4  changed: read it again  10 written, but its clean-up did not finish
   5  exists: read it first, or for --to, the copy exists
 ";
 
 fn main() -> ExitCode {
+    load_settings_file();
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
         Ok(code) => code,
@@ -75,6 +81,41 @@ fn main() -> ExitCode {
         }
     };
     ExitCode::from(code as u8)
+}
+
+/// The folder of this program, wherever it was started from.
+fn program_folder() -> Result<PathBuf, String> {
+    let program = env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
+    fs::canonicalize(&program)
+        .ok()
+        .and_then(|real| real.parent().map(Path::to_path_buf))
+        .ok_or_else(|| format!("could not find the folder of {}", program.display()))
+}
+
+/// Each `ORGTHREAD_` line of the `.env` beside the program, unless the
+/// environment holds that name already. Any other name stays out.
+fn load_settings_file() {
+    let Ok(folder) = program_folder() else {
+        return;
+    };
+    let file = folder.join(".env");
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            say(format!("could not read {}: {e}", file.display()));
+            return;
+        }
+    };
+    for line in text.lines() {
+        let Some((name, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if name.starts_with("ORGTHREAD_") && env::var_os(name).is_none() {
+            // SAFETY: the first step of main, before any other thread exists.
+            unsafe { env::set_var(name, value) };
+        }
+    }
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
@@ -313,7 +354,7 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
 
 struct Settings {
     root: PathBuf,
-    lock_dir: String,
+    locks: PathBuf,
     log: PathBuf,
     reads: PathBuf,
     versions: PathBuf,
@@ -323,9 +364,9 @@ struct Settings {
 impl Settings {
     fn storage(&self) -> Result<Box<dyn Storage>, String> {
         if self.dropbox {
-            Ok(Box::new(Dropbox::new(&self.lock_dir)?))
+            Ok(Box::new(Dropbox::new(&self.locks)?))
         } else {
-            Ok(Box::new(LocalFolder::new(&self.root, &self.lock_dir)))
+            Ok(Box::new(LocalFolder::new(&self.root, &self.locks)))
         }
     }
 
@@ -367,32 +408,55 @@ impl Settings {
 impl Settings {
     fn load() -> Result<Settings, String> {
         let dropbox = env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
-        let root = if dropbox {
-            PathBuf::new()
+        // One gateway to Dropbox: its locks and log live beside the program.
+        let (root, locks, state) = if dropbox {
+            let folder = program_folder()?;
+            let locks = match env::var_os("ORGTHREAD_LOCK_DIR") {
+                Some(dir) => folder.join(dir),
+                None => folder.join(".locks"),
+            };
+            // The first run makes it. A failure shows when a write needs it.
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            let _ = builder.create(&locks);
+            (PathBuf::new(), locks, folder.join("state"))
         } else {
             let root = match env::var_os("ORGTHREAD_ROOT") {
                 Some(root) => PathBuf::from(root),
                 None => home()?.join("Library/CloudStorage/Dropbox"),
             };
-            fs::canonicalize(&root)
-                .map_err(|e| format!("the folder {} does not exist: {e}", root.display()))?
+            let root = fs::canonicalize(&root).map_err(|e| {
+                let place = program_folder().map_or_else(|_| "beside this program".to_string(), |f| format!("in {}", f.join(".env").display()));
+                format!(
+                    "the folder {} does not exist: {e}. Set ORGTHREAD_ROOT to your folder, or ORGTHREAD_STORAGE=dropbox to use the Dropbox API, in the environment or {place}",
+                    root.display()
+                )
+            })?;
+            let lock_dir =
+                env::var("ORGTHREAD_LOCK_DIR").unwrap_or_else(|_| "org/.locks".to_string());
+            let locks = root.join(lock_dir);
+            (root, locks, home()?.join(".local/state/orgthread"))
         };
-        let lock_dir = env::var("ORGTHREAD_LOCK_DIR").unwrap_or_else(|_| "org/.locks".to_string());
         let log = match env::var_os("ORGTHREAD_LOG") {
             Some(path) => PathBuf::from(path),
-            None => home()?.join(".local/state/orgthread/writes.log"),
+            None => state.join("writes.log"),
         };
         let reads = match env::var_os("ORGTHREAD_READS") {
             Some(path) => PathBuf::from(path),
-            None => home()?.join(".local/state/orgthread/reads"),
+            None => state.join("reads"),
         };
         let versions = match env::var_os("ORGTHREAD_VERSIONS") {
             Some(path) => PathBuf::from(path),
-            None => home()?.join(".local/state/orgthread/versions"),
+            None => state.join("versions"),
         };
         Ok(Settings {
             root,
-            lock_dir,
+            locks,
             log,
             reads,
             versions,
@@ -403,15 +467,21 @@ impl Settings {
 
 fn cmd_watch(args: &[String]) -> Result<i32, String> {
     let settings = Settings::load()?;
-    let locks = settings.root.join(&settings.lock_dir);
+    let locks = &settings.locks;
+    // In Dropbox mode no text stays on the disk, so there are no copies to compare.
+    let versions = if settings.dropbox {
+        Versions::none()
+    } else {
+        Versions::new(&settings.versions)
+    };
     let result = match args {
         [] => {
             if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Err("watch needs a terminal. For plain text, use watch --once".into());
             }
-            screen::run(&locks, &settings.log, &Versions::new(&settings.versions))
+            screen::run(locks, &settings.log, &versions)
         }
-        [flag] if flag == "--once" => screen::once(&locks, &settings.log, 110, 30).map(|text| {
+        [flag] if flag == "--once" => screen::once(locks, &settings.log, 110, 30).map(|text| {
             let _ = io::stdout().write_all(text.as_bytes());
         }),
         _ => return Err("watch takes only --once".into()),
@@ -549,7 +619,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
             let _ = writeln!(io::stdout(), "written: {path}, {size} bytes");
         }
         Outcome::Locked { holder, age } => say(format!(
-            "refused, nothing written. {path} is locked since {} s by: {holder}. Try again when that writer is done.",
+            "refused, nothing written. {path} is busy since {} s with another writer: {holder}. Try again in a moment.",
             age.as_secs()
         )),
         Outcome::Changed { .. } => say(format!(
@@ -574,12 +644,12 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     }
     if let Some(old) = &report.took_over {
         say(format!(
-            "took over a stale lock older than 15 minutes, from: {old}"
+            "a writer that stopped over 15 minutes ago was cleared first: {old}"
         ));
     }
     if let Some(other) = &report.lock_lost {
         say(format!(
-            "this write no longer held its lock at the end, so another writer may have been at work. Check {path}. The lock now: {other}"
+            "another writer may have been at work during this write. Check {path}. That writer: {other}"
         ));
     }
     if let Err(e) = &logged {
@@ -590,12 +660,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     }
     if let Some(reason) = &report.lock_left {
         say(format!(
-            "the lock was NOT released: {reason}. Delete it: {}",
-            settings
-                .root
-                .join(&settings.lock_dir)
-                .join(write::lock_name(&path))
-                .display()
+            "the file is written, but orgthread's clean-up did not finish: {reason}. There is nothing to do: {path} is free again within 15 minutes."
         ));
     }
     Ok(report.exit_code(logged.is_ok()))

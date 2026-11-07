@@ -65,9 +65,9 @@ pub struct LocalFolder {
 }
 
 impl LocalFolder {
-    /// `lock_dir` is relative to `root`. It must exist already: a missing lock
-    /// folder means a wrong root, and a new one would protect nothing.
-    pub fn new(root: impl Into<PathBuf>, lock_dir: &str) -> Self {
+    /// A relative `lock_dir` starts at `root`. It must exist already: a missing
+    /// lock folder means a wrong root, and a new one would protect nothing.
+    pub fn new(root: impl Into<PathBuf>, lock_dir: impl AsRef<Path>) -> Self {
         let root = root.into();
         let locks = root.join(lock_dir);
         LocalFolder { root, locks }

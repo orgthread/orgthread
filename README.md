@@ -20,6 +20,8 @@ The fingerprint is the content hash that Dropbox reports. Today the tool writes 
 
 `orgthread serve` is the same read and write for a chat that has no shell. It speaks MCP over standard input and output, with two tools: `read` (file, who) and `write` (file, who, text). Each call starts the command itself, so the rules and the refusals are the same.
 
+On a server, the Dropbox API takes the place of the folder. Put the settings in a file `.env` beside the program, for example `ORGTHREAD_STORAGE=dropbox`. The locks stay in `.locks` and the log in `state/writes.log`, both beside the program, and no text of a file stays on the disk. `orgthread watch` works there too, with no web call. It shows no diff, as there are no copies to compare.
+
 Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## Licence

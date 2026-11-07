@@ -3,11 +3,16 @@
 //! The requests go through the `curl` program, so this needs no web library. The
 //! token stays in the environment: it never appears in a command line, a file or
 //! a message. Text goes through a pipe and is never written to disk.
+//!
+//! The locks are small local files beside the program, with no text of a file:
+//! one gateway is the one place to look, and a lock costs no web call. Between
+//! writers elsewhere, Dropbox's own version check decides.
 
-use crate::storage::{Expect, Storage, WriteError};
+use crate::storage::{Expect, LocalFolder, Storage, WriteError};
 use crate::watch::seconds_of;
 use serde_json::{Value, json};
 use std::io::{self, ErrorKind, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,8 +28,12 @@ pub struct Dropbox {
     token: String,
     api: String,
     content: String,
-    lock_dir: String,
+    /// Only its lock steps are used: every file goes to Dropbox.
+    locks: LocalFolder,
 }
+
+/// Where a rescue goes: it holds the text of a file, so it stays in Dropbox.
+const RESCUE_FOLDER: &str = "/org/.locks";
 
 struct Reply {
     status: u16,
@@ -76,7 +85,7 @@ fn refused(reply: &Reply) -> io::Error {
 }
 
 impl Dropbox {
-    pub fn new(lock_dir: &str) -> Result<Self, String> {
+    pub fn new(lock_dir: &Path) -> Result<Self, String> {
         let url = |name: &str, default: &str| std::env::var(name).unwrap_or(default.to_string());
         let mut dropbox = Dropbox {
             token: String::new(),
@@ -85,7 +94,7 @@ impl Dropbox {
                 "ORGTHREAD_DROPBOX_CONTENT",
                 "https://content.dropboxapi.com",
             ),
-            lock_dir: lock_dir.trim_matches('/').to_string(),
+            locks: LocalFolder::new(lock_dir, ""),
         };
         dropbox.token = match std::env::var(TOKEN).ok().filter(|t| !t.is_empty()) {
             Some(token) => token,
@@ -136,10 +145,6 @@ impl Dropbox {
 
     fn file(path: &str) -> String {
         format!("/{path}")
-    }
-
-    fn lock(&self, name: &str) -> String {
-        format!("/{}/{name}", self.lock_dir)
     }
 
     fn call(&self, url: &str, headers: &[String], body: Option<&[u8]>) -> io::Result<Reply> {
@@ -337,7 +342,7 @@ impl Storage for Dropbox {
 
     fn rescue(&self, path: &str, bytes: &[u8]) -> io::Result<String> {
         let name = format!("{}.{}.rescue", path.replace('/', "--"), std::process::id());
-        let full = self.lock(&name);
+        let full = format!("{RESCUE_FOLDER}/{name}");
         if self.upload(&full, json!("add"), bytes)? {
             Ok(full)
         } else {
@@ -346,38 +351,23 @@ impl Storage for Dropbox {
     }
 
     fn lock_create(&self, name: &str, line: &str) -> io::Result<bool> {
-        self.upload(
-            &self.lock(name),
-            json!("add"),
-            format!("{line}\n").as_bytes(),
-        )
+        self.locks.lock_create(name, line)
     }
 
     fn lock_read(&self, name: &str) -> io::Result<Option<String>> {
-        Ok(self
-            .download(&self.lock(name))?
-            .map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_string()))
+        self.locks.lock_read(name)
     }
 
     fn lock_age(&self, name: &str) -> io::Result<Option<Duration>> {
-        Ok(self.meta(&self.lock(name))?.map(|meta| Self::age_of(&meta)))
+        self.locks.lock_age(name)
     }
 
     fn lock_take_stale(&self, name: &str, max_age: Duration) -> io::Result<Option<String>> {
-        let full = self.lock(name);
-        let Some(meta) = self.meta(&full)? else {
-            return Ok(None);
-        };
-        if Self::age_of(&meta) <= max_age {
-            return Ok(None);
-        }
-        let line = self.lock_read(name)?.unwrap_or_default();
-        // The version check gives one winner, and it spares a fresh lock.
-        Ok(self.delete(&full, Some(&meta.rev))?.then_some(line))
+        self.locks.lock_take_stale(name, max_age)
     }
 
     fn lock_remove(&self, name: &str) -> io::Result<()> {
-        self.delete(&self.lock(name), None).map(|_| ())
+        self.locks.lock_remove(name)
     }
 }
 

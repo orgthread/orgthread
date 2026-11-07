@@ -295,8 +295,13 @@ fn change(
     // A slow read, of a file not yet on this disk, can outlast the 15 minutes.
     match held.is_ours() {
         Ok(true) => {}
-        Ok(false) => return failed("nothing written", "this write lost its lock while reading"),
-        Err(e) => return failed("could not check the lock", e),
+        Ok(false) => {
+            return failed(
+                "nothing written",
+                "another writer came in during this write",
+            );
+        }
+        Err(e) => return failed("could not check that the file is free", e),
     }
 
     match storage.write_if_unchanged(path, expect, new) {
@@ -396,7 +401,7 @@ pub fn write_unless_stopped(
     let took_over = match acquire(storage, &name, line) {
         Ok(Acquired::Yes { took_over }) => took_over,
         Ok(Acquired::No(outcome)) => return refused(outcome),
-        Err(e) => return refused(failed("could not take the lock", e)),
+        Err(e) => return refused(failed("could not reserve the file", e)),
     };
     let mut held = Held {
         storage,
@@ -409,7 +414,7 @@ pub fn write_unless_stopped(
         Ok(Release::Done) => (None, None),
         Ok(Release::NotOurs(other)) => (
             None,
-            Some(other.unwrap_or_else(|| "the lock is gone".to_string())),
+            Some(other.unwrap_or_else(|| "none left a name".to_string())),
         ),
         Err(e) => (Some(e.to_string()), None),
     };
