@@ -2,6 +2,7 @@ use orgthread::fingerprint::fingerprint;
 use orgthread::log;
 use orgthread::reads::Reads;
 use orgthread::screen;
+use orgthread::serve;
 use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage};
 use orgthread::write::{self, Outcome, exit};
@@ -23,6 +24,10 @@ For an agent, two commands:
 Give the same name each time. To change a file, read it first. A new file needs
 no read. orgthread remembers what each name read, and it refuses a write when
 the file changed since. The agent never handles anything else.
+
+For a chat with no shell:
+
+  orgthread serve                                the same read and write, as MCP tools
 
 For a person:
 
@@ -67,6 +72,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("read") => cmd_read(&args[1..]),
         Some("write") => cmd_write(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
+        Some("serve") => cmd_serve(&args[1..]),
         Some("--help" | "-h" | "help") => {
             print!("{USAGE}");
             Ok(0)
@@ -340,6 +346,20 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
         Ok(()) => Ok(0),
         Err(e) => {
             say(format!("the screen failed: {e}"));
+            Ok(exit::FAILED)
+        }
+    }
+}
+
+fn cmd_serve(args: &[String]) -> Result<i32, String> {
+    if !args.is_empty() {
+        return Err("serve takes nothing more".into());
+    }
+    let exe = env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
+    match serve::run(io::stdin().lock(), io::stdout(), &exe) {
+        Ok(()) => Ok(0),
+        Err(e) => {
+            say(format!("the server stopped: {e}"));
             Ok(exit::FAILED)
         }
     }

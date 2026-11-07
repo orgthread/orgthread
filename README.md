@@ -18,6 +18,8 @@ The fingerprint is the content hash that Dropbox reports. Today the tool writes 
 
 `orgthread watch` is a read-only screen: the locks held now, the latest writes and refusals, and the reason for each. It cannot change a file. `orgthread watch --once` prints the same screen as plain text.
 
+`orgthread serve` is the same read and write for a chat that has no shell. It speaks MCP over standard input and output, with two tools: `read` (file, who) and `write` (file, who, text). Each call starts the command itself, so the rules and the refusals are the same.
+
 Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## Licence
