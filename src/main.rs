@@ -58,6 +58,8 @@ Settings, from the environment:
                       what it may not, and what it may only read
   ORGTHREAD_VERSIONS  a copy of each version written, for the diff screen, for 30 days
                       (default: state/versions beside the program)
+  ORGTHREAD_LOGINS    the logins of a door over a restart: hashes of its tokens, no raw token
+                      and no text of a note (default: state/logins.json beside the program)
 
 Exit codes:
   0  done                    6  missing: this name read it, but it is gone
@@ -491,6 +493,25 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
     }
 }
 
+/// Where the door keeps its logins over a restart: `state/logins.json` beside the
+/// program, unless the settings name another file.
+fn logins_file() -> Result<PathBuf, String> {
+    if let Some(file) = env::var_os("ORGTHREAD_LOGINS") {
+        return Ok(PathBuf::from(file));
+    }
+    let state = program_folder()?.join("state");
+    // The first run makes it. A failure only means that chats log in again.
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    let _ = builder.create(&state);
+    Ok(state.join("logins.json"))
+}
+
 fn cmd_serve(args: &[String]) -> Result<i32, String> {
     let exe = env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
     let result = match args {
@@ -501,7 +522,8 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
             if !base.starts_with("https://") || hash.len() != 64 {
                 return Err("--http needs ORGTHREAD_PUBLIC_URL and ORGTHREAD_LOGIN_HASH".into());
             }
-            serve::run_http(address, &Login::new(&base, &hash), &exe)
+            let logins = logins_file()?;
+            serve::run_http(address, &Login::with_file(&base, &hash, &logins), &exe)
         }
         _ => return Err("serve takes nothing, or --http <address>".into()),
     };

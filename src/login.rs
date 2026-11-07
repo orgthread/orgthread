@@ -1,13 +1,16 @@
 //! The login of the door, for one person: an OAuth server, as Claude's connector
-//! expects one, with a single password. Sessions live in memory, so a restart of
-//! the service only means logging in once more.
+//! expects one, with a single password. Logins survive a restart: a small file holds
+//! the registered clients and the SHA-256 of each live token, never a token itself
+//! and never any text of a note. With no usable file, a chat simply logs in again.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CODE_LIFE: Duration = Duration::from_secs(60);
 const ACCESS_LIFE: Duration = Duration::from_secs(3600);
@@ -24,6 +27,13 @@ fn hex(bytes: &[u8]) -> String {
 
 pub fn password_hash(password: &str) -> String {
     hex(&Sha256::digest(password.as_bytes()))
+}
+
+/// Seconds since 1970: unlike an `Instant`, this still means something after a restart.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn random() -> io::Result<String> {
@@ -113,14 +123,115 @@ struct Code {
 struct Inner {
     clients: Vec<String>,
     codes: HashMap<String, Code>,
-    access: HashMap<String, Instant>,
-    refresh: HashMap<String, (String, Instant)>,
+    /// The SHA-256 of a live access token, and when it ends.
+    access: HashMap<String, u64>,
+    /// The SHA-256 of a live refresh token, its client, and when it ends.
+    refresh: HashMap<String, (String, u64)>,
     fails: Vec<Instant>,
+}
+
+impl Inner {
+    fn from_file(path: &Path, owner: &str) -> Inner {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Inner::default(),
+            Err(e) => {
+                eprintln!(
+                    "could not read {}: {e}. Chats log in again.",
+                    path.display()
+                );
+                return Inner::default();
+            }
+        };
+        Inner::from_text(&text, owner).unwrap_or_else(|| {
+            eprintln!(
+                "{} does not fit this door. Chats log in again.",
+                path.display()
+            );
+            Inner::default()
+        })
+    }
+
+    /// Nothing, unless the whole text is right and belongs to this door.
+    fn from_text(text: &str, owner: &str) -> Option<Inner> {
+        let v: Value = serde_json::from_str(text).ok()?;
+        if v["owner"].as_str()? != owner {
+            return None;
+        }
+        let mut inner = Inner::default();
+        for client in v["clients"].as_array()? {
+            inner.clients.push(client.as_str()?.to_string());
+        }
+        let extra = inner.clients.len().saturating_sub(MAX_CLIENTS);
+        inner.clients.drain(..extra);
+        let time = now();
+        for (hash, until) in v["access"].as_object()? {
+            let until = until.as_u64()?;
+            if until > time {
+                inner.access.insert(hash.clone(), until);
+            }
+        }
+        for (hash, entry) in v["refresh"].as_object()? {
+            let until = entry["until"].as_u64()?;
+            let client = entry["client"].as_str()?;
+            if until > time {
+                inner
+                    .refresh
+                    .insert(hash.clone(), (client.to_string(), until));
+            }
+        }
+        Some(inner)
+    }
+
+    fn to_text(&self, owner: &str) -> String {
+        let refresh: serde_json::Map<String, Value> = self
+            .refresh
+            .iter()
+            .map(|(hash, (client, until))| {
+                (hash.clone(), json!({ "client": client, "until": until }))
+            })
+            .collect();
+        json!({
+            "owner": owner,
+            "clients": self.clients,
+            "access": self.access,
+            "refresh": refresh,
+        })
+        .to_string()
+    }
+}
+
+/// A new file in one step, for its owner alone.
+fn replace_file(path: &Path, text: &str) -> io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".new");
+    let temp = PathBuf::from(temp);
+    let _ = fs::remove_file(&temp);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = options
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 pub struct Login {
     base: String,
     hash: String,
+    /// The file that outlives a restart. Without one, logins live in memory only.
+    file: Option<PathBuf>,
     inner: Mutex<Inner>,
 }
 
@@ -136,7 +247,41 @@ impl Login {
         Login {
             base: base.trim_end_matches('/').to_string(),
             hash: hash.to_string(),
+            file: None,
             inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// The same door, with logins kept in `file` over a restart.
+    pub fn with_file(base: &str, hash: &str, file: &Path) -> Self {
+        let mut login = Login::new(base, hash);
+        login.inner = Mutex::new(Inner::from_file(file, &login.owner()));
+        login.file = Some(file.to_path_buf());
+        login
+    }
+
+    /// Ties the file to this address and password: a new password, or a new secret
+    /// in the address, ends every login, as it must.
+    fn owner(&self) -> String {
+        password_hash(&format!("{}\n{}", self.base, self.hash))
+    }
+
+    /// Called with the lock held, before an answer goes out. A file that cannot be
+    /// kept up to date goes away, so a used token can never come back after a restart.
+    fn save(&self, inner: &Inner) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        if let Err(e) = replace_file(file, &inner.to_text(&self.owner())) {
+            eprintln!(
+                "could not save {}: {e}. Chats log in again after a restart.",
+                file.display()
+            );
+            if let Err(e) = fs::remove_file(file)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                eprintln!("could not remove {} either: {e}", file.display());
+            }
         }
     }
 
@@ -190,6 +335,7 @@ impl Login {
             inner.clients.remove(0);
         }
         inner.clients.push(id.clone());
+        self.save(&inner);
         Ok(json!({
             "client_id": id,
             "redirect_uris": [REDIRECT],
@@ -292,15 +438,22 @@ impl Login {
     fn tokens(&self, inner: &mut Inner, client: &str) -> Result<Value, &'static str> {
         let (access, refresh) = match (random(), random()) {
             (Ok(a), Ok(r)) => (a, r),
-            _ => return Err("server_error"),
+            _ => {
+                self.save(inner);
+                return Err("server_error");
+            }
         };
-        let now = Instant::now();
-        inner.access.retain(|_, until| *until > now);
-        inner.refresh.retain(|_, (_, until)| *until > now);
-        inner.access.insert(access.clone(), now + ACCESS_LIFE);
+        let time = now();
+        inner.access.retain(|_, until| *until > time);
+        inner.refresh.retain(|_, (_, until)| *until > time);
         inner
-            .refresh
-            .insert(refresh.clone(), (client.to_string(), now + REFRESH_LIFE));
+            .access
+            .insert(password_hash(&access), time + ACCESS_LIFE.as_secs());
+        inner.refresh.insert(
+            password_hash(&refresh),
+            (client.to_string(), time + REFRESH_LIFE.as_secs()),
+        );
+        self.save(inner);
         Ok(json!({
             "access_token": access,
             "token_type": "Bearer",
@@ -331,11 +484,13 @@ impl Login {
                 self.tokens(&mut inner, &code.client)
             }
             "refresh_token" => {
+                // A refresh token works once, also when the attempt fails.
                 let (client, until) = inner
                     .refresh
-                    .remove(get("refresh_token"))
+                    .remove(&password_hash(get("refresh_token")))
                     .ok_or("invalid_grant")?;
-                if until <= Instant::now() || client != get("client_id") {
+                if until <= now() || client != get("client_id") {
+                    self.save(&inner);
                     return Err("invalid_grant");
                 }
                 self.tokens(&mut inner, &client)
@@ -348,8 +503,8 @@ impl Login {
         let inner = self.inner.lock().unwrap();
         inner
             .access
-            .get(token)
-            .is_some_and(|until| *until > Instant::now())
+            .get(&password_hash(token))
+            .is_some_and(|until| *until > now())
     }
 }
 
@@ -377,6 +532,261 @@ mod tests {
 
     fn code_from(back: &str) -> String {
         parse_form(back.split_once('?').unwrap().1)["code"].clone()
+    }
+
+    const BASE: &str = "https://door.test/";
+
+    /// A file of its own for each test, gone at the end.
+    struct Place(PathBuf);
+    impl Place {
+        fn new(name: &str) -> Place {
+            let dir =
+                std::env::temp_dir().join(format!("orgthread-login-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Place(dir)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("logins.json")
+        }
+        /// A door as the program starts it, which is what a restart comes down to.
+        fn door(&self) -> Login {
+            Login::with_file(BASE, &password_hash("right password"), &self.file())
+        }
+    }
+    impl Drop for Place {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Logs in, as Claude does. Gives the client, access token and refresh token.
+    fn logged_in(l: &Login) -> (String, String, String) {
+        let c = client(l);
+        let back = l
+            .approve(&format!("{}&password=right+password", request(&c, "v1")))
+            .unwrap();
+        let form = format!(
+            "grant_type=authorization_code&code={}&client_id={c}&redirect_uri={}&code_verifier=v1",
+            code_from(&back),
+            encode(REDIRECT)
+        );
+        let t = l.token(&form).unwrap();
+        (
+            c,
+            t["access_token"].as_str().unwrap().to_string(),
+            t["refresh_token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    fn refreshing(c: &str, refresh: &str) -> String {
+        format!("grant_type=refresh_token&refresh_token={refresh}&client_id={c}")
+    }
+
+    #[test]
+    fn a_refresh_token_from_before_a_restart_works_once_after_it() {
+        let place = Place::new("once");
+        let (c, _, refresh) = logged_in(&place.door());
+        let door = place.door();
+        let t = door.token(&refreshing(&c, &refresh)).unwrap();
+        assert!(door.allows(t["access_token"].as_str().unwrap()));
+        assert_eq!(door.token(&refreshing(&c, &refresh)), Err("invalid_grant"));
+    }
+
+    #[test]
+    fn a_used_refresh_token_stays_dead_after_a_restart_and_its_successor_works() {
+        let place = Place::new("used");
+        let door = place.door();
+        let (c, _, old) = logged_in(&door);
+        let new = door.token(&refreshing(&c, &old)).unwrap();
+        let new = new["refresh_token"].as_str().unwrap();
+        let door = place.door();
+        assert_eq!(door.token(&refreshing(&c, &old)), Err("invalid_grant"));
+        assert!(door.token(&refreshing(&c, new)).is_ok());
+    }
+
+    #[test]
+    fn a_refresh_attempt_from_the_wrong_client_kills_the_token_also_after_a_restart() {
+        let place = Place::new("client");
+        let door = place.door();
+        let (c, _, refresh) = logged_in(&door);
+        assert_eq!(
+            door.token(&refreshing("other", &refresh)),
+            Err("invalid_grant")
+        );
+        assert_eq!(
+            place.door().token(&refreshing(&c, &refresh)),
+            Err("invalid_grant")
+        );
+    }
+
+    #[test]
+    fn an_access_token_from_before_a_restart_still_works() {
+        let place = Place::new("access");
+        let (_, access, _) = logged_in(&place.door());
+        let door = place.door();
+        assert!(door.allows(&access));
+        assert!(!door.allows("anything"));
+    }
+
+    /// Sets when each token ends, in the file, as if time had passed.
+    fn age(place: &Place, until: u64) {
+        let mut v: Value =
+            serde_json::from_str(&fs::read_to_string(place.file()).unwrap()).unwrap();
+        for (_, entry) in v["refresh"].as_object_mut().unwrap() {
+            entry["until"] = json!(until);
+        }
+        for (_, entry) in v["access"].as_object_mut().unwrap() {
+            *entry = json!(until);
+        }
+        fs::write(place.file(), v.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_token_past_its_time_fails_and_one_just_inside_it_works() {
+        let place = Place::new("late");
+        let (c, access, refresh) = logged_in(&place.door());
+        age(&place, now() + 60);
+        assert!(place.door().allows(&access));
+
+        age(&place, now() - 1);
+        let door = place.door();
+        assert!(!door.allows(&access));
+        assert_eq!(door.token(&refreshing(&c, &refresh)), Err("invalid_grant"));
+    }
+
+    #[test]
+    fn a_fresh_refresh_token_lasts_thirty_days_in_the_file() {
+        let place = Place::new("days");
+        logged_in(&place.door());
+        let v: Value = serde_json::from_str(&fs::read_to_string(place.file()).unwrap()).unwrap();
+        let (_, entry) = v["refresh"].as_object().unwrap().iter().next().unwrap();
+        let left = entry["until"].as_u64().unwrap() - now();
+        assert!(
+            left <= 30 * 24 * 3600 && left > 30 * 24 * 3600 - 60,
+            "{left}"
+        );
+    }
+
+    #[test]
+    fn no_raw_token_is_in_the_file_and_only_the_owner_may_read_it() {
+        let place = Place::new("raw");
+        let door = place.door();
+        let (c, access, refresh) = logged_in(&door);
+        let t = door.token(&refreshing(&c, &refresh)).unwrap();
+        let text = fs::read_to_string(place.file()).unwrap();
+        for raw in [
+            access.as_str(),
+            refresh.as_str(),
+            t["access_token"].as_str().unwrap(),
+            t["refresh_token"].as_str().unwrap(),
+            "right password",
+            &password_hash("right password"),
+        ] {
+            assert!(!text.contains(raw), "{raw} is in the file");
+        }
+        assert!(text.contains(&password_hash(t["refresh_token"].as_str().unwrap())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(place.file()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            fs::read_dir(&place.0).unwrap().count(),
+            1,
+            "no file left over"
+        );
+    }
+
+    #[test]
+    fn a_registration_still_counts_after_a_restart() {
+        let place = Place::new("client-known");
+        let c = client(&place.door());
+        assert!(place.door().page(&request(&c, "v1"), "x").is_ok());
+    }
+
+    #[test]
+    fn a_broken_file_means_a_new_login_never_a_crash_or_an_open_door() {
+        let place = Place::new("broken");
+        let (c, access, refresh) = logged_in(&place.door());
+        let good = fs::read_to_string(place.file()).unwrap();
+        let half = good[..good.len() / 2].to_string();
+        for broken in [
+            "",
+            "not json",
+            half.as_str(),
+            "null",
+            "[]",
+            "{}",
+            "{\"owner\":1,\"clients\":[],\"access\":{},\"refresh\":{}}",
+        ] {
+            fs::write(place.file(), broken).unwrap();
+            let door = place.door();
+            assert!(!door.allows(&access), "{broken}");
+            assert!(!door.allows(""), "{broken}");
+            assert_eq!(door.token(&refreshing(&c, &refresh)), Err("invalid_grant"));
+            assert!(door.page(&request(&c, "v1"), "x").is_err());
+            logged_in(&door);
+        }
+    }
+
+    #[test]
+    fn one_bad_entry_voids_the_whole_file() {
+        let place = Place::new("bad-entry");
+        let (_, access, _) = logged_in(&place.door());
+        let mut v: Value =
+            serde_json::from_str(&fs::read_to_string(place.file()).unwrap()).unwrap();
+        v["refresh"]["ab"] = json!({ "client": "x", "until": "soon" });
+        fs::write(place.file(), v.to_string()).unwrap();
+        assert!(!place.door().allows(&access));
+    }
+
+    #[test]
+    fn a_missing_file_or_folder_means_a_new_login() {
+        let place = Place::new("missing");
+        assert!(!place.file().exists());
+        logged_in(&place.door());
+        assert!(place.file().exists());
+
+        let nowhere = place.0.join("no/such/folder/logins.json");
+        let door = Login::with_file(BASE, &password_hash("right password"), &nowhere);
+        let (c, access, refresh) = logged_in(&door);
+        assert!(door.allows(&access), "it still works until a restart");
+        assert!(door.token(&refreshing(&c, &refresh)).is_ok());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_written_goes_away_so_a_used_token_cannot_return() {
+        let place = Place::new("no-write");
+        let (c, _, refresh) = logged_in(&place.door());
+        let door = place.door();
+        // The next file cannot be made: a folder stands where its temporary name goes.
+        let temp = place.0.join("logins.json.new");
+        fs::create_dir(&temp).unwrap();
+        assert!(door.token(&refreshing(&c, &refresh)).is_ok());
+        fs::remove_dir(&temp).unwrap();
+        assert!(!place.file().exists());
+        assert_eq!(
+            place.door().token(&refreshing(&c, &refresh)),
+            Err("invalid_grant")
+        );
+    }
+
+    #[test]
+    fn a_new_password_or_address_ends_every_login() {
+        let place = Place::new("owner");
+        let (c, access, refresh) = logged_in(&place.door());
+        let other = Login::with_file(BASE, &password_hash("new password"), &place.file());
+        assert!(!other.allows(&access));
+        assert_eq!(other.token(&refreshing(&c, &refresh)), Err("invalid_grant"));
+
+        let moved = Login::with_file(
+            "https://door.test/new-secret",
+            &password_hash("right password"),
+            &place.file(),
+        );
+        assert!(!moved.allows(&access));
     }
 
     #[test]

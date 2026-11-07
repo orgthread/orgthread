@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -44,6 +44,31 @@ fn encode(text: &str) -> String {
         .collect()
 }
 
+/// Starts the program, and returns once it answers.
+fn start(port: u16, base: &str, root: &Path) -> Child {
+    let child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
+        .args(["serve", "--http", &format!("127.0.0.1:{port}")])
+        .env("ORGTHREAD_PUBLIC_URL", base)
+        .env("ORGTHREAD_LOGIN_HASH", password_hash(PASSWORD))
+        .env("ORGTHREAD_ROOT", root)
+        .env("ORGTHREAD_LOCK_DIR", root.join("org/.locks"))
+        .env("ORGTHREAD_LOG", root.join("log"))
+        .env("ORGTHREAD_READS", root.join("reads"))
+        .env("ORGTHREAD_VERSIONS", root.join("versions"))
+        .env("ORGTHREAD_LOGINS", root.join("logins.json"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+}
+
 impl Door {
     fn open(name: &str) -> Self {
         Self::open_at(name, BASE)
@@ -64,25 +89,7 @@ impl Door {
             TcpListener::bind(("127.0.0.1", port)).is_ok(),
             "port {port} is busy"
         );
-        let child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
-            .args(["serve", "--http", &format!("127.0.0.1:{port}")])
-            .env("ORGTHREAD_PUBLIC_URL", base)
-            .env("ORGTHREAD_LOGIN_HASH", password_hash(PASSWORD))
-            .env("ORGTHREAD_ROOT", &root)
-            .env("ORGTHREAD_LOCK_DIR", root.join("org/.locks"))
-            .env("ORGTHREAD_LOG", root.join("log"))
-            .env("ORGTHREAD_READS", root.join("reads"))
-            .env("ORGTHREAD_VERSIONS", root.join("versions"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        for _ in 0..100 {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let child = start(port, base, &root);
         Door {
             _turn: turn,
             port,
@@ -108,6 +115,10 @@ impl Door {
     }
     /// Goes through the whole login, as Claude's connector does.
     fn log_in(&self) -> String {
+        self.log_in_fully().1
+    }
+    /// The same, and gives the client, the access token and the refresh token.
+    fn log_in_fully(&self) -> (String, String, String) {
         let r = self.raw(
             "POST",
             "/register",
@@ -158,7 +169,17 @@ impl Door {
         );
         assert_eq!(token.status, 200, "{}", token.body);
         let v: Value = serde_json::from_str(&token.body).unwrap();
-        v["access_token"].as_str().unwrap().to_string()
+        (
+            client,
+            v["access_token"].as_str().unwrap().to_string(),
+            v["refresh_token"].as_str().unwrap().to_string(),
+        )
+    }
+    /// Stops the program and starts it again on the same port and files.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = start(self.port, BASE, &self.root);
     }
     fn mcp(&self, token: &str, message: &Value) -> Reply {
         let extra = format!("Authorization: Bearer {token}\r\n");
@@ -417,4 +438,38 @@ fn the_whole_login_and_a_write_work_behind_the_secret() {
     assert_eq!(fs::read(d.file()).unwrap(), b"ok\n");
     // The right token at the address with no secret still finds nothing.
     assert_eq!(d.raw("POST", "/mcp", &extra, &call.to_string()).status, 404);
+}
+
+#[test]
+fn a_login_survives_a_restart_of_the_program() {
+    let mut d = Door::open("restart");
+    let (client, access, refresh) = d.log_in_fully();
+    let start_call = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    assert_eq!(d.mcp(&access, &start_call).status, 200);
+
+    d.restart();
+
+    // Claude needs do nothing: the token it holds still opens the door.
+    assert_eq!(d.mcp(&access, &start_call).status, 200);
+    assert_eq!(d.mcp("invented", &start_call).status, 401);
+
+    // And when that token runs out, the refresh token works, once.
+    let form = format!("grant_type=refresh_token&refresh_token={refresh}&client_id={client}");
+    let renewed = d.raw("POST", "/token", "", &form);
+    assert_eq!(renewed.status, 200, "{}", renewed.body);
+    let v: Value = serde_json::from_str(&renewed.body).unwrap();
+    assert_eq!(
+        d.mcp(v["access_token"].as_str().unwrap(), &start_call)
+            .status,
+        200
+    );
+    assert_eq!(d.raw("POST", "/token", "", &form).status, 400);
+
+    // It stays dead after one more restart, and no raw token is on the disk.
+    d.restart();
+    assert_eq!(d.raw("POST", "/token", "", &form).status, 400);
+    let kept = fs::read_to_string(d.root.join("logins.json")).unwrap();
+    assert!(!kept.contains(&access));
+    assert!(!kept.contains(&refresh));
+    assert!(!kept.contains(v["refresh_token"].as_str().unwrap()));
 }
