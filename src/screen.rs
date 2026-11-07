@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -59,60 +59,96 @@ fn color_of(outcome: &str) -> Color {
     }
 }
 
-fn details(entry: &Entry) -> Vec<Line<'static>> {
+/// Breaks text at spaces to fit the width. A longer word is cut, so nothing is
+/// ever lost at the edge of a narrow terminal.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for word in text.split(' ') {
+        let used = row.chars().count();
+        let size = word.chars().count();
+        if used > 0 && used + 1 + size > width {
+            rows.push(std::mem::take(&mut row));
+        } else if used > 0 {
+            row.push(' ');
+        }
+        let mut rest: Vec<char> = word.chars().collect();
+        while rest.len() > width {
+            let tail = rest.split_off(width);
+            rows.push(rest.iter().collect());
+            rest = tail;
+        }
+        row.extend(rest);
+    }
+    rows.push(row);
+    rows
+}
+
+const LABEL: usize = 10;
+
+/// A label in bold, and its value in a column that wraps under itself.
+fn labelled(label: &str, value: &str, width: usize) -> Vec<Line<'static>> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let row = |label: &str, value: String| {
-        Line::from(vec![
-            Span::styled(format!("{label:<10}"), bold),
-            Span::raw(value),
-        ])
-    };
+    wrap(value, width.saturating_sub(LABEL))
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let head = if i == 0 { label } else { "" };
+            Line::from(vec![
+                Span::styled(format!("{head:<LABEL$}"), bold),
+                Span::raw(row),
+            ])
+        })
+        .collect()
+}
+
+fn plain(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap(text, width)
+        .into_iter()
+        .map(|row| Line::styled(row, style))
+        .collect()
+}
+
+fn details(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let (first, second) = if entry.outcome == "changed" {
         ("Expected", "Found")
     } else {
         ("Before", "After")
     };
-    let mut lines = vec![
-        row("File", entry.path.clone()),
-        row("Who", entry.who.clone()),
-        row(
-            "Time",
-            format!("{} ({} ago)", entry.time, watch::ago(&entry.time)),
-        ),
-        Line::styled(
-            watch::why(&entry.outcome),
-            Style::new().fg(color_of(&entry.outcome)),
-        ),
-    ];
+    let mut lines = labelled("File", &entry.path, width);
+    lines.extend(labelled("Who", &entry.who, width));
+    let time = format!("{} ({} ago)", entry.time, watch::ago(&entry.time));
+    lines.extend(labelled("Time", &time, width));
+    let color = Style::new().fg(color_of(&entry.outcome));
+    lines.extend(plain(watch::why(&entry.outcome), width, color));
     if !entry.before.is_empty() {
-        lines.push(row(first, entry.before.clone()));
+        lines.extend(labelled(first, &entry.before, width));
     }
     if !entry.after.is_empty() {
-        lines.push(row(second, entry.after.clone()));
+        lines.extend(labelled(second, &entry.after, width));
     }
     lines
 }
 
-fn top_lines(snap: &Snapshot) -> Vec<Line<'static>> {
+fn top_lines(snap: &Snapshot, width: usize) -> Vec<Line<'static>> {
     let orange = Style::new().fg(ORANGE);
     let mut lines = Vec::new();
     for lock in &snap.locks {
         let state = if lock.stale { ", STALE" } else { "" };
-        lines.push(Line::styled(
-            format!(
-                "{}  since {}{state}  {}",
-                lock.path,
-                watch::short_age(lock.age.as_secs()),
-                lock.holder
-            ),
-            orange,
-        ));
+        let text = format!(
+            "{}  since {}{state}  {}",
+            lock.path,
+            watch::short_age(lock.age.as_secs()),
+            lock.holder
+        );
+        lines.extend(plain(&text, width, orange));
     }
     for name in &snap.left_behind {
-        lines.push(Line::styled(format!("left behind: {name}"), orange));
+        lines.extend(plain(&format!("left behind: {name}"), width, orange));
     }
     for problem in &snap.problems {
-        lines.push(Line::styled(format!("cannot read {problem}"), orange));
+        lines.extend(plain(&format!("cannot read {problem}"), width, orange));
     }
     if lines.is_empty() {
         lines.push(Line::raw("none"));
@@ -120,12 +156,43 @@ fn top_lines(snap: &Snapshot) -> Vec<Line<'static>> {
     lines
 }
 
+/// The end of a path matters most, so a long one loses its start.
+fn tail_of(path: &str, room: usize) -> String {
+    let count = path.chars().count();
+    if count <= room {
+        return path.to_string();
+    }
+    let keep = room.saturating_sub(3);
+    let tail: String = path.chars().skip(count - keep).collect();
+    format!("...{tail}")
+}
+
+/// One row of the list. A narrow terminal drops the size and the word "ago".
+fn row_of(entry: &Entry, width: usize) -> String {
+    let ago = watch::ago(&entry.time);
+    if width >= 80 {
+        let size = if entry.size.is_empty() {
+            String::new()
+        } else {
+            format!("{} B", entry.size)
+        };
+        let head = format!("{ago:>7} ago  {:<12}  {size:>9}  ", entry.outcome);
+        let room = width.saturating_sub(head.chars().count());
+        format!("{head}{}", tail_of(&entry.path, room))
+    } else {
+        let head = format!("{ago:>6}  {:<12}  ", entry.outcome);
+        let room = width.saturating_sub(head.chars().count());
+        format!("{head}{}", tail_of(&entry.path, room))
+    }
+}
+
 pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
-    let top = top_lines(snap);
+    let width = usize::from(frame.area().width.saturating_sub(2));
+    let top = top_lines(snap, width);
     let count = snap.entries.len();
     let place = choice.place(count);
     let chosen = snap.entries.iter().rev().nth(place);
-    let detail = chosen.map_or_else(Vec::new, details);
+    let detail = chosen.map_or_else(Vec::new, |e| details(e, width));
 
     let [head, locks, list, info, foot] = Layout::vertical([
         Constraint::Length(1),
@@ -154,17 +221,7 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
         .iter()
         .rev()
         .map(|e| {
-            let text = format!(
-                "{:>7} ago  {:<12}  {:>9}  {}",
-                watch::ago(&e.time),
-                e.outcome,
-                if e.size.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} B", e.size)
-                },
-                e.path
-            );
+            let text = row_of(e, width);
             ListItem::new(text).style(Style::new().fg(color_of(&e.outcome)))
         })
         .collect();
@@ -183,15 +240,10 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
     }
 
     frame.render_widget(
-        Paragraph::new(detail)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title("Chosen line")),
+        Paragraph::new(detail).block(Block::bordered().title("Chosen line")),
         info,
     );
-    frame.render_widget(
-        Line::raw("up, down: choose a line    g: newest    q: quit"),
-        foot,
-    );
+    frame.render_widget(Line::raw("up, down: line   g: newest   q: quit"), foot);
 }
 
 /// Runs the screen until a quit key.
@@ -330,6 +382,38 @@ mod tests {
         c.key(KeyCode::Down, false, 3);
         assert_eq!(c.place(3), 1);
         assert_eq!(c.place(4), 2, "one line further down, the same entry");
+    }
+
+    #[test]
+    fn a_narrow_terminal_keeps_the_file_name_and_all_details() {
+        let snap = Snapshot {
+            entries: vec![
+                parse_line(&format!(
+                    "2026-11-07 07:28:26Z\tchanged\torg/claude-notes/2026-11-07-invented-long-name.md\tinvented chat\t{}\t{}\t-",
+                    "a".repeat(64),
+                    "b".repeat(64)
+                ))
+                .unwrap(),
+            ],
+            ..Snapshot::default()
+        };
+        // The width of Silviu's Terminal panel on the first try.
+        let mut t = Terminal::new(TestBackend::new(49, 50)).unwrap();
+        t.draw(|f| draw(f, &snap, &Choice::default())).unwrap();
+        let text = text_of(&t);
+        assert!(text.contains("-invented-long-name.md"), "{text}");
+        assert!(text.contains("Expected"), "{text}");
+        assert!(text.contains("Found"), "{text}");
+        let hexes = |c: char| text.chars().filter(|x| *x == c).count();
+        assert!(hexes('b') >= 64, "the whole fingerprint shows: {text}");
+        assert!(text.contains("q: quit"), "{text}");
+    }
+
+    #[test]
+    fn wrapping_breaks_at_spaces_and_cuts_long_words() {
+        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap("", 5), [""]);
     }
 
     #[test]
