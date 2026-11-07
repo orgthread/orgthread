@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 const PASSWORD: &str = "an invented long password";
@@ -46,10 +47,15 @@ impl Door {
         fs::create_dir_all(root.join("org/.locks")).unwrap();
         fs::create_dir_all(root.join("org/notes")).unwrap();
         let root = fs::canonicalize(root).unwrap();
-        let port = {
-            let free = TcpListener::bind("127.0.0.1:0").unwrap();
-            free.local_addr().unwrap().port()
-        };
+        // A port for this door alone: tests run side by side, and a port asked from
+        // the system and given back could go to two doors at once.
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let port = 20_000 + (std::process::id() % 20_000) as u16 + n;
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "port {port} is busy"
+        );
         let child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
             .args(["serve", "--http", &format!("127.0.0.1:{port}")])
             .env("ORGTHREAD_PUBLIC_URL", base)
