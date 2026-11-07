@@ -295,3 +295,40 @@ fn a_closed_output_still_gives_the_real_outcome_and_the_log() {
     assert_eq!(fs::read(&file).unwrap(), b"new\n");
     assert!(fs::read_to_string(p.log()).unwrap().contains("written"));
 }
+
+#[test]
+fn watch_once_shows_the_writes_and_a_held_lock() {
+    let p = Place::new();
+    let file = p.file();
+    let o = p.run(
+        &["write", file.to_str().unwrap(), "--new", "--who", "t"],
+        b"new\n",
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    fs::write(
+        p.root.join("org/.locks/org--notes--other.md.lock"),
+        "other writer\n",
+    )
+    .unwrap();
+    let o = p.run(&["watch", "--once"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains("org/notes/invented.md"), "{text}");
+    assert!(text.contains("written"), "{text}");
+    assert!(text.contains("org/notes/other.md"), "{text}");
+    assert!(text.contains("other writer"), "{text}");
+}
+
+#[test]
+fn watch_without_a_terminal_says_what_to_do_and_changes_nothing() {
+    let p = Place::new();
+    let o = p.run(&["watch"], b"");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--once"));
+    assert!(
+        fs::read_dir(p.root.join("org/.locks"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}

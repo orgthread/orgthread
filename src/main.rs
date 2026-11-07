@@ -1,10 +1,11 @@
 use orgthread::fingerprint::{fingerprint, is_fingerprint};
 use orgthread::log;
+use orgthread::screen;
 use orgthread::storage::{Expect, LocalFolder};
 use orgthread::write::{self, Outcome, exit};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,6 +13,8 @@ const USAGE: &str = "\
 orgthread writes a plain text file the same way every time.
 
   orgthread fingerprint <file>
+  orgthread watch                         the read-only screen: locks, writes, refusals
+  orgthread watch --once                  the same screen once, as plain text
   orgthread write <file> --expect <fingerprint> --who <name>   < new-text
   orgthread write <file> --new --who <name>                    < new-text
 
@@ -49,6 +52,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     match args.first().map(String::as_str) {
         Some("fingerprint") => cmd_fingerprint(&args[1..]),
         Some("write") => cmd_write(&args[1..]),
+        Some("watch") => cmd_watch(&args[1..]),
         Some("--help" | "-h" | "help") => {
             print!("{USAGE}");
             Ok(0)
@@ -174,19 +178,64 @@ fn path_in_root(file: &str, root: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("the path of {file} is not valid UTF-8"))
 }
 
+struct Settings {
+    root: PathBuf,
+    lock_dir: String,
+    log: PathBuf,
+}
+
+impl Settings {
+    fn load() -> Result<Settings, String> {
+        let root = match env::var_os("ORGTHREAD_ROOT") {
+            Some(root) => PathBuf::from(root),
+            None => home()?.join("Library/CloudStorage/Dropbox"),
+        };
+        let root = fs::canonicalize(&root)
+            .map_err(|e| format!("the folder {} does not exist: {e}", root.display()))?;
+        let lock_dir = env::var("ORGTHREAD_LOCK_DIR").unwrap_or_else(|_| "org/.locks".to_string());
+        let log = match env::var_os("ORGTHREAD_LOG") {
+            Some(path) => PathBuf::from(path),
+            None => home()?.join(".local/state/orgthread/writes.log"),
+        };
+        Ok(Settings {
+            root,
+            lock_dir,
+            log,
+        })
+    }
+}
+
+fn cmd_watch(args: &[String]) -> Result<i32, String> {
+    let settings = Settings::load()?;
+    let locks = settings.root.join(&settings.lock_dir);
+    let result = match args {
+        [] => {
+            if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
+                return Err("watch needs a terminal. For plain text, use watch --once".into());
+            }
+            screen::run(&locks, &settings.log)
+        }
+        [flag] if flag == "--once" => screen::once(&locks, &settings.log, 110, 30).map(|text| {
+            let _ = io::stdout().write_all(text.as_bytes());
+        }),
+        _ => return Err("watch takes only --once".into()),
+    };
+    match result {
+        Ok(()) => Ok(0),
+        Err(e) => {
+            say(format!("the screen failed: {e}"));
+            Ok(exit::FAILED)
+        }
+    }
+}
+
 fn cmd_write(args: &[String]) -> Result<i32, String> {
     let args = parse_write(args)?;
-    let root = match env::var_os("ORGTHREAD_ROOT") {
-        Some(root) => PathBuf::from(root),
-        None => home()?.join("Library/CloudStorage/Dropbox"),
-    };
-    let root = fs::canonicalize(&root)
-        .map_err(|e| format!("the folder {} does not exist: {e}", root.display()))?;
-    let lock_dir = env::var("ORGTHREAD_LOCK_DIR").unwrap_or_else(|_| "org/.locks".to_string());
-    let log_path = match env::var_os("ORGTHREAD_LOG") {
-        Some(path) => PathBuf::from(path),
-        None => home()?.join(".local/state/orgthread/writes.log"),
-    };
+    let Settings {
+        root,
+        lock_dir,
+        log: log_path,
+    } = Settings::load()?;
     let path = path_in_root(&args.file, &root)?;
     if fs::metadata(root.join(&path)).is_ok_and(|m| !m.is_file()) {
         return Err(format!("{} is not a file", args.file));
