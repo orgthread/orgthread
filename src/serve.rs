@@ -4,6 +4,7 @@
 //! So there is no second copy of the rules: the lock, the checks, the log and every
 //! refusal are the ones of the command.
 
+use crate::login::{Login, Refused};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -40,18 +41,16 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, exe: &Path) -> io::R
     }
 }
 
-/// The door for a chat in the cloud: the same answers over HTTP, on one address
-/// with a long secret in it. It listens on this machine only, so a program that
-/// handles TLS must stand in front. There is no session and no stream: each POST
-/// gets one JSON answer, which the Streamable HTTP form of MCP allows.
-pub fn run_http(address: &str, secret: &str, exe: &Path) -> io::Result<()> {
+/// The door for a chat in the cloud: the same answers over HTTP, behind a login.
+/// It listens on this machine only, so a program that handles TLS must stand in
+/// front. There is no session and no stream: each POST gets one JSON answer, which
+/// the Streamable HTTP form of MCP allows.
+pub fn run_http(address: &str, login: &Login, exe: &Path) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
-    let path = format!("/mcp/{secret}");
     std::thread::scope(|scope| {
         for stream in listener.incoming().flatten() {
-            let path = &path;
             scope.spawn(move || {
-                let _ = handle(stream, path, exe);
+                let _ = handle(stream, login, exe);
             });
         }
     });
@@ -59,55 +58,125 @@ pub fn run_http(address: &str, secret: &str, exe: &Path) -> io::Result<()> {
 }
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
+const JSON_TYPE: &str = "application/json";
 
-fn respond(stream: &mut TcpStream, status: &str, body: &[u8]) -> io::Result<()> {
+fn respond(stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]) -> io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)
 }
 
-fn handle(mut stream: TcpStream, path: &str, exe: &Path) -> io::Result<()> {
+fn respond_json(stream: &mut TcpStream, status: &str, value: &Value) -> io::Result<()> {
+    let extra = format!("Content-Type: {JSON_TYPE}\r\n");
+    respond(stream, status, &extra, value.to_string().as_bytes())
+}
+
+fn respond_page(stream: &mut TcpStream, status: &str, page: &str) -> io::Result<()> {
+    let extra = "Content-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\n";
+    respond(stream, status, extra, page.as_bytes())
+}
+
+fn handle(mut stream: TcpStream, login: &Login, exe: &Path) -> io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first = String::new();
-    reader.by_ref().take(8192).read_line(&mut first)?;
+    reader.by_ref().take(16384).read_line(&mut first)?;
     let mut parts = first.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let mut length = 0usize;
+    let mut bearer = String::new();
     loop {
         let mut line = String::new();
-        if reader.by_ref().take(8192).read_line(&mut line)? == 0 || line.trim().is_empty() {
+        if reader.by_ref().take(16384).read_line(&mut line)? == 0 || line.trim().is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                bearer = value
+                    .trim()
+                    .strip_prefix("Bearer ")
+                    .unwrap_or("")
+                    .to_string();
+            }
         }
     }
-    // A wrong address learns nothing, not even that this is the right server.
-    if target != path {
-        return respond(&mut stream, "404 Not Found", b"");
-    }
-    if method != "POST" {
-        return respond(&mut stream, "405 Method Not Allowed", b"");
-    }
     if length > MAX_BODY {
-        return respond(&mut stream, "413 Content Too Large", b"");
+        return respond(&mut stream, "413 Content Too Large", "", b"");
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    let answered = match serde_json::from_slice::<Value>(&body) {
-        Ok(message) => answer(&message, exe),
-        Err(e) => Some(problem(Value::Null, NOT_JSON, &e.to_string())),
-    };
-    match answered {
-        Some(reply) => respond(&mut stream, "200 OK", reply.to_string().as_bytes()),
-        // A notification wants no answer.
-        None => respond(&mut stream, "202 Accepted", b""),
+    let text = String::from_utf8_lossy(&body);
+
+    match (method, path) {
+        (
+            "GET",
+            "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp",
+        ) => respond_json(&mut stream, "200 OK", &login.resource_metadata()),
+        ("GET", "/.well-known/oauth-authorization-server") => {
+            respond_json(&mut stream, "200 OK", &login.server_metadata())
+        }
+        ("POST", "/register") => {
+            let given = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            match login.register(&given) {
+                Ok(client) => respond_json(&mut stream, "201 Created", &client),
+                Err(e) => respond_json(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"error": "invalid_redirect_uri", "error_description": e}),
+                ),
+            }
+        }
+        ("GET", "/authorize") => match login.page(query, "Enter your orgthread password.") {
+            Ok(page) => respond_page(&mut stream, "200 OK", &page),
+            Err(e) => respond_page(&mut stream, "400 Bad Request", &e),
+        },
+        ("POST", "/authorize") => match login.approve(&text) {
+            Ok(back) => {
+                let extra = format!("Location: {back}\r\n");
+                respond(&mut stream, "302 Found", &extra, b"")
+            }
+            Err(Refused::WrongPassword) => {
+                let page = login
+                    .page(&text, "That password is wrong. Try again.")
+                    .unwrap_or_default();
+                respond_page(&mut stream, "401 Unauthorized", &page)
+            }
+            Err(Refused::Locked) => respond_page(
+                &mut stream,
+                "429 Too Many Requests",
+                "Too many wrong passwords. Try again in 15 minutes.",
+            ),
+            Err(Refused::BadRequest(e)) => respond_page(&mut stream, "400 Bad Request", &e),
+        },
+        ("POST", "/token") => match login.token(&text) {
+            Ok(tokens) => respond_json(&mut stream, "200 OK", &tokens),
+            Err(word) => respond_json(&mut stream, "400 Bad Request", &json!({"error": word})),
+        },
+        (_, "/mcp") => {
+            if !login.allows(&bearer) {
+                let extra = format!("WWW-Authenticate: {}\r\n", login.challenge_header());
+                return respond(&mut stream, "401 Unauthorized", &extra, b"");
+            }
+            if method != "POST" {
+                return respond(&mut stream, "405 Method Not Allowed", "", b"");
+            }
+            let answered = match serde_json::from_slice::<Value>(&body) {
+                Ok(message) => answer(&message, exe),
+                Err(e) => Some(problem(Value::Null, NOT_JSON, &e.to_string())),
+            };
+            match answered {
+                Some(reply) => respond_json(&mut stream, "200 OK", &reply),
+                // A notification wants no answer.
+                None => respond(&mut stream, "202 Accepted", "", b""),
+            }
+        }
+        _ => respond(&mut stream, "404 Not Found", "", b""),
     }
 }
 

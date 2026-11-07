@@ -1,6 +1,7 @@
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::fingerprint;
 use orgthread::log;
+use orgthread::login::Login;
 use orgthread::reads::Reads;
 use orgthread::screen;
 use orgthread::serve;
@@ -80,6 +81,14 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("write") => cmd_write(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
+        Some("password-hash") => {
+            let mut password = String::new();
+            io::stdin()
+                .read_line(&mut password)
+                .map_err(|e| e.to_string())?;
+            println!("{}", orgthread::login::password_hash(password.trim_end()));
+            Ok(0)
+        }
         Some("--help" | "-h" | "help") => {
             print!("{USAGE}");
             Ok(0)
@@ -406,11 +415,12 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
     let result = match args {
         [] => serve::run(io::stdin().lock(), io::stdout(), &exe),
         [flag, address] if flag == "--http" => {
-            let secret = env::var("ORGTHREAD_HTTP_SECRET").unwrap_or_default();
-            if secret.len() < 32 {
-                return Err("--http needs ORGTHREAD_HTTP_SECRET, with 32 signs or more".into());
+            let base = env::var("ORGTHREAD_PUBLIC_URL").unwrap_or_default();
+            let hash = env::var("ORGTHREAD_LOGIN_HASH").unwrap_or_default();
+            if !base.starts_with("https://") || hash.len() != 64 {
+                return Err("--http needs ORGTHREAD_PUBLIC_URL and ORGTHREAD_LOGIN_HASH".into());
             }
-            serve::run_http(address, &secret, &exe)
+            serve::run_http(address, &Login::new(&base, &hash), &exe)
         }
         _ => return Err("serve takes nothing, or --http <address>".into()),
     };

@@ -3,6 +3,7 @@
 pub mod dropbox;
 pub mod fingerprint;
 pub mod log;
+pub mod login;
 pub mod reads;
 pub mod screen;
 pub mod serve;
