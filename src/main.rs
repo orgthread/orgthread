@@ -2,6 +2,7 @@ use orgthread::fingerprint::fingerprint;
 use orgthread::log;
 use orgthread::reads::Reads;
 use orgthread::screen;
+use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage};
 use orgthread::write::{self, Outcome, exit};
 use std::env;
@@ -385,7 +386,16 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     let now = log::utc_now();
     let storage = LocalFolder::new(&root, &lock_dir);
     let lock_line = format!("orgthread {} {now} pid {}", args.who, std::process::id());
-    let report = write::write(&storage, &path, &expect, &text, &lock_line);
+    let stop = match stop::arm() {
+        Ok(stop) => stop,
+        Err(e) => {
+            say(format!(
+                "could not prepare for a stop, so nothing is written: {e}"
+            ));
+            return Ok(exit::FAILED);
+        }
+    };
+    let report = write::write_unless_stopped(&storage, &path, &expect, &text, &lock_line, &stop);
 
     let (before, after, size) = match &report.outcome {
         Outcome::Written { old, new, size } => (

@@ -3,6 +3,7 @@
 use crate::fingerprint::fingerprint;
 use crate::storage::{Expect, Storage, WriteError};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// A lock older than this is stale.
@@ -215,7 +216,14 @@ fn failed(step: &str, e: impl std::fmt::Display) -> Outcome {
 }
 
 /// The steps between taking and releasing the lock.
-fn change(storage: &dyn Storage, held: &Held, path: &str, expect: &Expect, new: &[u8]) -> Outcome {
+fn change(
+    storage: &dyn Storage,
+    held: &Held,
+    path: &str,
+    expect: &Expect,
+    new: &[u8],
+    stop: &AtomicBool,
+) -> Outcome {
     let old = match storage.read(path) {
         Ok(old) => old,
         Err(e) => return failed("could not read the file", e),
@@ -239,6 +247,11 @@ fn change(storage: &dyn Storage, held: &Held, path: &str, expect: &Expect, new: 
             };
         }
         _ => {}
+    }
+
+    // The last safe point: from here on, the write runs to its end and its check.
+    if stop.load(Ordering::SeqCst) {
+        return failed("nothing written", "a stop was asked for");
     }
 
     // A slow read, of a file not yet on this disk, can outlast the 15 minutes.
@@ -322,6 +335,18 @@ fn change(storage: &dyn Storage, held: &Held, path: &str, expect: &Expect, new: 
 
 /// One write. `line` is the text of the lock: who and when.
 pub fn write(storage: &dyn Storage, path: &str, expect: &Expect, new: &[u8], line: &str) -> Report {
+    write_unless_stopped(storage, path, expect, new, line, &AtomicBool::new(false))
+}
+
+/// The same, and a stop asked for before the last safe point writes nothing.
+pub fn write_unless_stopped(
+    storage: &dyn Storage,
+    path: &str,
+    expect: &Expect,
+    new: &[u8],
+    line: &str,
+    stop: &AtomicBool,
+) -> Report {
     let name = lock_name(path);
     let refused = |outcome| Report {
         outcome,
@@ -340,7 +365,7 @@ pub fn write(storage: &dyn Storage, path: &str, expect: &Expect, new: &[u8], lin
         line: line.to_string(),
         done: false,
     };
-    let outcome = change(storage, &held, path, expect, new);
+    let outcome = change(storage, &held, path, expect, new, stop);
     let (lock_left, lock_lost) = match held.release() {
         Ok(Release::Done) => (None, None),
         Ok(Release::NotOurs(other)) => (
