@@ -26,7 +26,7 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## MCP
 
-Two MCP servers give the same read and write to a chat that has no shell: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. How to start and add each, the tools, the refusals and the settings are in [docs/mcp.md](docs/mcp.md).
+Two MCP servers give the same read and write to a chat that has no shell: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 ## Licence
 
