@@ -317,6 +317,132 @@ fn the_door_needs_its_settings() {
     assert_eq!(o.status.code(), Some(2));
 }
 
+/// The program with the settings a door needs, on an address.
+fn serve_at(address: &str, anywhere: Option<&str>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+    command
+        .args(["serve", "--http", address])
+        .env("ORGTHREAD_PUBLIC_URL", BASE)
+        .env("ORGTHREAD_LOGIN_HASH", password_hash(PASSWORD))
+        .env(
+            "ORGTHREAD_LOGINS",
+            std::env::temp_dir().join(format!("orgthread-address-{}", std::process::id())),
+        )
+        .env_remove("ORGTHREAD_LISTEN_ANYWHERE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(value) = anywhere {
+        command.env("ORGTHREAD_LISTEN_ANYWHERE", value);
+    }
+    command.spawn().unwrap()
+}
+
+/// The exit code and the message, or a failed test if the program keeps running.
+fn assert_refused(address: &str, anywhere: Option<&str>) {
+    let mut child = serve_at(address, anywhere);
+    for _ in 0..250 {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("{address} was not refused: the program kept running");
+    }
+    let o = child.wait_with_output().unwrap();
+    let message = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(2), "{address}: {message}");
+    assert!(
+        message.contains("refused to listen on"),
+        "{address}: {message}"
+    );
+    assert!(
+        message.contains("ORGTHREAD_LISTEN_ANYWHERE=yes"),
+        "{address}: {message}"
+    );
+}
+
+/// The program listens on `address`, and answers at `reach`.
+fn assert_listens(address: &str, reach: &str, anywhere: Option<&str>) {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut child = serve_at(address, anywhere);
+    let mut answered = false;
+    for _ in 0..250 {
+        if TcpStream::connect(reach).is_ok() {
+            answered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(answered && running, "{address} did not listen");
+}
+
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[test]
+fn the_door_listens_on_the_machine_itself() {
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    assert_listens(&address, &address, None);
+    let address = format!("[::1]:{port}");
+    assert_listens(&address, &address, None);
+    let address = format!("localhost:{port}");
+    assert_listens(&address, &address, None);
+}
+
+#[test]
+fn the_door_refuses_every_address_of_the_network() {
+    for address in [
+        "0.0.0.0:0",
+        "[::]:0",
+        ":0",
+        "10.0.0.1:0",
+        "8.8.8.8:0",
+        "[2001:db8::1]:0",
+        "[::ffff:127.0.0.1]:0",
+    ] {
+        assert_refused(address, None);
+    }
+}
+
+#[test]
+fn a_name_does_not_pass_for_looking_local() {
+    for address in [
+        "localhost.example.com:0",
+        "127.0.0.1.example.com:0",
+        "localhost.:0",
+        "notlocalhost:0",
+        "127.1:0",
+        "0:0",
+        "localhost",
+        "localhost:",
+        "localhost:notaport",
+    ] {
+        assert_refused(address, None);
+    }
+}
+
+#[test]
+fn only_the_setting_with_yes_allows_a_network_address() {
+    for value in ["", "no", "true", "YES"] {
+        assert_refused("0.0.0.0:0", Some(value));
+    }
+    let port = free_port();
+    assert_listens(
+        &format!("0.0.0.0:{port}"),
+        &format!("127.0.0.1:{port}"),
+        Some("yes"),
+    );
+}
+
 const SECRET_BASE: &str = "https://door.test/invented-long-secret";
 const SECRET: &str = "/invented-long-secret";
 

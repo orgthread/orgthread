@@ -12,6 +12,7 @@ use orgthread::write::{self, Outcome, exit};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -60,6 +61,9 @@ Settings, from the environment:
                       (default: state/versions beside the program)
   ORGTHREAD_LOGINS    the logins of a door over a restart: hashes of its tokens, no raw token
                       and no text of a note (default: state/logins.json beside the program)
+  ORGTHREAD_LISTEN_ANYWHERE
+                      yes: let serve --http listen on an address that others can reach, with
+                      no encryption (default: only 127.0.0.1, [::1] and localhost)
 
 Exit codes:
   0  done                    6  missing: this name read it, but it is gone
@@ -512,6 +516,23 @@ fn logins_file() -> Result<PathBuf, String> {
     Ok(state.join("logins.json"))
 }
 
+/// Where the door may listen. It speaks plain HTTP, so only on this machine, unless
+/// the settings say otherwise on purpose.
+fn listen_addresses(address: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    if let Some(addresses) = serve::local_addresses(address) {
+        return Ok(addresses);
+    }
+    if env::var("ORGTHREAD_LISTEN_ANYWHERE").is_ok_and(|v| v == "yes") {
+        return address
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .map_err(|e| format!("could not use the address {address}: {e}"));
+    }
+    Err(format!(
+        "refused to listen on {address}: this server speaks plain HTTP, so passwords and notes could cross the network unencrypted. Use an address of this machine, such as 127.0.0.1:8080, behind a program that handles HTTPS. To allow this address on purpose, set ORGTHREAD_LISTEN_ANYWHERE=yes"
+    ))
+}
+
 fn cmd_serve(args: &[String]) -> Result<i32, String> {
     let exe = env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
     let result = match args {
@@ -522,8 +543,9 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
             if !base.starts_with("https://") || hash.len() != 64 {
                 return Err("--http needs ORGTHREAD_PUBLIC_URL and ORGTHREAD_LOGIN_HASH".into());
             }
+            let addresses = listen_addresses(address)?;
             let logins = logins_file()?;
-            serve::run_http(address, &Login::with_file(&base, &hash, &logins), &exe)
+            serve::run_http(&addresses, &Login::with_file(&base, &hash, &logins), &exe)
         }
         _ => return Err("serve takes nothing, or --http <address>".into()),
     };

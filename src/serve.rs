@@ -7,7 +7,7 @@
 use crate::login::{Login, Refused};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -42,11 +42,11 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, exe: &Path) -> io::R
 }
 
 /// The door for a chat in the cloud: the same answers over HTTP, behind a login.
-/// It listens on this machine only, so a program that handles TLS must stand in
-/// front. There is no session and no stream: each POST gets one JSON answer, which
-/// the Streamable HTTP form of MCP allows.
-pub fn run_http(address: &str, login: &Login, exe: &Path) -> io::Result<()> {
-    let listener = TcpListener::bind(address)?;
+/// It speaks plain HTTP, so a program that handles TLS must stand in front. There is
+/// no session and no stream: each POST gets one JSON answer, which the Streamable
+/// HTTP form of MCP allows.
+pub fn run_http(addresses: &[SocketAddr], login: &Login, exe: &Path) -> io::Result<()> {
+    let listener = TcpListener::bind(addresses)?;
     std::thread::scope(|scope| {
         for stream in listener.incoming().flatten() {
             scope.spawn(move || {
@@ -55,6 +55,19 @@ pub fn run_http(address: &str, login: &Login, exe: &Path) -> io::Result<()> {
         }
     });
     Ok(())
+}
+
+/// What `address` means, if it reaches this machine alone: an IP address of the
+/// machine itself, or the exact name `localhost`. Any other name is `None` with no
+/// lookup, as what it points at can change. The caller binds what this returns, so
+/// the address checked is the address used.
+pub fn local_addresses(address: &str) -> Option<Vec<SocketAddr>> {
+    if address.parse::<SocketAddr>().is_err() && !address.starts_with("localhost:") {
+        return None;
+    }
+    let found: Vec<SocketAddr> = address.to_socket_addrs().ok()?.collect();
+    let all_local = !found.is_empty() && found.iter().all(|a| a.ip().is_loopback());
+    all_local.then_some(found)
 }
 
 const MAX_BODY: usize = 64 * 1024 * 1024;

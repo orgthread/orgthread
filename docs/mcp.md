@@ -52,7 +52,9 @@ This adds it for you alone, in the current project. With `--scope project`, Clau
 
 ## The remote server
 
-Traffic from outside always uses HTTPS. A separate program on the same machine handles it, and passes each request to this server over plain HTTP. So give this server an address on its own machine. That program must pass each path on unchanged.
+This server speaks plain HTTP, so traffic from outside must reach it through HTTPS. A separate program on the same machine handles it, and passes each request to this server over plain HTTP. So give this server an address on its own machine. That program must pass each path on unchanged.
+
+`orgthread serve --http` accepts `127.0.0.1`, `[::1]` and `localhost`, each with a port. Any other address, such as `0.0.0.0`, `[::]`, `:8080` or a host name, stops it at once with exit code 2. Without encryption, a password and your notes could cross the network in plain sight. To allow such an address on purpose, set `ORGTHREAD_LISTEN_ANYWHERE=yes`. Do this only on a network you trust, or with HTTPS in front.
 
 **1. Make the hash of a password.** Choose a long password, as the hash is one plain SHA-256:
 
@@ -152,6 +154,7 @@ Each setting comes from the environment. A file `.env` beside the program, with 
 | `ORGTHREAD_PUBLIC_URL` | The public address of the remote server | None, required by it |
 | `ORGTHREAD_LOGIN_HASH` | The hash of its password | None, required by it |
 | `ORGTHREAD_LOGINS` | The file of the logins | `state/logins.json` beside the program |
+| `ORGTHREAD_LISTEN_ANYWHERE` | `yes` lets the remote server listen on an address that others can reach, with no encryption | Only `127.0.0.1`, `[::1]` and `localhost` |
 | `ORGTHREAD_LOCK_DIR` | The locks. For a local folder, keep them on the same disk as the root | `.locks` beside the program |
 | `ORGTHREAD_LOG` | The log file | `state/writes.log` beside the program |
 | `ORGTHREAD_READS` | The notes of what each name read | `state/reads` beside the program |
