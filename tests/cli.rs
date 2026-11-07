@@ -2,7 +2,7 @@
 
 use orgthread::fingerprint::fingerprint;
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -54,7 +54,13 @@ impl Place {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        // A command that refuses early never reads its input and closes the pipe.
+        // That is fine: the exit code says what happened.
+        match child.stdin.take().unwrap().write_all(stdin) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("{e}"),
+        }
         child.wait_with_output().unwrap()
     }
     fn read(&self, who: &str) -> Output {
@@ -432,4 +438,16 @@ fn watch_without_a_terminal_says_what_to_do_and_changes_nothing() {
             .next()
             .is_none()
     );
+}
+
+#[test]
+fn a_refusal_before_the_text_is_taken_in_changes_nothing() {
+    // The command refuses a bad path without reading its input. Text larger than
+    // a pipe holds makes the sender always find the pipe closed.
+    let p = Place::new();
+    let outside = p.outside("o.md");
+    let text = vec![b'x'; 4 * 1024 * 1024];
+    let o = p.run(&["write", outside.to_str().unwrap(), "--who", "t"], &text);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(!outside.exists());
 }
