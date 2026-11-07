@@ -1,7 +1,7 @@
 use orgthread::fingerprint::{fingerprint, is_fingerprint};
 use orgthread::log;
 use orgthread::screen;
-use orgthread::storage::{Expect, LocalFolder};
+use orgthread::storage::{Expect, LocalFolder, Storage};
 use orgthread::write::{self, Outcome, exit};
 use std::env;
 use std::fs;
@@ -12,11 +12,16 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 orgthread writes a plain text file the same way every time.
 
-  orgthread fingerprint <file>
+  orgthread read <file> --to <copy>       saves an exact copy, prints its fingerprint
+  orgthread read <file>                   prints the fingerprint, then the exact text
+  orgthread fingerprint <file>            only the fingerprint, for a check
   orgthread watch                         the read-only screen: locks, writes, refusals
   orgthread watch --once                  the same screen once, as plain text
   orgthread write <file> --expect <fingerprint> --who <name>   < new-text
   orgthread write <file> --new --who <name>                    < new-text
+
+  To change a file: read it, build the new text from that copy, and give write
+  that fingerprint. Text and fingerprint then come from one single read.
 
   Add --size <bytes> to refuse new text of any other length, so a cut-off
   pipe cannot replace a whole file.
@@ -51,6 +56,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<i32, String> {
     match args.first().map(String::as_str) {
         Some("fingerprint") => cmd_fingerprint(&args[1..]),
+        Some("read") => cmd_read(&args[1..]),
         Some("write") => cmd_write(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("--help" | "-h" | "help") => {
@@ -176,6 +182,86 @@ fn path_in_root(file: &str, root: &Path) -> Result<String, String> {
         .to_str()
         .map(str::to_string)
         .ok_or_else(|| format!("the path of {file} is not valid UTF-8"))
+}
+
+/// Text and fingerprint from one single read, so that no change can slip in
+/// between the two.
+fn cmd_read(args: &[String]) -> Result<i32, String> {
+    let (file, to) = match args {
+        [file] => (file, None),
+        [file, flag, to] if flag == "--to" => (file, Some(to)),
+        [flag, to, file] if flag == "--to" => (file, Some(to)),
+        _ => return Err("read takes one file, and maybe --to <copy>".into()),
+    };
+    let settings = Settings::load()?;
+    let path = path_in_root(file, &settings.root)?;
+    if fs::metadata(settings.root.join(&path)).is_ok_and(|m| !m.is_file()) {
+        return Err(format!("{file} is not a file"));
+    }
+    let storage = LocalFolder::new(&settings.root, &settings.lock_dir);
+    let bytes = match storage.read(&path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            say(format!("there is no file {path}"));
+            return Ok(exit::MISSING);
+        }
+        Err(e) => {
+            say(format!("could not read {path}: {e}"));
+            return Ok(exit::FAILED);
+        }
+    };
+    if !bytes.is_empty()
+        && let Err(reason) = write::check_text(&bytes)
+    {
+        return Err(format!("{path}: {reason}"));
+    }
+    let print = fingerprint(&bytes);
+    let mut out = io::stdout();
+    let sent = match to {
+        None => out
+            .write_all(format!("{print}\n").as_bytes())
+            .and_then(|()| out.write_all(&bytes)),
+        Some(to) => {
+            let copy = Path::new(to);
+            let parent = match copy.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let parent = fs::canonicalize(parent)
+                .map_err(|e| format!("the folder of {to} does not exist: {e}"))?;
+            if parent.starts_with(&settings.root) {
+                return Err(format!(
+                    "{to} is inside {}, where a working copy would sync to every device",
+                    settings.root.display()
+                ));
+            }
+            let created = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(copy);
+            let mut made = match created {
+                Ok(made) => made,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    say(format!("refused: {to} exists already. Name a new copy."));
+                    return Ok(exit::EXISTS);
+                }
+                Err(e) => {
+                    say(format!("could not make {to}: {e}"));
+                    return Ok(exit::FAILED);
+                }
+            };
+            made.write_all(&bytes)
+                .and_then(|()| made.sync_all())
+                .and_then(|()| out.write_all(format!("{print}\n").as_bytes()))
+        }
+    };
+    match sent.and_then(|()| out.flush()) {
+        Ok(()) => Ok(0),
+        Err(e) => {
+            say(format!("could not hand over {path}: {e}"));
+            Ok(exit::FAILED)
+        }
+    }
 }
 
 struct Settings {

@@ -25,6 +25,12 @@ impl Place {
     fn file(&self) -> PathBuf {
         self.root.join("org/notes/invented.md")
     }
+    /// A folder for working copies, outside the root.
+    fn outside(&self) -> PathBuf {
+        let dir = self.root.with_extension("copies");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
     fn log(&self) -> PathBuf {
         self.root.join("log/writes.log")
     }
@@ -46,6 +52,7 @@ impl Place {
 impl Drop for Place {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(self.root.with_extension("copies"));
     }
 }
 
@@ -330,5 +337,84 @@ fn watch_without_a_terminal_says_what_to_do_and_changes_nothing() {
             .unwrap()
             .next()
             .is_none()
+    );
+}
+
+#[test]
+fn read_gives_the_fingerprint_then_the_exact_bytes() {
+    let p = Place::new();
+    let file = p.file();
+    let text = "Grüße,  odd spacing\r\nno last newline";
+    fs::write(&file, text).unwrap();
+    let o = p.run(&["read", file.to_str().unwrap()], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let mut want = format!("{}\n", fingerprint(text.as_bytes())).into_bytes();
+    want.extend_from_slice(text.as_bytes());
+    assert_eq!(o.stdout, want);
+}
+
+#[test]
+fn read_to_a_copy_then_write_is_the_whole_round() {
+    let p = Place::new();
+    let file = p.file();
+    let f = file.to_str().unwrap();
+    fs::write(&file, "old\n").unwrap();
+    let outside = p.outside();
+    let copy = outside.join("copy.md");
+    let c = copy.to_str().unwrap();
+
+    let o = p.run(&["read", f, "--to", c], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(fs::read(&copy).unwrap(), b"old\n");
+    let print = String::from_utf8(o.stdout).unwrap();
+    assert_eq!(print.trim(), fingerprint(b"old\n"));
+
+    // Someone edits after the read: the fingerprint of that read refuses the write.
+    fs::write(&file, "edited\n").unwrap();
+    let o = p.run(
+        &["write", f, "--expect", print.trim(), "--who", "t"],
+        b"new\n",
+    );
+    assert_eq!(code(&o), 4, "{o:?}");
+    assert_eq!(fs::read(&file).unwrap(), b"edited\n");
+
+    // A copy is never replaced.
+    let o = p.run(&["read", f, "--to", c], b"");
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(fs::read(&copy).unwrap(), b"old\n");
+}
+
+#[test]
+fn read_refuses_what_it_should() {
+    let p = Place::new();
+    let file = p.file();
+    let f = file.to_str().unwrap();
+    assert_eq!(code(&p.run(&["read", f], b"")), 6);
+
+    fs::write(&file, b"bad \xff bytes").unwrap();
+    assert_eq!(code(&p.run(&["read", f], b"")), 2);
+
+    fs::write(&file, b"good\n").unwrap();
+    let inside = p.root.join("org/notes/copy.md");
+    let o = p.run(&["read", f, "--to", inside.to_str().unwrap()], b"");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(!inside.exists());
+
+    let outside = std::env::temp_dir().join(format!("orgthread-read-{}.md", std::process::id()));
+    fs::write(&outside, "elsewhere\n").unwrap();
+    assert_eq!(code(&p.run(&["read", outside.to_str().unwrap()], b"")), 2);
+    fs::remove_file(&outside).unwrap();
+}
+
+#[test]
+fn an_empty_file_can_be_read() {
+    let p = Place::new();
+    let file = p.file();
+    fs::write(&file, b"").unwrap();
+    let o = p.run(&["read", file.to_str().unwrap()], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap().trim(),
+        fingerprint(b"")
     );
 }
