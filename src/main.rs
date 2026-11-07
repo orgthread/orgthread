@@ -1,3 +1,4 @@
+use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::fingerprint;
 use orgthread::log;
 use orgthread::reads::Reads;
@@ -44,6 +45,8 @@ Settings, from the environment:
   ORGTHREAD_LOCK_DIR  the lock folder inside it (default: org/.locks)
   ORGTHREAD_LOG       the log file (default: ~/.local/state/orgthread/writes.log)
   ORGTHREAD_READS     the notes of what was read (default: ~/.local/state/orgthread/reads)
+  ORGTHREAD_STORAGE   dropbox: use the Dropbox API, with paths from its root, such as /org/a.md.
+                      Needs ORGTHREAD_DROPBOX_TOKEN in the environment. Keeps no copies.
   ORGTHREAD_VERSIONS  a copy of each version written, for the diff screen, for 30 days
                       (default: ~/.local/state/orgthread/versions)
 
@@ -221,11 +224,8 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
     let ReadArgs { file, who, to } = parse_read(args)?;
     let (file, to) = (&file, to.as_ref());
     let settings = Settings::load()?;
-    let path = path_in_root(file, &settings.root)?;
-    if fs::metadata(settings.root.join(&path)).is_ok_and(|m| !m.is_file()) {
-        return Err(format!("{file} is not a file"));
-    }
-    let storage = LocalFolder::new(&settings.root, &settings.lock_dir);
+    let path = settings.path_of(file)?;
+    let storage = settings.storage()?;
     let bytes = match storage.read(&path) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
@@ -261,7 +261,7 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
             };
             let parent = fs::canonicalize(parent)
                 .map_err(|e| format!("the folder of {to} does not exist: {e}"))?;
-            if parent.starts_with(&settings.root) {
+            if !settings.dropbox && parent.starts_with(&settings.root) {
                 return Err(format!(
                     "{to} is inside {}, where a working copy would sync to every device",
                     settings.root.display()
@@ -303,16 +303,55 @@ struct Settings {
     log: PathBuf,
     reads: PathBuf,
     versions: PathBuf,
+    dropbox: bool,
+}
+
+impl Settings {
+    fn storage(&self) -> Result<Box<dyn Storage>, String> {
+        if self.dropbox {
+            Ok(Box::new(Dropbox::new(&self.lock_dir)?))
+        } else {
+            Ok(Box::new(LocalFolder::new(&self.root, &self.lock_dir)))
+        }
+    }
+
+    /// The path from the root. In Dropbox a file is named from there already.
+    fn path_of(&self, file: &str) -> Result<String, String> {
+        if self.dropbox {
+            let inside = file
+                .strip_prefix('/')
+                .ok_or_else(|| format!("{file} must start with / in Dropbox"))?;
+            let bad = inside.is_empty()
+                || inside.ends_with('/')
+                || inside
+                    .split('/')
+                    .any(|p| p.is_empty() || p == "." || p == "..");
+            if bad {
+                return Err(format!("{file} names no file"));
+            }
+            return Ok(inside.to_string());
+        }
+        let path = path_in_root(file, &self.root)?;
+        if fs::metadata(self.root.join(&path)).is_ok_and(|m| !m.is_file()) {
+            return Err(format!("{file} is not a file"));
+        }
+        Ok(path)
+    }
 }
 
 impl Settings {
     fn load() -> Result<Settings, String> {
-        let root = match env::var_os("ORGTHREAD_ROOT") {
-            Some(root) => PathBuf::from(root),
-            None => home()?.join("Library/CloudStorage/Dropbox"),
+        let dropbox = env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
+        let root = if dropbox {
+            PathBuf::new()
+        } else {
+            let root = match env::var_os("ORGTHREAD_ROOT") {
+                Some(root) => PathBuf::from(root),
+                None => home()?.join("Library/CloudStorage/Dropbox"),
+            };
+            fs::canonicalize(&root)
+                .map_err(|e| format!("the folder {} does not exist: {e}", root.display()))?
         };
-        let root = fs::canonicalize(&root)
-            .map_err(|e| format!("the folder {} does not exist: {e}", root.display()))?;
         let lock_dir = env::var("ORGTHREAD_LOCK_DIR").unwrap_or_else(|_| "org/.locks".to_string());
         let log = match env::var_os("ORGTHREAD_LOG") {
             Some(path) => PathBuf::from(path),
@@ -332,6 +371,7 @@ impl Settings {
             log,
             reads,
             versions,
+            dropbox,
         })
     }
 }
@@ -376,18 +416,9 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
 
 fn cmd_write(args: &[String]) -> Result<i32, String> {
     let args = parse_write(args)?;
-    let Settings {
-        root,
-        lock_dir,
-        log: log_path,
-        reads,
-        versions: versions_dir,
-    } = Settings::load()?;
-    let reads = Reads::new(reads);
-    let path = path_in_root(&args.file, &root)?;
-    if fs::metadata(root.join(&path)).is_ok_and(|m| !m.is_file()) {
-        return Err(format!("{} is not a file", args.file));
-    }
+    let settings = Settings::load()?;
+    let reads = Reads::new(&settings.reads);
+    let path = settings.path_of(&args.file)?;
 
     let mut text = Vec::new();
     io::stdin()
@@ -414,7 +445,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     };
 
     let now = log::utc_now();
-    let storage = LocalFolder::new(&root, &lock_dir);
+    let storage = settings.storage()?;
     let lock_line = format!("orgthread {} {now} pid {}", args.who, std::process::id());
     let stop = match stop::arm() {
         Ok(stop) => stop,
@@ -425,7 +456,8 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
             return Ok(exit::FAILED);
         }
     };
-    let report = write::write_unless_stopped(&storage, &path, &expect, &text, &lock_line, &stop);
+    let report =
+        write::write_unless_stopped(storage.as_ref(), &path, &expect, &text, &lock_line, &stop);
 
     let (before, after, size) = match &report.outcome {
         Outcome::Written { old, new, size, .. } => (
@@ -448,7 +480,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     ]);
 
     // First the log. A closed output must never hide what happened to the file.
-    let logged = log::append(&log_path, &line);
+    let logged = log::append(&settings.log, &line);
     let saved = |rescued: &Option<String>| match rescued {
         Some(place) => format!(" What the file held instead is kept in {place}."),
         None => String::new(),
@@ -461,14 +493,17 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
             ..
         } => {
             // Only for a person's diff, so a failure here does not fail the write.
-            let versions = Versions::new(&versions_dir);
-            versions.tidy();
-            let kept = match old_text {
-                Some(old) => versions.save(old),
-                None => Ok(()),
-            };
-            if let Err(e) = kept.and_then(|()| versions.save(&text)) {
-                say(format!("could not keep a copy for the diff screen: {e}"));
+            // In Dropbox mode, on a server, no text may stay on the disk.
+            if !settings.dropbox {
+                let versions = Versions::new(&settings.versions);
+                versions.tidy();
+                let kept = match old_text {
+                    Some(old) => versions.save(old),
+                    None => Ok(()),
+                };
+                if let Err(e) = kept.and_then(|()| versions.save(&text)) {
+                    say(format!("could not keep a copy for the diff screen: {e}"));
+                }
             }
             // A next write of this agent needs no new read: it knows this text.
             if let Err(e) = reads.remember(&args.who, &path, new) {
@@ -515,13 +550,17 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     if let Err(e) = &logged {
         say(format!(
             "the log line failed, {}: {e}. The line: {line}",
-            log_path.display()
+            settings.log.display()
         ));
     }
     if let Some(reason) = &report.lock_left {
         say(format!(
             "the lock was NOT released: {reason}. Delete it: {}",
-            root.join(&lock_dir).join(write::lock_name(&path)).display()
+            settings
+                .root
+                .join(&settings.lock_dir)
+                .join(write::lock_name(&path))
+                .display()
         ));
     }
     Ok(report.exit_code(logged.is_ok()))

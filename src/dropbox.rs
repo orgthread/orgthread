@@ -1,0 +1,354 @@
+//! Files in Dropbox, through its web API, behind the same interface as a folder.
+//!
+//! The requests go through the `curl` program, so this needs no web library. The
+//! token stays in the environment: it never appears in a command line, a file or
+//! a message. Text goes through a pipe and is never written to disk.
+
+use crate::storage::{Expect, Storage, WriteError};
+use crate::watch::seconds_of;
+use serde_json::{Value, json};
+use std::io::{self, ErrorKind, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const TOKEN: &str = "ORGTHREAD_DROPBOX_TOKEN";
+
+pub struct Dropbox {
+    api: String,
+    content: String,
+    lock_dir: String,
+}
+
+struct Reply {
+    status: u16,
+    body: Vec<u8>,
+}
+
+struct Meta {
+    rev: String,
+    hash: String,
+    modified: String,
+}
+
+fn failure(message: String) -> io::Error {
+    io::Error::other(message)
+}
+
+/// A header can only carry plain ASCII, so other signs are written as `\uXXXX`.
+fn ascii_json(value: &Value) -> String {
+    let mut out = String::new();
+    for c in value.to_string().chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+fn summary(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v["error_summary"].as_str().map(str::to_string))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).chars().take(200).collect())
+}
+
+/// A failure that no step can recover from, in plain words.
+fn refused(reply: &Reply) -> io::Error {
+    match reply.status {
+        401 => failure("Dropbox refused the token: it is wrong or has expired".to_string()),
+        status => failure(format!(
+            "Dropbox answered {status}: {}",
+            summary(&reply.body)
+        )),
+    }
+}
+
+impl Dropbox {
+    pub fn new(lock_dir: &str) -> Result<Self, String> {
+        if std::env::var_os(TOKEN).is_none_or(|t| t.is_empty()) {
+            return Err(format!("{TOKEN} is not set"));
+        }
+        let url = |name: &str, default: &str| std::env::var(name).unwrap_or(default.to_string());
+        Ok(Dropbox {
+            api: url("ORGTHREAD_DROPBOX_API", "https://api.dropboxapi.com"),
+            content: url(
+                "ORGTHREAD_DROPBOX_CONTENT",
+                "https://content.dropboxapi.com",
+            ),
+            lock_dir: lock_dir.trim_matches('/').to_string(),
+        })
+    }
+
+    fn file(path: &str) -> String {
+        format!("/{path}")
+    }
+
+    fn lock(&self, name: &str) -> String {
+        format!("/{}/{name}", self.lock_dir)
+    }
+
+    fn call(&self, url: &str, headers: &[String], body: Option<&[u8]>) -> io::Result<Reply> {
+        let mut curl = Command::new("curl");
+        curl.args(["-sS", "-X", "POST", "--max-time", "120"])
+            .args(["--variable", &format!("%{TOKEN}")])
+            .args([
+                "--expand-header",
+                &format!("Authorization: Bearer {{{{{TOKEN}}}}}"),
+            ])
+            .args(["-w", "\n%{http_code}"]);
+        for header in headers {
+            curl.args(["-H", header]);
+        }
+        if body.is_some() {
+            curl.args(["--data-binary", "@-"]);
+        }
+        curl.arg(url)
+            .stdin(if body.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = curl
+            .spawn()
+            .map_err(|e| failure(format!("could not start curl: {e}")))?;
+        let stdin = child.stdin.take();
+        let output = std::thread::scope(|scope| {
+            if let (Some(mut stdin), Some(body)) = (stdin, body) {
+                scope.spawn(move || {
+                    let _ = stdin.write_all(body);
+                });
+            }
+            child.wait_with_output()
+        })?;
+        if !output.status.success() {
+            let text = String::from_utf8_lossy(&output.stderr);
+            return Err(failure(format!("curl failed: {}", text.trim())));
+        }
+        let split = output
+            .stdout
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .ok_or_else(|| failure("curl gave no status".to_string()))?;
+        let status = String::from_utf8_lossy(&output.stdout[split + 1..])
+            .parse()
+            .map_err(|_| failure("curl gave no status".to_string()))?;
+        Ok(Reply {
+            status,
+            body: output.stdout[..split].to_vec(),
+        })
+    }
+
+    fn rpc(&self, endpoint: &str, arg: &Value) -> io::Result<Reply> {
+        let url = format!("{}/2/files/{endpoint}", self.api);
+        let headers = ["Content-Type: application/json".to_string()];
+        self.call(&url, &headers, Some(arg.to_string().as_bytes()))
+    }
+
+    fn content(&self, endpoint: &str, arg: &Value, body: Option<&[u8]>) -> io::Result<Reply> {
+        let url = format!("{}/2/files/{endpoint}", self.content);
+        let mut headers = vec![format!("Dropbox-API-Arg: {}", ascii_json(arg))];
+        if body.is_some() {
+            headers.push("Content-Type: application/octet-stream".to_string());
+        }
+        self.call(&url, &headers, body)
+    }
+
+    fn download(&self, full: &str) -> io::Result<Option<Vec<u8>>> {
+        let reply = self.content("download", &json!({ "path": full }), None)?;
+        match reply.status {
+            200 => Ok(Some(reply.body)),
+            409 if summary(&reply.body).contains("not_found") => Ok(None),
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    fn meta(&self, full: &str) -> io::Result<Option<Meta>> {
+        let reply = self.rpc("get_metadata", &json!({ "path": full }))?;
+        match reply.status {
+            200 => {
+                let v: Value = serde_json::from_slice(&reply.body)?;
+                if v[".tag"] != "file" {
+                    return Err(failure(format!("{full} is not a file")));
+                }
+                let text = |key: &str| v[key].as_str().unwrap_or_default().to_string();
+                Ok(Some(Meta {
+                    rev: text("rev"),
+                    hash: text("content_hash"),
+                    modified: text("server_modified"),
+                }))
+            }
+            409 if summary(&reply.body).contains("not_found") => Ok(None),
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    /// False means that the file is not as `mode` asks, and nothing was written.
+    fn upload(&self, full: &str, mode: Value, bytes: &[u8]) -> io::Result<bool> {
+        // Decision of 2026-11-06: no renamed copy on a clash, ever.
+        let arg = json!({
+            "path": full,
+            "mode": mode,
+            "autorename": false,
+            "mute": true,
+            "strict_conflict": true,
+        });
+        let reply = self.content("upload", &arg, Some(bytes))?;
+        match reply.status {
+            200 => Ok(true),
+            409 if summary(&reply.body).contains("conflict") => Ok(false),
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    fn delete(&self, full: &str, rev: Option<&str>) -> io::Result<bool> {
+        let arg = match rev {
+            Some(rev) => json!({ "path": full, "parent_rev": rev }),
+            None => json!({ "path": full }),
+        };
+        let reply = self.rpc("delete_v2", &arg)?;
+        match reply.status {
+            200 => Ok(true),
+            409 => {
+                let text = summary(&reply.body);
+                if text.contains("not_found") || text.contains("conflict") {
+                    Ok(false)
+                } else {
+                    Err(refused(&reply))
+                }
+            }
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    fn age_of(meta: &Meta) -> Duration {
+        let then = seconds_of(&meta.modified.replace('T', " ")).unwrap_or(u64::MAX);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Duration::from_secs(now.saturating_sub(then))
+    }
+}
+
+impl Storage for Dropbox {
+    fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
+        self.download(&Self::file(path))
+    }
+
+    fn write_if_unchanged(
+        &self,
+        path: &str,
+        expect: &Expect,
+        bytes: &[u8],
+    ) -> Result<(), WriteError> {
+        let full = Self::file(path);
+        let written = match expect {
+            Expect::Absent => self.upload(&full, json!("add"), bytes)?,
+            Expect::Fingerprint(want) => {
+                let Some(meta) = self.meta(&full)? else {
+                    return Err(WriteError::Changed { found: None });
+                };
+                if meta.hash != *want {
+                    return Err(WriteError::Changed {
+                        found: Some(meta.hash),
+                    });
+                }
+                // Dropbox itself refuses this if another version came first.
+                self.upload(
+                    &full,
+                    json!({ ".tag": "update", "update": meta.rev }),
+                    bytes,
+                )?
+            }
+        };
+        if written {
+            return Ok(());
+        }
+        let found = self.meta(&full)?.map(|meta| meta.hash);
+        Err(WriteError::Changed { found })
+    }
+
+    fn restore(&self, path: &str, old: Option<&[u8]>) -> io::Result<()> {
+        let full = Self::file(path);
+        match old {
+            Some(bytes) => self.upload(&full, json!("overwrite"), bytes).map(|_| ()),
+            None => self.delete(&full, None).map(|_| ()),
+        }
+    }
+
+    fn rescue(&self, path: &str, bytes: &[u8]) -> io::Result<String> {
+        let name = format!("{}.{}.rescue", path.replace('/', "--"), std::process::id());
+        let full = self.lock(&name);
+        if self.upload(&full, json!("add"), bytes)? {
+            Ok(full)
+        } else {
+            Err(io::Error::new(ErrorKind::AlreadyExists, full))
+        }
+    }
+
+    fn lock_create(&self, name: &str, line: &str) -> io::Result<bool> {
+        self.upload(
+            &self.lock(name),
+            json!("add"),
+            format!("{line}\n").as_bytes(),
+        )
+    }
+
+    fn lock_read(&self, name: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .download(&self.lock(name))?
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_string()))
+    }
+
+    fn lock_age(&self, name: &str) -> io::Result<Option<Duration>> {
+        Ok(self.meta(&self.lock(name))?.map(|meta| Self::age_of(&meta)))
+    }
+
+    fn lock_take_stale(&self, name: &str, max_age: Duration) -> io::Result<Option<String>> {
+        let full = self.lock(name);
+        let Some(meta) = self.meta(&full)? else {
+            return Ok(None);
+        };
+        if Self::age_of(&meta) <= max_age {
+            return Ok(None);
+        }
+        let line = self.lock_read(name)?.unwrap_or_default();
+        // The version check gives one winner, and it spares a fresh lock.
+        Ok(self.delete(&full, Some(&meta.rev))?.then_some(line))
+    }
+
+    fn lock_remove(&self, name: &str) -> io::Result<()> {
+        self.delete(&self.lock(name), None).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_header_holds_only_ascii() {
+        let arg = json!({ "path": "/org/Grüße 😀.md" });
+        let text = ascii_json(&arg);
+        assert!(text.is_ascii());
+        assert!(text.contains("\\u00fc"));
+        assert!(text.contains("\\ud83d\\ude00"));
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, arg);
+    }
+
+    #[test]
+    fn a_dropbox_error_gives_its_summary() {
+        assert_eq!(
+            summary(br#"{"error_summary":"path/not_found/.."}"#),
+            "path/not_found/.."
+        );
+        assert_eq!(summary(b"plain text"), "plain text");
+    }
+}
