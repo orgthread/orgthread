@@ -52,7 +52,7 @@ This adds it for you alone, in the current project. With `--scope project`, Clau
 
 ## The remote server
 
-This server speaks plain HTTP and has no TLS. So give it an address on its own machine, and let a program that handles TLS stand in front of it. That program must pass each path on unchanged.
+Traffic from outside always uses HTTPS. A separate program on the same machine handles it, and passes each request to this server over plain HTTP. So give this server an address on its own machine. That program must pass each path on unchanged.
 
 **1. Make the hash of a password.** Choose a long password, as the hash is one plain SHA-256:
 
