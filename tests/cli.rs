@@ -43,6 +43,10 @@ impl Place {
             .env(
                 "ORGTHREAD_READS",
                 self.root.with_extension("outside").join("reads"),
+            )
+            .env(
+                "ORGTHREAD_VERSIONS",
+                self.root.with_extension("outside").join("versions"),
             );
         c
     }
@@ -450,4 +454,40 @@ fn a_refusal_before_the_text_is_taken_in_changes_nothing() {
     let o = p.run(&["write", outside.to_str().unwrap(), "--who", "t"], &text);
     assert_eq!(code(&o), 2, "{o:?}");
     assert!(!outside.exists());
+}
+
+#[test]
+fn a_write_keeps_a_copy_of_the_old_and_the_new_version() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("chat");
+    assert_eq!(code(&p.write("chat", b"new\n")), 0);
+    let versions = p.outside("versions");
+    assert_eq!(
+        fs::read(versions.join(fingerprint(b"old\n"))).unwrap(),
+        b"old\n"
+    );
+    assert_eq!(
+        fs::read(versions.join(fingerprint(b"new\n"))).unwrap(),
+        b"new\n"
+    );
+}
+
+#[test]
+fn a_refused_write_keeps_no_copy() {
+    let p = Place::new();
+    fs::write(p.file(), "here already\n").unwrap();
+    assert_eq!(code(&p.write("chat", b"new\n")), 5);
+    assert!(!p.outside("versions").join(fingerprint(b"new\n")).exists());
+}
+
+#[test]
+fn a_copy_that_cannot_be_kept_does_not_fail_the_write() {
+    let p = Place::new();
+    // A file stands where the folder of copies should be.
+    fs::write(p.outside("versions"), "in the way").unwrap();
+    let o = p.write("chat", b"new\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(p.text(), b"new\n");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("could not keep a copy"));
 }

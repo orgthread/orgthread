@@ -50,6 +50,8 @@ pub enum Outcome {
         old: Option<String>,
         new: String,
         size: usize,
+        /// The old text, so that the caller can keep a copy.
+        old_text: Option<Vec<u8>>,
     },
     Locked {
         holder: String,
@@ -287,6 +289,7 @@ fn change(
                 old: old_print,
                 new: fingerprint(new),
                 size: new.len(),
+                old_text: old,
             };
         }
         Ok(Some(back)) => format!(

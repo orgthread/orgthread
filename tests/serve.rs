@@ -40,6 +40,10 @@ impl Place {
             .env(
                 "ORGTHREAD_READS",
                 self.root.with_extension("outside").join("reads"),
+            )
+            .env(
+                "ORGTHREAD_VERSIONS",
+                self.root.with_extension("outside").join("versions"),
             );
         c
     }

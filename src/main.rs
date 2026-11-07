@@ -5,6 +5,7 @@ use orgthread::screen;
 use orgthread::serve;
 use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage};
+use orgthread::versions::Versions;
 use orgthread::write::{self, Outcome, exit};
 use std::env;
 use std::fs;
@@ -43,6 +44,8 @@ Settings, from the environment:
   ORGTHREAD_LOCK_DIR  the lock folder inside it (default: org/.locks)
   ORGTHREAD_LOG       the log file (default: ~/.local/state/orgthread/writes.log)
   ORGTHREAD_READS     the notes of what was read (default: ~/.local/state/orgthread/reads)
+  ORGTHREAD_VERSIONS  a copy of each version written, for the diff screen, for 30 days
+                      (default: ~/.local/state/orgthread/versions)
 
 Exit codes:
   0  done                    6  missing: this name read it, but it is gone
@@ -299,6 +302,7 @@ struct Settings {
     lock_dir: String,
     log: PathBuf,
     reads: PathBuf,
+    versions: PathBuf,
 }
 
 impl Settings {
@@ -318,11 +322,16 @@ impl Settings {
             Some(path) => PathBuf::from(path),
             None => home()?.join(".local/state/orgthread/reads"),
         };
+        let versions = match env::var_os("ORGTHREAD_VERSIONS") {
+            Some(path) => PathBuf::from(path),
+            None => home()?.join(".local/state/orgthread/versions"),
+        };
         Ok(Settings {
             root,
             lock_dir,
             log,
             reads,
+            versions,
         })
     }
 }
@@ -372,6 +381,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
         lock_dir,
         log: log_path,
         reads,
+        versions: versions_dir,
     } = Settings::load()?;
     let reads = Reads::new(reads);
     let path = path_in_root(&args.file, &root)?;
@@ -418,7 +428,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     let report = write::write_unless_stopped(&storage, &path, &expect, &text, &lock_line, &stop);
 
     let (before, after, size) = match &report.outcome {
-        Outcome::Written { old, new, size } => (
+        Outcome::Written { old, new, size, .. } => (
             old.clone().unwrap_or_default(),
             new.clone(),
             size.to_string(),
@@ -444,7 +454,22 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
         None => String::new(),
     };
     match &report.outcome {
-        Outcome::Written { new, size, .. } => {
+        Outcome::Written {
+            new,
+            size,
+            old_text,
+            ..
+        } => {
+            // Only for a person's diff, so a failure here does not fail the write.
+            let versions = Versions::new(&versions_dir);
+            versions.tidy();
+            let kept = match old_text {
+                Some(old) => versions.save(old),
+                None => Ok(()),
+            };
+            if let Err(e) = kept.and_then(|()| versions.save(&text)) {
+                say(format!("could not keep a copy for the diff screen: {e}"));
+            }
             // A next write of this agent needs no new read: it knows this text.
             if let Err(e) = reads.remember(&args.who, &path, new) {
                 say(format!(
