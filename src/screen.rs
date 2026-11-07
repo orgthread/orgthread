@@ -17,6 +17,8 @@ use std::time::Duration;
 const BLUE: Color = Color::Rgb(0x22, 0x6D, 0xBD);
 const ORANGE: Color = Color::Rgb(0xE8, 0x74, 0x0C);
 const REFRESH: Duration = Duration::from_secs(1);
+/// The name and the version of this build, from `Cargo.toml`.
+const TITLE: &str = concat!("orgthread watch ", env!("CARGO_PKG_VERSION"));
 
 /// Which line is chosen. `None` follows the newest line, and a number stays on
 /// the same entry while new ones arrive.
@@ -207,10 +209,7 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
 
     let bold = Style::new().add_modifier(Modifier::BOLD);
     frame.render_widget(
-        Line::from(vec![
-            Span::styled("orgthread watch", bold),
-            Span::raw("   read only"),
-        ]),
+        Line::from(vec![Span::styled(TITLE, bold), Span::raw("   read only")]),
         head,
     );
     frame.render_widget(
@@ -329,10 +328,7 @@ pub fn draw_diff(frame: &mut Frame, view: &DiffView) {
     let shown: Vec<Line> = lines.into_iter().skip(scroll).collect();
     let bold = Style::new().add_modifier(Modifier::BOLD);
     frame.render_widget(
-        Line::from(vec![
-            Span::styled("orgthread watch", bold),
-            Span::raw("   read only"),
-        ]),
+        Line::from(vec![Span::styled(TITLE, bold), Span::raw("   read only")]),
         head,
     );
     frame.render_widget(
@@ -437,6 +433,25 @@ mod tests {
         assert!(text.contains("read only"));
         assert!(text.contains("none"));
         assert!(text.contains("No writes yet."));
+    }
+
+    #[test]
+    fn every_screen_shows_the_version_of_the_build_on_its_first_line() {
+        use crate::versions::Versions;
+        let want = format!("orgthread watch {}", env!("CARGO_PKG_VERSION"));
+
+        let text = screen(&Snapshot::default(), &Choice::default());
+        assert!(text.lines().next().unwrap().contains(&want), "{text}");
+
+        let none = Path::new("no-such-place");
+        let text = once(none, none, 100, 28).unwrap();
+        assert!(text.lines().next().unwrap().contains(&want), "{text}");
+
+        let view = DiffView::open(&entry("written", "a"), &Versions::none());
+        let mut t = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        t.draw(|f| draw_diff(f, &view)).unwrap();
+        let text = text_of(&t);
+        assert!(text.lines().next().unwrap().contains(&want), "{text}");
     }
 
     #[test]
