@@ -137,7 +137,7 @@ fn run(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         Some("--version" | "-V") => {
-            println!("orgthread {}", env!("CARGO_PKG_VERSION"));
+            println!("orgthread {}", orgthread::VERSION);
             Ok(0)
         }
         Some(other) => Err(format!("there is no command {other}")),
