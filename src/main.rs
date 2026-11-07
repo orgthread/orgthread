@@ -49,6 +49,9 @@ Settings, from the environment:
   ORGTHREAD_READS     the notes of what was read (default: ~/.local/state/orgthread/reads)
   ORGTHREAD_STORAGE   dropbox: use the Dropbox API, with paths from its root, such as /org/a.md.
                       Needs ORGTHREAD_DROPBOX_TOKEN in the environment. Keeps no copies.
+  ORGTHREAD_ALLOW, ORGTHREAD_DENY, ORGTHREAD_READ_ONLY
+                      comma-separated folders or files: what a door may touch,
+                      what it may not, and what it may only read
   ORGTHREAD_VERSIONS  a copy of each version written, for the diff screen, for 30 days
                       (default: ~/.local/state/orgthread/versions)
 
@@ -235,6 +238,7 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
     let (file, to) = (&file, to.as_ref());
     let settings = Settings::load()?;
     let path = settings.path_of(file)?;
+    settings.limits(&path, false)?;
     let storage = settings.storage()?;
     let bytes = match storage.read(&path) {
         Ok(Some(bytes)) => bytes,
@@ -326,6 +330,17 @@ impl Settings {
     }
 
     /// The path from the root. In Dropbox a file is named from there already.
+    fn limits(&self, path: &str, writing: bool) -> Result<(), String> {
+        let var = |name: &str| env::var(name).unwrap_or_default();
+        write::check_limits(
+            path,
+            writing,
+            &var("ORGTHREAD_ALLOW"),
+            &var("ORGTHREAD_DENY"),
+            &var("ORGTHREAD_READ_ONLY"),
+        )
+    }
+
     fn path_of(&self, file: &str) -> Result<String, String> {
         if self.dropbox {
             let inside = file
@@ -438,6 +453,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     let settings = Settings::load()?;
     let reads = Reads::new(&settings.reads);
     let path = settings.path_of(&args.file)?;
+    settings.limits(&path, true)?;
 
     let mut text = Vec::new();
     io::stdin()

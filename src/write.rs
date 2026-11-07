@@ -44,6 +44,42 @@ pub fn check_text(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// True when `path` is the folder or file `rule`, or lies inside it. Capitals do
+/// not count, as Dropbox does not count them either.
+pub fn is_under(path: &str, rule: &str) -> bool {
+    let path = path.trim_start_matches('/').to_lowercase();
+    let rule = rule.trim_matches('/').to_lowercase();
+    !rule.is_empty() && (path == rule || path.starts_with(&format!("{rule}/")))
+}
+
+/// The limits of a door, from comma-separated lists. An empty `allow` allows all.
+/// A refusal says why. These guard against a confused chat, not against a thief.
+pub fn check_limits(
+    path: &str,
+    writing: bool,
+    allow: &str,
+    deny: &str,
+    read_only: &str,
+) -> Result<(), String> {
+    let list = |text: &str| -> Vec<String> {
+        text.split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    };
+    let allowed = list(allow);
+    if !allowed.is_empty() && !allowed.iter().any(|rule| is_under(path, rule)) {
+        return Err(format!("{path} is outside the folders this door may touch"));
+    }
+    if list(deny).iter().any(|rule| is_under(path, rule)) {
+        return Err(format!("{path} is closed to this door"));
+    }
+    if writing && list(read_only).iter().any(|rule| is_under(path, rule)) {
+        return Err(format!("{path} is read only for this door"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     Written {

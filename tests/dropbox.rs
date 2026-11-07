@@ -434,3 +434,69 @@ fn a_refresh_token_gets_a_fresh_key_for_a_service() {
     assert_eq!(code(&o), 0, "{o:?}");
     assert_eq!(f.get(FILE).unwrap(), b"text\n");
 }
+
+#[test]
+fn the_limits_hold_for_reads_and_writes() {
+    let f = Fake::new();
+    f.put("/org/notes/a.md", b"old\n");
+    f.put("/org/health/log.md", b"private\n");
+    f.put("/org/tasks.org", b"* TODO\n");
+    f.put("/other/b.md", b"other\n");
+    f.put("/organic/c.md", b"near\n");
+    let run = |args: &[&str], text: &[u8]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+        c.args(args)
+            .env("ORGTHREAD_STORAGE", "dropbox")
+            .env("ORGTHREAD_DROPBOX_API", &f.url)
+            .env("ORGTHREAD_DROPBOX_CONTENT", &f.url)
+            .env("ORGTHREAD_DROPBOX_TOKEN", GOOD_TOKEN)
+            .env("ORGTHREAD_LOG", f.dir.join("log"))
+            .env("ORGTHREAD_READS", f.dir.join("reads"))
+            .env("ORGTHREAD_ALLOW", "/org")
+            .env("ORGTHREAD_DENY", "/org/health")
+            .env("ORGTHREAD_READ_ONLY", "/org/tasks.org")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        let _ = child.stdin.take().unwrap().write_all(text);
+        child.wait_with_output().unwrap()
+    };
+    // Allowed.
+    assert_eq!(
+        code(&run(&["read", "/org/notes/a.md", "--who", "c"], b"")),
+        0
+    );
+    assert_eq!(
+        code(&run(&["write", "/org/notes/a.md", "--who", "c"], b"new\n")),
+        0
+    );
+    assert_eq!(f.get("/org/notes/a.md").unwrap(), b"new\n");
+    // Closed, with any capitals, for reading and writing.
+    for path in ["/org/health/log.md", "/ORG/Health/log.md", "/org/health"] {
+        let o = run(&["read", path, "--who", "c"], b"");
+        assert_eq!(code(&o), 2, "{path} {o:?}");
+        assert!(o.stdout.is_empty(), "{path}");
+        assert_eq!(
+            code(&run(&["write", path, "--who", "c"], b"x\n")),
+            2,
+            "{path}"
+        );
+    }
+    assert_eq!(f.get("/org/health/log.md").unwrap(), b"private\n");
+    // Outside, also a folder that only starts with the same letters.
+    for path in ["/other/b.md", "/organic/c.md"] {
+        assert_eq!(code(&run(&["read", path, "--who", "c"], b"")), 2, "{path}");
+    }
+    // Read only.
+    assert_eq!(
+        code(&run(&["read", "/org/tasks.org", "--who", "c"], b"")),
+        0
+    );
+    let o = run(&["write", "/org/tasks.org", "--who", "c"], b"x\n");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("read only"));
+    assert_eq!(f.get("/org/tasks.org").unwrap(), b"* TODO\n");
+}
