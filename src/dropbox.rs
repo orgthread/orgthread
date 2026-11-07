@@ -2,19 +2,19 @@
 //!
 //! The requests go through the `curl` program, so this needs no web library. The
 //! token stays in the environment: it never appears in a command line, a file or
-//! a message. Text goes through a pipe and is never written to disk.
+//! a message. Text goes through a pipe and is not written to disk, with one
+//! exception: a rescue, what a failed write found in the file, stays beside the
+//! program until its owner settles it on the screen.
 //!
-//! The locks are small local files beside the program, with no text of a file:
-//! one gateway is the one place to look, and a lock costs no web call. Between
-//! writers elsewhere, Dropbox's own version check decides.
+//! The locks are small local files beside the program: a lock costs no web call.
+//! Between writers elsewhere, Dropbox's own version check decides.
 
 use crate::storage::{Expect, LocalFolder, Storage, WriteError};
-use crate::watch::seconds_of;
 use serde_json::{Value, json};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub const TOKEN: &str = "ORGTHREAD_DROPBOX_TOKEN";
 /// For a service: these three get a fresh short-lived token for each command.
@@ -28,12 +28,9 @@ pub struct Dropbox {
     token: String,
     api: String,
     content: String,
-    /// Only its lock steps are used: every file goes to Dropbox.
+    /// Only its lock and rescue steps are used: every file goes to Dropbox.
     locks: LocalFolder,
 }
-
-/// Where a rescue goes: it holds the text of a file, so it stays in Dropbox.
-const RESCUE_FOLDER: &str = "/org/.locks";
 
 struct Reply {
     status: u16,
@@ -43,7 +40,6 @@ struct Reply {
 struct Meta {
     rev: String,
     hash: String,
-    modified: String,
 }
 
 fn failure(message: String) -> io::Error {
@@ -239,7 +235,6 @@ impl Dropbox {
                 Ok(Some(Meta {
                     rev: text("rev"),
                     hash: text("content_hash"),
-                    modified: text("server_modified"),
                 }))
             }
             409 if summary(&reply.body).contains("not_found") => Ok(None),
@@ -283,14 +278,6 @@ impl Dropbox {
             }
             _ => Err(refused(&reply)),
         }
-    }
-
-    fn age_of(meta: &Meta) -> Duration {
-        let then = seconds_of(&meta.modified.replace('T', " ")).unwrap_or(u64::MAX);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        Duration::from_secs(now.saturating_sub(then))
     }
 }
 
@@ -341,13 +328,7 @@ impl Storage for Dropbox {
     }
 
     fn rescue(&self, path: &str, bytes: &[u8]) -> io::Result<String> {
-        let name = format!("{}.{}.rescue", path.replace('/', "--"), std::process::id());
-        let full = format!("{RESCUE_FOLDER}/{name}");
-        if self.upload(&full, json!("add"), bytes)? {
-            Ok(full)
-        } else {
-            Err(io::Error::new(ErrorKind::AlreadyExists, full))
-        }
+        self.locks.rescue(path, bytes)
     }
 
     fn lock_create(&self, name: &str, line: &str) -> io::Result<bool> {

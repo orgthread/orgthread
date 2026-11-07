@@ -216,7 +216,7 @@ impl Storage for LocalFolder {
         if !self.locks.is_dir() {
             return Err(io::Error::new(
                 ErrorKind::NotFound,
-                format!("the lock folder {} does not exist", self.locks.display()),
+                format!("orgthread's folder {} does not exist", self.locks.display()),
             ));
         }
         let path = self.lock_path(name);

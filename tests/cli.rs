@@ -39,6 +39,7 @@ impl Place {
         let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
         c.args(args)
             .env("ORGTHREAD_ROOT", &self.root)
+            .env("ORGTHREAD_LOCK_DIR", self.root.join("org/.locks"))
             .env("ORGTHREAD_LOG", self.log())
             .env(
                 "ORGTHREAD_READS",
@@ -495,4 +496,58 @@ fn a_copy_that_cannot_be_kept_does_not_fail_the_write() {
     assert_eq!(code(&o), 0, "{o:?}");
     assert_eq!(p.text(), b"new\n");
     assert!(String::from_utf8_lossy(&o.stderr).contains("could not keep a copy"));
+}
+
+/// The program alone in a folder beside the notes, with an invented home.
+fn program_beside(p: &Place) -> PathBuf {
+    let folder = p.root.with_extension("outside").join("program");
+    fs::create_dir_all(&folder).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_orgthread"), folder.join("orgthread")).unwrap();
+    fs::write(
+        folder.join(".env"),
+        format!("ORGTHREAD_ROOT={}\n", p.root.display()),
+    )
+    .unwrap();
+    fs::canonicalize(folder).unwrap()
+}
+
+#[test]
+fn a_local_folder_keeps_locks_and_log_beside_the_program_too() {
+    let p = Place::new();
+    let folder = program_beside(&p);
+    fs::remove_dir_all(p.root.join("org/.locks")).unwrap();
+    let run = |args: &[&str], text: &[u8]| {
+        let mut child = Command::new(folder.join("orgthread"))
+            .args(args)
+            .env_clear()
+            .env("HOME", p.outside("home"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(text);
+        child.wait_with_output().unwrap()
+    };
+    let f = p.f();
+    let o = run(&["write", &f, "--who", "chat"], b"new\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(p.text(), b"new\n");
+    assert!(!p.root.join("org/.locks").exists(), "no lock in the notes");
+    assert_eq!(fs::read_dir(folder.join(".locks")).unwrap().count(), 0);
+    let log = fs::read_to_string(folder.join("state/writes.log")).unwrap();
+    assert!(log.contains("org/notes/invented.md"), "{log}");
+
+    // A lock in the old place means nothing, and the one beside the program holds.
+    fs::create_dir_all(p.root.join("org/.locks")).unwrap();
+    let name = "org--notes--invented.md.lock";
+    fs::write(p.root.join("org/.locks").join(name), "old place\n").unwrap();
+    let o = run(&["write", &f, "--who", "chat"], b"next\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    fs::write(folder.join(".locks").join(name), "other writer\n").unwrap();
+    let o = run(&["write", &f, "--who", "chat"], b"third\n");
+    assert_eq!(code(&o), 3, "{o:?}");
+    assert_eq!(p.text(), b"next\n");
+    let o = run(&["watch", "--once"], b"");
+    assert!(String::from_utf8_lossy(&o.stdout).contains("other writer"));
 }

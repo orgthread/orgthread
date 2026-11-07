@@ -69,6 +69,7 @@ impl Door {
             .env("ORGTHREAD_PUBLIC_URL", base)
             .env("ORGTHREAD_LOGIN_HASH", password_hash(PASSWORD))
             .env("ORGTHREAD_ROOT", &root)
+            .env("ORGTHREAD_LOCK_DIR", root.join("org/.locks"))
             .env("ORGTHREAD_LOG", root.join("log"))
             .env("ORGTHREAD_READS", root.join("reads"))
             .env("ORGTHREAD_VERSIONS", root.join("versions"))

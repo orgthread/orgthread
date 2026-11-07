@@ -47,18 +47,17 @@ Settings, from the environment:
   setting of this list that the environment does not hold.
 
   ORGTHREAD_ROOT      the folder all paths live in (default: ~/Library/CloudStorage/Dropbox)
-  ORGTHREAD_LOCK_DIR  the lock folder inside it (default: org/.locks)
-  ORGTHREAD_LOG       the log file (default: ~/.local/state/orgthread/writes.log)
-  ORGTHREAD_READS     the notes of what was read (default: ~/.local/state/orgthread/reads)
+  ORGTHREAD_LOCK_DIR  orgthread's own locks, on this machine only (default: .locks beside the
+                      program). For a local folder, on the same disk as ORGTHREAD_ROOT
+  ORGTHREAD_LOG       the log file (default: state/writes.log beside the program)
+  ORGTHREAD_READS     the notes of what was read (default: state/reads beside the program)
   ORGTHREAD_STORAGE   dropbox: use the Dropbox API, with paths from its root, such as /org/a.md.
-                      Needs ORGTHREAD_DROPBOX_TOKEN. Keeps no copies. For one gateway:
-                      locks, log and notes stay beside the program, in .locks and state,
-                      unless the settings above name other places on this machine.
+                      Needs ORGTHREAD_DROPBOX_TOKEN. Keeps no copies.
   ORGTHREAD_ALLOW, ORGTHREAD_DENY, ORGTHREAD_READ_ONLY
                       comma-separated folders or files: what a door may touch,
                       what it may not, and what it may only read
   ORGTHREAD_VERSIONS  a copy of each version written, for the diff screen, for 30 days
-                      (default: ~/.local/state/orgthread/versions)
+                      (default: state/versions beside the program)
 
 Exit codes:
   0  done                    6  missing: this name read it, but it is gone
@@ -408,39 +407,36 @@ impl Settings {
 impl Settings {
     fn load() -> Result<Settings, String> {
         let dropbox = env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
-        // One gateway to Dropbox: its locks and log live beside the program.
-        let (root, locks, state) = if dropbox {
-            let folder = program_folder()?;
-            let locks = match env::var_os("ORGTHREAD_LOCK_DIR") {
-                Some(dir) => folder.join(dir),
-                None => folder.join(".locks"),
-            };
-            // The first run makes it. A failure shows when a write needs it.
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            let _ = builder.create(&locks);
-            (PathBuf::new(), locks, folder.join("state"))
+        // Locks, log and notes live beside the program, and nowhere else.
+        let folder = program_folder()?;
+        let locks = match env::var_os("ORGTHREAD_LOCK_DIR") {
+            Some(dir) => folder.join(dir),
+            None => folder.join(".locks"),
+        };
+        // The first run makes it. A failure shows when a write needs it.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        let _ = builder.create(&locks);
+        let state = folder.join("state");
+        let root = if dropbox {
+            PathBuf::new()
         } else {
             let root = match env::var_os("ORGTHREAD_ROOT") {
                 Some(root) => PathBuf::from(root),
                 None => home()?.join("Library/CloudStorage/Dropbox"),
             };
-            let root = fs::canonicalize(&root).map_err(|e| {
-                let place = program_folder().map_or_else(|_| "beside this program".to_string(), |f| format!("in {}", f.join(".env").display()));
+            fs::canonicalize(&root).map_err(|e| {
                 format!(
-                    "the folder {} does not exist: {e}. Set ORGTHREAD_ROOT to your folder, or ORGTHREAD_STORAGE=dropbox to use the Dropbox API, in the environment or {place}",
-                    root.display()
+                    "the folder {} does not exist: {e}. Set ORGTHREAD_ROOT to your folder, or ORGTHREAD_STORAGE=dropbox to use the Dropbox API, in the environment or in {}",
+                    root.display(),
+                    folder.join(".env").display()
                 )
-            })?;
-            let lock_dir =
-                env::var("ORGTHREAD_LOCK_DIR").unwrap_or_else(|_| "org/.locks".to_string());
-            let locks = root.join(lock_dir);
-            (root, locks, home()?.join(".local/state/orgthread"))
+            })?
         };
         let log = match env::var_os("ORGTHREAD_LOG") {
             Some(path) => PathBuf::from(path),
@@ -587,8 +583,8 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     // First the log. A closed output must never hide what happened to the file.
     let logged = log::append(&settings.log, &line);
     let saved = |rescued: &Option<String>| match rescued {
-        Some(place) => format!(" What the file held instead is kept in {place}."),
-        None => String::new(),
+        Some(_) => " What the file held instead is kept for its owner: orgthread watch shows it.",
+        None => "",
     };
     match &report.outcome {
         Outcome::Written {

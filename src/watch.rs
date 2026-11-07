@@ -248,7 +248,7 @@ pub fn diff_of(entry: &Entry, versions: &Versions) -> Result<Vec<Row>, String> {
     }
     if !versions.keeps_copies() {
         return Err(
-            "This server keeps no copies, so that no text stays on its disk. Dropbox keeps the old versions in its history."
+            "This server keeps no copies of what it writes. Dropbox keeps the old versions in its history."
                 .to_string(),
         );
     }

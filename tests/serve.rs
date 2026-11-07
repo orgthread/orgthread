@@ -36,6 +36,7 @@ impl Place {
         let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
         c.args(args)
             .env("ORGTHREAD_ROOT", &self.root)
+            .env("ORGTHREAD_LOCK_DIR", self.root.join("org/.locks"))
             .env("ORGTHREAD_LOG", self.log())
             .env(
                 "ORGTHREAD_READS",

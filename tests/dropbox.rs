@@ -29,6 +29,8 @@ struct State {
     next_rev: u64,
     /// The next update finds a newer version, as if a second writer came first.
     second_writer: bool,
+    /// The next update stores this in place of what was sent, as if a person edited it.
+    edit_instead: Option<Vec<u8>>,
 }
 
 impl State {
@@ -144,7 +146,14 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
                 }
             };
             if ok {
-                s.put(&path, &body);
+                let stored = match (&arg["mode"], s.edit_instead.take()) {
+                    (Value::Object(_), Some(edit)) => edit,
+                    (_, edit) => {
+                        s.edit_instead = edit;
+                        body
+                    }
+                };
+                s.put(&path, &stored);
                 reply(&mut stream, 200, b"{}");
             } else {
                 error(&mut stream, "path/conflict/file/..");
@@ -473,6 +482,36 @@ fn settings_beside_the_program_let_every_command_work_there() {
             }
         }
     }
+}
+
+#[test]
+fn a_rescue_stays_on_the_server_and_the_screen_shows_it() {
+    let f = Fake::new();
+    let s = Server::new(&f);
+    s.dropbox_settings(&f);
+    f.put(FILE, b"old\n");
+    assert_eq!(code(&s.run(&["read", FILE, "--who", "chat"], b"")), 0);
+    f.state.lock().unwrap().edit_instead = Some(b"a person's edit\n".to_vec());
+    let o = s.run(&["write", FILE, "--who", "chat"], b"new\n");
+    assert_eq!(code(&o), 7, "{o:?}");
+    let said = String::from_utf8_lossy(&o.stderr).to_lowercase();
+    assert!(
+        !said.contains("lock"),
+        "a chat need not know about locks: {said}"
+    );
+    assert!(said.contains("orgthread watch"), "{said}");
+    assert_eq!(f.get(FILE).unwrap(), b"old\n");
+    assert_eq!(f.names(), [FILE], "nothing extra in Dropbox");
+    let kept: Vec<_> = fs::read_dir(s.folder.join(".locks"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(fs::read(&kept[0]).unwrap(), b"a person's edit\n");
+    let o = s.run(&["watch", "--once"], b"");
+    let screen = String::from_utf8_lossy(&o.stdout);
+    assert!(screen.contains("left behind"), "{screen}");
 }
 
 #[test]
