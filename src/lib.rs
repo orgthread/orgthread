@@ -3,4 +3,5 @@
 pub mod fingerprint;
 pub mod log;
 pub mod storage;
+pub mod watch;
 pub mod write;
