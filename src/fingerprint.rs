@@ -19,11 +19,6 @@ pub fn fingerprint(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// True when the text has the shape of a fingerprint: 64 lower-case hex signs.
-pub fn is_fingerprint(text: &str) -> bool {
-    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,12 +47,5 @@ mod tests {
             fingerprint(&bytes),
             "656e7e27f7d0459e319264cdccb61f6667e8e964f8e763c332f35d36ee1cb924"
         );
-    }
-
-    #[test]
-    fn shape_check() {
-        assert!(is_fingerprint(&fingerprint(b"a")));
-        assert!(!is_fingerprint("abc"));
-        assert!(!is_fingerprint(&"A".repeat(64)));
     }
 }

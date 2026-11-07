@@ -1,5 +1,6 @@
-use orgthread::fingerprint::{fingerprint, is_fingerprint};
+use orgthread::fingerprint::fingerprint;
 use orgthread::log;
+use orgthread::reads::Reads;
 use orgthread::screen;
 use orgthread::storage::{Expect, LocalFolder, Storage};
 use orgthread::write::{self, Outcome, exit};
@@ -10,34 +11,40 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-orgthread writes a plain text file the same way every time.
+orgthread reads and writes a plain text file the same way every time.
 
-  orgthread read <file> --to <copy>       saves an exact copy, prints its fingerprint
-  orgthread read <file>                   prints the fingerprint, then the exact text
-  orgthread fingerprint <file>            only the fingerprint, for a check
-  orgthread watch                         the read-only screen: locks, writes, refusals
-  orgthread watch --once                  the same screen once, as plain text
-  orgthread write <file> --expect <fingerprint> --who <name>   < new-text
-  orgthread write <file> --new --who <name>                    < new-text
+For an agent, two commands:
 
-  To change a file: read it, build the new text from that copy, and give write
-  that fingerprint. Text and fingerprint then come from one single read.
+  orgthread read <file> --who <name>             prints the exact text
+  orgthread read <file> --who <name> --to <copy> saves an exact copy instead
+  orgthread write <file> --who <name>            < the whole new text
 
-  Add --size <bytes> to refuse new text of any other length, so a cut-off
-  pipe cannot replace a whole file.
+Give the same name each time. To change a file, read it first. A new file needs
+no read. orgthread remembers what each name read, and it refuses a write when
+the file changed since. The agent never handles anything else.
+
+For a person:
+
+  orgthread watch                                the read-only screen
+  orgthread watch --once                         the same screen, as plain text
+  orgthread fingerprint <file>                   the content hash Dropbox reports
+
+Options of write: --size <bytes> refuses text of any other length, so a cut-off
+pipe cannot replace a whole file.
 
 Settings, from the environment:
   ORGTHREAD_ROOT      the folder all paths live in (default: ~/Library/CloudStorage/Dropbox)
   ORGTHREAD_LOCK_DIR  the lock folder inside it (default: org/.locks)
   ORGTHREAD_LOG       the log file (default: ~/.local/state/orgthread/writes.log)
+  ORGTHREAD_READS     the notes of what was read (default: ~/.local/state/orgthread/reads)
 
 Exit codes:
-  0  written                 6  missing: --expect, but no file there
+  0  done                    6  missing: this name read it, but it is gone
   1  failed, file unchanged  7  check failed, old state put back
   2  wrong use, or not text  8  written, but the log line failed
   3  locked by a writer      9  check failed, old state NOT put back
-  4  changed since you read  10 written, but the lock was not released or not ours
-  5  exists: --new, but a file is there
+  4  changed: read it again  10 written, but the lock was not released or not ours
+  5  exists: read it first, or for --to, the copy exists
 ";
 
 fn main() -> ExitCode {
@@ -92,37 +99,57 @@ fn cmd_fingerprint(args: &[String]) -> Result<i32, String> {
     }
 }
 
+struct ReadArgs {
+    file: String,
+    who: String,
+    to: Option<String>,
+}
+
+fn parse_read(args: &[String]) -> Result<ReadArgs, String> {
+    let mut file = None;
+    let mut who = None;
+    let mut to = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--who" => who = Some(rest.next().ok_or("--who needs a name")?.clone()),
+            "--to" => to = Some(rest.next().ok_or("--to needs a file")?.clone()),
+            other if other.starts_with("--") => return Err(format!("there is no option {other}")),
+            other => {
+                if file.replace(other.to_string()).is_some() {
+                    return Err("read takes one file".into());
+                }
+            }
+        }
+    }
+    Ok(ReadArgs {
+        file: file.ok_or("read needs a file")?,
+        who: checked_who(who)?,
+        to,
+    })
+}
+
+fn checked_who(who: Option<String>) -> Result<String, String> {
+    let who = who.ok_or("--who is required: give the same name of this agent each time")?;
+    if who.trim().is_empty() || who.chars().any(char::is_control) {
+        return Err("--who must be a name on one line".into());
+    }
+    Ok(who)
+}
+
 struct WriteArgs {
     file: String,
-    expect: Expect,
     who: String,
     size: Option<usize>,
 }
 
 fn parse_write(args: &[String]) -> Result<WriteArgs, String> {
     let mut file = None;
-    let mut expect = None;
     let mut who = None;
     let mut size = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--expect" => {
-                let value = rest.next().ok_or("--expect needs a fingerprint")?;
-                if !is_fingerprint(value) {
-                    return Err(format!(
-                        "{value} is not a fingerprint: it must be 64 lower-case hex signs"
-                    ));
-                }
-                if expect.replace(Expect::Fingerprint(value.clone())).is_some() {
-                    return Err("give --expect or --new once".into());
-                }
-            }
-            "--new" => {
-                if expect.replace(Expect::Absent).is_some() {
-                    return Err("give --expect or --new once".into());
-                }
-            }
             "--size" => {
                 let value = rest.next().ok_or("--size needs a number of bytes")?;
                 let bytes = value
@@ -139,14 +166,9 @@ fn parse_write(args: &[String]) -> Result<WriteArgs, String> {
             }
         }
     }
-    let who = who.ok_or("--who is required: the lock says who is writing")?;
-    if who.trim().is_empty() || who.chars().any(char::is_control) {
-        return Err("--who must be a name on one line".into());
-    }
     Ok(WriteArgs {
         file: file.ok_or("write needs a file")?,
-        expect: expect.ok_or("write needs --expect <fingerprint> or --new")?,
-        who,
+        who: checked_who(who)?,
         size,
     })
 }
@@ -184,15 +206,10 @@ fn path_in_root(file: &str, root: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("the path of {file} is not valid UTF-8"))
 }
 
-/// Text and fingerprint from one single read, so that no change can slip in
-/// between the two.
+/// The exact text, and a note of what this name read, from one single read.
 fn cmd_read(args: &[String]) -> Result<i32, String> {
-    let (file, to) = match args {
-        [file] => (file, None),
-        [file, flag, to] if flag == "--to" => (file, Some(to)),
-        [flag, to, file] if flag == "--to" => (file, Some(to)),
-        _ => return Err("read takes one file, and maybe --to <copy>".into()),
-    };
+    let ReadArgs { file, who, to } = parse_read(args)?;
+    let (file, to) = (&file, to.as_ref());
     let settings = Settings::load()?;
     let path = path_in_root(file, &settings.root)?;
     if fs::metadata(settings.root.join(&path)).is_ok_and(|m| !m.is_file()) {
@@ -215,12 +232,17 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
     {
         return Err(format!("{path}: {reason}"));
     }
-    let print = fingerprint(&bytes);
+    let reads = Reads::new(&settings.reads);
+    reads.tidy();
     let mut out = io::stdout();
     let sent = match to {
-        None => out
-            .write_all(format!("{print}\n").as_bytes())
-            .and_then(|()| out.write_all(&bytes)),
+        None => {
+            if let Err(e) = reads.remember(&who, &path, &fingerprint(&bytes)) {
+                say(format!("could not note this read: {e}"));
+                return Ok(exit::FAILED);
+            }
+            out.write_all(&bytes)
+        }
         Some(to) => {
             let copy = Path::new(to);
             let parent = match copy.parent() {
@@ -250,9 +272,10 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
                     return Ok(exit::FAILED);
                 }
             };
+            // The note comes last: a failed copy must not count as read.
             made.write_all(&bytes)
                 .and_then(|()| made.sync_all())
-                .and_then(|()| out.write_all(format!("{print}\n").as_bytes()))
+                .and_then(|()| reads.remember(&who, &path, &fingerprint(&bytes)))
         }
     };
     match sent.and_then(|()| out.flush()) {
@@ -268,6 +291,7 @@ struct Settings {
     root: PathBuf,
     lock_dir: String,
     log: PathBuf,
+    reads: PathBuf,
 }
 
 impl Settings {
@@ -283,10 +307,15 @@ impl Settings {
             Some(path) => PathBuf::from(path),
             None => home()?.join(".local/state/orgthread/writes.log"),
         };
+        let reads = match env::var_os("ORGTHREAD_READS") {
+            Some(path) => PathBuf::from(path),
+            None => home()?.join(".local/state/orgthread/reads"),
+        };
         Ok(Settings {
             root,
             lock_dir,
             log,
+            reads,
         })
     }
 }
@@ -321,7 +350,9 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
         root,
         lock_dir,
         log: log_path,
+        reads,
     } = Settings::load()?;
+    let reads = Reads::new(reads);
     let path = path_in_root(&args.file, &root)?;
     if fs::metadata(root.join(&path)).is_ok_and(|m| !m.is_file()) {
         return Err(format!("{} is not a file", args.file));
@@ -341,10 +372,20 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
         ));
     }
 
+    // What this name read decides what must hold. An unread file must be new.
+    let expect = match reads.recall(&args.who, &path) {
+        Ok(Some(print)) => Expect::Fingerprint(print),
+        Ok(None) => Expect::Absent,
+        Err(e) => {
+            say(format!("could not look up what {} read: {e}", args.who));
+            return Ok(exit::FAILED);
+        }
+    };
+
     let now = log::utc_now();
     let storage = LocalFolder::new(&root, &lock_dir);
     let lock_line = format!("orgthread {} {now} pid {}", args.who, std::process::id());
-    let report = write::write(&storage, &path, &args.expect, &text, &lock_line);
+    let report = write::write(&storage, &path, &expect, &text, &lock_line);
 
     let (before, after, size) = match &report.outcome {
         Outcome::Written { old, new, size } => (
@@ -373,21 +414,28 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
         None => String::new(),
     };
     match &report.outcome {
-        Outcome::Written { .. } => {
-            let _ = writeln!(io::stdout(), "{line}");
+        Outcome::Written { new, size, .. } => {
+            // A next write of this agent needs no new read: it knows this text.
+            if let Err(e) = reads.remember(&args.who, &path, new) {
+                say(format!(
+                    "could not note this write, so read before the next one: {e}"
+                ));
+            }
+            let _ = writeln!(io::stdout(), "written: {path}, {size} bytes");
         }
         Outcome::Locked { holder, age } => say(format!(
             "refused, nothing written. {path} is locked since {} s by: {holder}. Try again when that writer is done.",
             age.as_secs()
         )),
-        Outcome::Changed { expected, found } => say(format!(
-            "refused, nothing written. {path} changed since you read it. You expected {expected}, and it is {found}. Read it again and build the change from those bytes."
+        Outcome::Changed { .. } => say(format!(
+            "refused, nothing written. {path} changed since you read it. Read it again and build the change from that text."
         )),
-        Outcome::Exists { found } => say(format!(
-            "refused, nothing written. {path} exists already, with fingerprint {found}. To change it, use --expect."
+        Outcome::Exists { .. } => say(format!(
+            "refused, nothing written. {path} exists, and {} has not read it. Read it first with: orgthread read <file> --who <same name>",
+            args.who
         )),
-        Outcome::Missing { expected } => say(format!(
-            "refused, nothing written. There is no file {path}, and you expected {expected}."
+        Outcome::Missing { .. } => say(format!(
+            "refused, nothing written. {path} is gone since you read it."
         )),
         Outcome::Restored { reason, rescued } => say(format!(
             "the check after the write failed: {reason}. The old state of {path} is back.{}",

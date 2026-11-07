@@ -1,4 +1,4 @@
-//! The command itself: its exit codes, its output and its log line.
+//! The command itself: what an agent types, the exit codes, and the log.
 
 use orgthread::fingerprint::fingerprint;
 use std::fs;
@@ -18,6 +18,7 @@ impl Place {
         let root = std::env::temp_dir().join(format!("orgthread-cli-{}-{n}", std::process::id()));
         fs::create_dir_all(root.join("org/.locks")).unwrap();
         fs::create_dir_all(root.join("org/notes")).unwrap();
+        fs::create_dir_all(root.with_extension("outside")).unwrap();
         Place {
             root: fs::canonicalize(root).unwrap(),
         }
@@ -25,20 +26,29 @@ impl Place {
     fn file(&self) -> PathBuf {
         self.root.join("org/notes/invented.md")
     }
-    /// A folder for working copies, outside the root.
-    fn outside(&self) -> PathBuf {
-        let dir = self.root.with_extension("copies");
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn f(&self) -> String {
+        self.file().to_str().unwrap().to_string()
+    }
+    fn outside(&self, name: &str) -> PathBuf {
+        self.root.with_extension("outside").join(name)
     }
     fn log(&self) -> PathBuf {
         self.root.join("log/writes.log")
     }
-    fn run(&self, args: &[&str], stdin: &[u8]) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
-            .args(args)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+        c.args(args)
             .env("ORGTHREAD_ROOT", &self.root)
             .env("ORGTHREAD_LOG", self.log())
+            .env(
+                "ORGTHREAD_READS",
+                self.root.with_extension("outside").join("reads"),
+            );
+        c
+    }
+    fn run(&self, args: &[&str], stdin: &[u8]) -> Output {
+        let mut child = self
+            .command(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -47,12 +57,21 @@ impl Place {
         child.stdin.take().unwrap().write_all(stdin).unwrap();
         child.wait_with_output().unwrap()
     }
+    fn read(&self, who: &str) -> Output {
+        self.run(&["read", &self.f(), "--who", who], b"")
+    }
+    fn write(&self, who: &str, text: &[u8]) -> Output {
+        self.run(&["write", &self.f(), "--who", who], text)
+    }
+    fn text(&self) -> Vec<u8> {
+        fs::read(self.file()).unwrap()
+    }
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
-        let _ = fs::remove_dir_all(self.root.with_extension("copies"));
+        let _ = fs::remove_dir_all(self.root.with_extension("outside"));
     }
 }
 
@@ -61,147 +80,245 @@ fn code(o: &Output) -> i32 {
 }
 
 #[test]
-fn new_then_change_then_refusals() {
+fn a_new_file_needs_no_read() {
     let p = Place::new();
-    let file = p.file();
-    let f = file.to_str().unwrap();
-
-    let o = p.run(
-        &["write", f, "--new", "--who", "test chat"],
-        "Grüße\n".as_bytes(),
-    );
+    let o = p.write("chat", "Grüße\n".as_bytes());
     assert_eq!(code(&o), 0, "{o:?}");
-    assert_eq!(fs::read(&file).unwrap(), "Grüße\n".as_bytes());
+    assert_eq!(p.text(), "Grüße\n".as_bytes());
+    let told = String::from_utf8(o.stdout).unwrap();
+    assert_eq!(told, "written: org/notes/invented.md, 8 bytes\n");
+}
 
-    let o = p.run(&["fingerprint", f], b"");
-    let print = String::from_utf8(o.stdout).unwrap();
-    assert_eq!(print.trim(), fingerprint("Grüße\n".as_bytes()));
-
-    let o = p.run(
-        &["write", f, "--expect", print.trim(), "--who", "test chat"],
-        b"second",
-    );
+#[test]
+fn read_then_write_is_all_an_agent_does() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    let o = p.read("chat");
     assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(o.stdout, b"old\n", "only the text, and nothing else");
+    assert_eq!(code(&p.write("chat", b"new\n")), 0);
+    assert_eq!(p.text(), b"new\n");
+}
 
-    // The same fingerprint again: the file changed since.
-    let o = p.run(
-        &["write", f, "--expect", print.trim(), "--who", "test chat"],
-        b"third",
-    );
+#[test]
+fn an_agent_sees_no_fingerprint() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    let hashes = [fingerprint(b"old\n"), fingerprint(b"new\n")];
+    let mut outputs = vec![p.read("chat"), p.write("chat", b"new\n")];
+    fs::write(p.file(), "edited\n").unwrap();
+    outputs.push(p.write("chat", b"third\n"));
+    for o in outputs {
+        for stream in [&o.stdout, &o.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            for hash in &hashes {
+                assert!(!text.contains(hash.as_str()), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_edit_after_the_read_is_refused_and_survives() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("chat");
+    fs::write(p.file(), "typed in the editor\n").unwrap();
+    let o = p.write("chat", b"built on the old text\n");
     assert_eq!(code(&o), 4, "{o:?}");
-    assert_eq!(fs::read(&file).unwrap(), b"second");
+    assert_eq!(p.text(), b"typed in the editor\n");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("Read it again"));
+    // And the way out is a new read.
+    assert_eq!(p.read("chat").stdout, b"typed in the editor\n");
+    assert_eq!(code(&p.write("chat", b"built on the new text\n")), 0);
+}
 
-    let o = p.run(&["write", f, "--new", "--who", "test chat"], b"third");
+#[test]
+fn an_existing_file_that_was_not_read_is_refused() {
+    let p = Place::new();
+    fs::write(p.file(), "here already\n").unwrap();
+    let o = p.write("chat", b"new\n");
     assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(p.text(), b"here already\n");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("Read it first"));
+}
 
-    let lines = fs::read_to_string(p.log()).unwrap();
-    let words: Vec<_> = lines
-        .lines()
-        .map(|l| l.split('\t').nth(1).unwrap())
-        .collect();
-    assert_eq!(words, ["written", "written", "changed", "exists"]);
-    let first: Vec<_> = lines.lines().next().unwrap().split('\t').collect();
-    assert_eq!(first[2], "org/notes/invented.md");
-    assert_eq!(first[3], "test chat");
-    assert_eq!(first[4], "-");
-    assert_eq!(first[6], "8");
-    assert!(!lines.contains("Grüße"), "the log never holds the text");
+#[test]
+fn the_read_of_another_agent_does_not_count() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("chat a");
+    assert_eq!(code(&p.write("chat b", b"new\n")), 5);
+    assert_eq!(p.text(), b"old\n");
+}
+
+#[test]
+fn two_agents_who_read_the_same_version_one_wins() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("chat a");
+    p.read("chat b");
+    assert_eq!(code(&p.write("chat a", b"from a\n")), 0);
+    assert_eq!(code(&p.write("chat b", b"from b\n")), 4);
+    assert_eq!(p.text(), b"from a\n");
+}
+
+#[test]
+fn a_second_write_needs_no_new_read() {
+    let p = Place::new();
+    assert_eq!(code(&p.write("chat", b"first\n")), 0);
+    assert_eq!(code(&p.write("chat", b"second\n")), 0);
+    assert_eq!(p.text(), b"second\n");
+    fs::write(p.file(), "edited\n").unwrap();
+    assert_eq!(code(&p.write("chat", b"third\n")), 4);
+    assert_eq!(p.text(), b"edited\n");
+}
+
+#[test]
+fn a_file_gone_since_the_read_gives_exit_6() {
+    let p = Place::new();
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("chat");
+    fs::remove_file(p.file()).unwrap();
+    assert_eq!(code(&p.write("chat", b"new\n")), 6);
+    assert!(!p.file().exists());
 }
 
 #[test]
 fn a_held_lock_gives_exit_3() {
     let p = Place::new();
-    let file = p.file();
-    fs::write(&file, "old\n").unwrap();
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("chat");
     let lock = p.root.join("org/.locks/org--notes--invented.md.lock");
     fs::write(&lock, "other writer\n").unwrap();
-    let print = fingerprint(b"old\n");
-    let o = p.run(
-        &[
-            "write",
-            file.to_str().unwrap(),
-            "--expect",
-            &print,
-            "--who",
-            "t",
-        ],
-        b"new\n",
-    );
+    let o = p.write("chat", b"new\n");
     assert_eq!(code(&o), 3, "{o:?}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("other writer"));
-    assert_eq!(fs::read(&file).unwrap(), b"old\n");
+    assert_eq!(p.text(), b"old\n");
     assert!(lock.exists());
 }
 
 #[test]
-fn a_missing_file_gives_exit_6() {
+fn read_gives_the_exact_bytes() {
     let p = Place::new();
-    let f = p.file();
-    let print = fingerprint(b"old\n");
+    let text = "Grüße,  odd spacing\r\nno last newline";
+    fs::write(p.file(), text).unwrap();
+    assert_eq!(p.read("chat").stdout, text.as_bytes());
+    let copy = p.outside("copy.md");
     let o = p.run(
         &[
-            "write",
-            f.to_str().unwrap(),
-            "--expect",
-            &print,
+            "read",
+            &p.f(),
             "--who",
-            "t",
+            "chat",
+            "--to",
+            copy.to_str().unwrap(),
         ],
-        b"new\n",
+        b"",
     );
-    assert_eq!(code(&o), 6, "{o:?}");
-    assert_eq!(code(&p.run(&["fingerprint", f.to_str().unwrap()], b"")), 6);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(o.stdout.is_empty());
+    assert_eq!(fs::read(&copy).unwrap(), text.as_bytes());
+    assert_eq!(code(&p.write("chat", b"new\n")), 0, "a copy counts as read");
+}
+
+#[test]
+fn read_refuses_what_it_should() {
+    let p = Place::new();
+    assert_eq!(code(&p.read("chat")), 6);
+    assert_eq!(
+        code(&p.run(&["read", &p.f()], b"")),
+        2,
+        "the name is required"
+    );
+
+    fs::write(p.file(), b"bad \xff bytes").unwrap();
+    assert_eq!(code(&p.read("chat")), 2);
+
+    fs::write(p.file(), b"good\n").unwrap();
+    let inside = p.root.join("org/notes/copy.md");
+    let o = p.run(
+        &[
+            "read",
+            &p.f(),
+            "--who",
+            "c",
+            "--to",
+            inside.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(!inside.exists());
+
+    let copy = p.outside("taken.md");
+    fs::write(&copy, "mine\n").unwrap();
+    let o = p.run(
+        &["read", &p.f(), "--who", "c", "--to", copy.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(fs::read(&copy).unwrap(), b"mine\n");
+    assert_eq!(
+        code(&p.write("c", b"new\n")),
+        5,
+        "a refused read does not count"
+    );
+
+    let elsewhere = p.outside("elsewhere.md");
+    fs::write(&elsewhere, "x\n").unwrap();
+    let o = p.run(&["read", elsewhere.to_str().unwrap(), "--who", "c"], b"");
+    assert_eq!(code(&o), 2, "{o:?}");
+}
+
+#[test]
+fn an_empty_file_can_be_read_and_replaced() {
+    let p = Place::new();
+    fs::write(p.file(), b"").unwrap();
+    let o = p.read("chat");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(o.stdout.is_empty());
+    assert_eq!(code(&p.write("chat", b"new\n")), 0);
 }
 
 #[test]
 fn wrong_use_gives_exit_2_and_changes_nothing() {
     let p = Place::new();
-    let file = p.file();
-    fs::write(&file, "old\n").unwrap();
-    let f = file.to_str().unwrap();
-    let print = fingerprint(b"old\n");
+    fs::write(p.file(), "old\n").unwrap();
+    p.read("t");
+    let f = p.f();
     let bad: Vec<(Vec<&str>, &[u8])> = vec![
         (vec![], b"x"),
-        (vec!["write", f, "--who", "t"], b"x"),
-        (vec!["write", f, "--new"], b"x"),
-        (
-            vec!["write", f, "--new", "--expect", &print, "--who", "t"],
-            b"x",
-        ),
-        (vec!["write", f, "--expect", "short", "--who", "t"], b"x"),
-        (
-            vec!["write", f, "--expect", &print, "--who", "two\nlines"],
-            b"x",
-        ),
-        (vec!["write", f, "--expect", &print, "--who", "t"], b""),
-        (
-            vec!["write", f, "--expect", &print, "--who", "t"],
-            b"bad \xff",
-        ),
+        (vec!["write", &f], b"x"),
+        (vec!["write", "--who", "t"], b"x"),
+        (vec!["write", &f, "--who", "two\nlines"], b"x"),
+        (vec!["write", &f, "--who", " "], b"x"),
+        (vec!["write", &f, "--who", "t", "--expect", "abc"], b"x"),
+        (vec!["write", &f, "--who", "t"], b""),
+        (vec!["write", &f, "--who", "t"], b"bad \xff"),
+        (vec!["write", &f, "--who", "t", "--size", "100"], b"cut"),
     ];
     for (args, stdin) in bad {
         let o = p.run(&args, stdin);
         assert_eq!(code(&o), 2, "{args:?} {o:?}");
     }
-    assert_eq!(fs::read(&file).unwrap(), b"old\n");
+    assert_eq!(p.text(), b"old\n");
+    assert_eq!(
+        code(&p.run(&["write", &f, "--who", "t", "--size", "4"], b"new\n")),
+        0
+    );
 }
 
 #[test]
 fn a_path_outside_the_root_is_refused() {
     let p = Place::new();
-    let outside = std::env::temp_dir().join(format!("orgthread-outside-{}.md", std::process::id()));
-    let o = p.run(
-        &["write", outside.to_str().unwrap(), "--new", "--who", "t"],
-        b"x",
-    );
+    let outside = p.outside("o.md");
+    let o = p.run(&["write", outside.to_str().unwrap(), "--who", "t"], b"x");
     assert_eq!(code(&o), 2, "{o:?}");
     assert!(!outside.exists());
 
     let climbing = p.root.join("org/notes/../../../orgthread-climb.md");
-    let o = p.run(
-        &["write", climbing.to_str().unwrap(), "--new", "--who", "t"],
-        b"x",
-    );
+    let o = p.run(&["write", climbing.to_str().unwrap(), "--who", "t"], b"x");
     assert_eq!(code(&o), 2, "{o:?}");
 }
 
@@ -209,50 +326,56 @@ fn a_path_outside_the_root_is_refused() {
 #[test]
 fn a_link_to_a_file_outside_the_root_is_refused() {
     let p = Place::new();
-    let outside = std::env::temp_dir().join(format!("orgthread-target-{}.md", std::process::id()));
+    let outside = p.outside("target.md");
     fs::write(&outside, "outside\n").unwrap();
-    let link = p.file();
-    std::os::unix::fs::symlink(&outside, &link).unwrap();
-    let print = fingerprint(b"outside\n");
-    let o = p.run(
-        &[
-            "write",
-            link.to_str().unwrap(),
-            "--expect",
-            &print,
-            "--who",
-            "t",
-        ],
-        b"x",
-    );
-    assert_eq!(code(&o), 2, "{o:?}");
+    std::os::unix::fs::symlink(&outside, p.file()).unwrap();
+    assert_eq!(code(&p.read("t")), 2);
+    assert_eq!(code(&p.write("t", b"x")), 2);
     assert_eq!(fs::read(&outside).unwrap(), b"outside\n");
-    fs::remove_file(&outside).unwrap();
 }
 
 #[test]
 fn a_folder_is_refused() {
     let p = Place::new();
     let dir = p.root.join("org/notes");
-    let o = p.run(
-        &["write", dir.to_str().unwrap(), "--new", "--who", "t"],
-        b"x",
-    );
+    let o = p.run(&["write", dir.to_str().unwrap(), "--who", "t"], b"x");
     assert_eq!(code(&o), 2, "{o:?}");
+}
+
+#[test]
+fn each_try_leaves_one_log_line_without_the_text() {
+    let p = Place::new();
+    assert_eq!(code(&p.write("test chat", "Grüße\n".as_bytes())), 0);
+    fs::write(p.file(), "edited\n").unwrap();
+    assert_eq!(code(&p.write("test chat", b"x\n")), 4);
+    assert_eq!(code(&p.write("other chat", b"x\n")), 5);
+
+    let lines = fs::read_to_string(p.log()).unwrap();
+    let words: Vec<_> = lines
+        .lines()
+        .map(|l| l.split('\t').nth(1).unwrap())
+        .collect();
+    assert_eq!(words, ["written", "changed", "exists"]);
+    let first: Vec<_> = lines.lines().next().unwrap().split('\t').collect();
+    assert_eq!(first[2], "org/notes/invented.md");
+    assert_eq!(first[3], "test chat");
+    assert_eq!(first[4], "-");
+    assert_eq!(
+        first[5],
+        fingerprint("Grüße\n".as_bytes()),
+        "the log keeps it for a person"
+    );
+    assert_eq!(first[6], "8");
+    assert!(!lines.contains("Grüße"), "the log never holds the text");
 }
 
 #[test]
 fn a_log_that_cannot_be_written_gives_exit_8_after_the_write() {
     let p = Place::new();
-    let file = p.file();
     // A file stands where the log folder should be.
     fs::write(p.root.join("log"), "in the way").unwrap();
-    let o = p.run(
-        &["write", file.to_str().unwrap(), "--new", "--who", "t"],
-        b"new\n",
-    );
-    assert_eq!(code(&o), 8, "{o:?}");
-    assert_eq!(fs::read(&file).unwrap(), b"new\n");
+    assert_eq!(code(&p.write("t", b"new\n")), 8);
+    assert_eq!(p.text(), b"new\n");
     assert!(
         fs::read_dir(p.root.join("org/.locks"))
             .unwrap()
@@ -262,35 +385,11 @@ fn a_log_that_cannot_be_written_gives_exit_8_after_the_write() {
 }
 
 #[test]
-fn a_wrong_size_is_refused() {
-    let p = Place::new();
-    let file = p.file();
-    fs::write(&file, "the whole long text\n").unwrap();
-    let print = fingerprint(b"the whole long text\n");
-    let f = file.to_str().unwrap();
-    let o = p.run(
-        &[
-            "write", f, "--expect", &print, "--who", "t", "--size", "100",
-        ],
-        b"cut",
-    );
-    assert_eq!(code(&o), 2, "{o:?}");
-    assert_eq!(fs::read(&file).unwrap(), b"the whole long text\n");
-    let o = p.run(
-        &["write", f, "--expect", &print, "--who", "t", "--size", "3"],
-        b"cut",
-    );
-    assert_eq!(code(&o), 0, "{o:?}");
-}
-
-#[test]
 fn a_closed_output_still_gives_the_real_outcome_and_the_log() {
     let p = Place::new();
-    let file = p.file();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
-        .args(["write", file.to_str().unwrap(), "--new", "--who", "t"])
-        .env("ORGTHREAD_ROOT", &p.root)
-        .env("ORGTHREAD_LOG", p.log())
+    let f = p.f();
+    let mut child = p
+        .command(&["write", &f, "--who", "t"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -299,19 +398,14 @@ fn a_closed_output_still_gives_the_real_outcome_and_the_log() {
     drop(child.stdout.take());
     child.stdin.take().unwrap().write_all(b"new\n").unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(0));
-    assert_eq!(fs::read(&file).unwrap(), b"new\n");
+    assert_eq!(p.text(), b"new\n");
     assert!(fs::read_to_string(p.log()).unwrap().contains("written"));
 }
 
 #[test]
 fn watch_once_shows_the_writes_and_a_held_lock() {
     let p = Place::new();
-    let file = p.file();
-    let o = p.run(
-        &["write", file.to_str().unwrap(), "--new", "--who", "t"],
-        b"new\n",
-    );
-    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(code(&p.write("t", b"new\n")), 0);
     fs::write(
         p.root.join("org/.locks/org--notes--other.md.lock"),
         "other writer\n",
@@ -337,84 +431,5 @@ fn watch_without_a_terminal_says_what_to_do_and_changes_nothing() {
             .unwrap()
             .next()
             .is_none()
-    );
-}
-
-#[test]
-fn read_gives_the_fingerprint_then_the_exact_bytes() {
-    let p = Place::new();
-    let file = p.file();
-    let text = "Grüße,  odd spacing\r\nno last newline";
-    fs::write(&file, text).unwrap();
-    let o = p.run(&["read", file.to_str().unwrap()], b"");
-    assert_eq!(code(&o), 0, "{o:?}");
-    let mut want = format!("{}\n", fingerprint(text.as_bytes())).into_bytes();
-    want.extend_from_slice(text.as_bytes());
-    assert_eq!(o.stdout, want);
-}
-
-#[test]
-fn read_to_a_copy_then_write_is_the_whole_round() {
-    let p = Place::new();
-    let file = p.file();
-    let f = file.to_str().unwrap();
-    fs::write(&file, "old\n").unwrap();
-    let outside = p.outside();
-    let copy = outside.join("copy.md");
-    let c = copy.to_str().unwrap();
-
-    let o = p.run(&["read", f, "--to", c], b"");
-    assert_eq!(code(&o), 0, "{o:?}");
-    assert_eq!(fs::read(&copy).unwrap(), b"old\n");
-    let print = String::from_utf8(o.stdout).unwrap();
-    assert_eq!(print.trim(), fingerprint(b"old\n"));
-
-    // Someone edits after the read: the fingerprint of that read refuses the write.
-    fs::write(&file, "edited\n").unwrap();
-    let o = p.run(
-        &["write", f, "--expect", print.trim(), "--who", "t"],
-        b"new\n",
-    );
-    assert_eq!(code(&o), 4, "{o:?}");
-    assert_eq!(fs::read(&file).unwrap(), b"edited\n");
-
-    // A copy is never replaced.
-    let o = p.run(&["read", f, "--to", c], b"");
-    assert_eq!(code(&o), 5, "{o:?}");
-    assert_eq!(fs::read(&copy).unwrap(), b"old\n");
-}
-
-#[test]
-fn read_refuses_what_it_should() {
-    let p = Place::new();
-    let file = p.file();
-    let f = file.to_str().unwrap();
-    assert_eq!(code(&p.run(&["read", f], b"")), 6);
-
-    fs::write(&file, b"bad \xff bytes").unwrap();
-    assert_eq!(code(&p.run(&["read", f], b"")), 2);
-
-    fs::write(&file, b"good\n").unwrap();
-    let inside = p.root.join("org/notes/copy.md");
-    let o = p.run(&["read", f, "--to", inside.to_str().unwrap()], b"");
-    assert_eq!(code(&o), 2, "{o:?}");
-    assert!(!inside.exists());
-
-    let outside = std::env::temp_dir().join(format!("orgthread-read-{}.md", std::process::id()));
-    fs::write(&outside, "elsewhere\n").unwrap();
-    assert_eq!(code(&p.run(&["read", outside.to_str().unwrap()], b"")), 2);
-    fs::remove_file(&outside).unwrap();
-}
-
-#[test]
-fn an_empty_file_can_be_read() {
-    let p = Place::new();
-    let file = p.file();
-    fs::write(&file, b"").unwrap();
-    let o = p.run(&["read", file.to_str().unwrap()], b"");
-    assert_eq!(code(&o), 0, "{o:?}");
-    assert_eq!(
-        String::from_utf8(o.stdout).unwrap().trim(),
-        fingerprint(b"")
     );
 }

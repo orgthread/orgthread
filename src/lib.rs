@@ -2,6 +2,7 @@
 
 pub mod fingerprint;
 pub mod log;
+pub mod reads;
 pub mod screen;
 pub mod storage;
 pub mod watch;

@@ -2,18 +2,17 @@
 
 Not ready. Do not use it on real files yet.
 
-The first block: one command that writes a plain text file the same way every time.
+The first block: an agent reads and writes a plain text file, and it deals with nothing else.
 
 ```
-orgthread read <file> --to <copy>
-orgthread write <file> --expect <fingerprint> --who <name>   < new-text
-orgthread write <file> --new --who <name>                    < new-text
+orgthread read <file> --who <name>
+orgthread write <file> --who <name>   < the whole new text
 orgthread watch
 ```
 
-The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists them.
+To change a file, read it first with the same name. A new file needs no read. orgthread remembers what each name read, and it refuses a write when the file changed since.
 
-To change a file, read it first. `read` saves an exact copy and prints its fingerprint, both from one single read, so no change can slip in between them. Build the new text from that copy, and give `write` that fingerprint.
+The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists them.
 
 The fingerprint is the content hash that Dropbox reports. Today the tool writes to a local folder, behind one small storage interface.
 
