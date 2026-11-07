@@ -1,6 +1,8 @@
 //! What the read-only screen shows: the locks and the log. This part only
 //! reads, and it knows nothing about the terminal.
 
+use crate::versions::Versions;
+use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -187,6 +189,82 @@ pub fn why(outcome: &str) -> &'static str {
     }
 }
 
+/// One row of a diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Row {
+    Same {
+        line: usize,
+        text: String,
+    },
+    Removed {
+        line: usize,
+        text: String,
+    },
+    Added {
+        line: usize,
+        text: String,
+    },
+    /// Unchanged lines left out between two changes.
+    Gap,
+}
+
+/// What changed from one text to the next, with 3 lines around each change. A
+/// line with no newline at its end says so, as that is a real change too.
+pub fn diff_rows(old: &str, new: &str) -> Vec<Row> {
+    let diff = TextDiff::from_lines(old, new);
+    let mut rows = Vec::new();
+    for (i, group) in diff.grouped_ops(3).iter().enumerate() {
+        if i > 0 {
+            rows.push(Row::Gap);
+        }
+        for op in group {
+            for change in diff.iter_changes(op) {
+                let mut text = change.value().trim_end_matches('\n').to_string();
+                if change.missing_newline() {
+                    text.push_str("  (no newline at the end)");
+                }
+                let line = change.new_index().or(change.old_index()).unwrap_or(0) + 1;
+                rows.push(match change.tag() {
+                    ChangeTag::Equal => Row::Same { line, text },
+                    ChangeTag::Delete => Row::Removed {
+                        line: change.old_index().unwrap_or(0) + 1,
+                        text,
+                    },
+                    ChangeTag::Insert => Row::Added { line, text },
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// What the diff screen shows for one log entry: rows, or the reason there are none.
+pub fn diff_of(entry: &Entry, versions: &Versions) -> Result<Vec<Row>, String> {
+    if !is_written(&entry.outcome) {
+        return Err(format!(
+            "{} There is nothing to compare.",
+            why(&entry.outcome)
+        ));
+    }
+    const NO_COPY: &str = "No copy of this version. Writes from before the diff screen have none, and copies go after 30 days.";
+    let load = |print: &str| match versions.load(print) {
+        Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(None) => Err(NO_COPY.to_string()),
+        Err(e) => Err(format!("Could not read the copy: {e}")),
+    };
+    let new = load(&entry.after)?;
+    let old = if entry.before.is_empty() {
+        String::new()
+    } else {
+        load(&entry.before)?
+    };
+    let rows = diff_rows(&old, &new);
+    if rows.is_empty() {
+        return Err("The text did not change in this write.".to_string());
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +276,126 @@ mod tests {
         assert_eq!(e.before, "");
         assert_eq!(e.after, "abc");
         assert_eq!(e.size, "170");
+    }
+
+    #[test]
+    fn a_diff_shows_the_change_with_three_lines_around_it() {
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        let new = "1\n2\n3\n4\nfive\n6\n7\n8\n";
+        let rows = diff_rows(old, new);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(
+            rows[0],
+            Row::Same {
+                line: 2,
+                text: "2".into()
+            }
+        );
+        assert_eq!(
+            rows[3],
+            Row::Removed {
+                line: 5,
+                text: "5".into()
+            }
+        );
+        assert_eq!(
+            rows[4],
+            Row::Added {
+                line: 5,
+                text: "five".into()
+            }
+        );
+        assert_eq!(
+            rows[7],
+            Row::Same {
+                line: 8,
+                text: "8".into()
+            }
+        );
+    }
+
+    #[test]
+    fn two_far_changes_have_a_gap_between_them() {
+        let old: String = (1..=20).map(|n| format!("{n}\n")).collect();
+        let new = old
+            .replace("2\n3", "two\n3")
+            .replace("\n19\n", "\nnineteen\n");
+        assert!(diff_rows(&old, &new).contains(&Row::Gap));
+    }
+
+    #[test]
+    fn a_missing_last_newline_shows() {
+        let rows = diff_rows("a\n", "a");
+        assert_eq!(
+            rows[0],
+            Row::Removed {
+                line: 1,
+                text: "a".into()
+            }
+        );
+        assert_eq!(
+            rows[1],
+            Row::Added {
+                line: 1,
+                text: "a  (no newline at the end)".into()
+            }
+        );
+    }
+
+    fn written(before: &str, after: &str) -> Entry {
+        parse_line(&format!(
+            "2026-11-07 07:28:26Z\twritten\torg/a.md\tchat\t{before}\t{after}\t3"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn diff_of_an_entry_uses_its_copies() {
+        use crate::fingerprint::fingerprint;
+        let dir = std::env::temp_dir().join(format!("orgthread-diff-{}", std::process::id()));
+        let v = Versions::new(&dir);
+        v.save(b"old\n").unwrap();
+        v.save(b"new\n").unwrap();
+        let (o, n) = (fingerprint(b"old\n"), fingerprint(b"new\n"));
+
+        let rows = diff_of(&written(&o, &n), &v).unwrap();
+        assert_eq!(
+            rows,
+            [
+                Row::Removed {
+                    line: 1,
+                    text: "old".into()
+                },
+                Row::Added {
+                    line: 1,
+                    text: "new".into()
+                },
+            ]
+        );
+
+        // A new file: every line is added.
+        let rows = diff_of(&written("-", &n), &v).unwrap();
+        assert_eq!(
+            rows,
+            [Row::Added {
+                line: 1,
+                text: "new".into()
+            }]
+        );
+
+        // Nothing changed.
+        assert!(diff_of(&written(&n, &n), &v).is_err());
+
+        // A write from before the copies.
+        let e = diff_of(&written(&o, &fingerprint(b"gone")), &v).unwrap_err();
+        assert!(e.contains("No copy"), "{e}");
+
+        // A refusal has nothing to compare.
+        let mut refused = written(&o, &n);
+        refused.outcome = "changed".to_string();
+        let e = diff_of(&refused, &v).unwrap_err();
+        assert!(e.contains("Nothing was written"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

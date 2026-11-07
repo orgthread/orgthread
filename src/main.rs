@@ -32,7 +32,7 @@ For a chat with no shell:
 
 For a person:
 
-  orgthread watch                                the read-only screen
+  orgthread watch                                the read-only screen; Enter shows a diff, Esc goes back
   orgthread watch --once                         the same screen, as plain text
   orgthread fingerprint <file>                   the content hash Dropbox reports
 
@@ -344,7 +344,7 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
             if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Err("watch needs a terminal. For plain text, use watch --once".into());
             }
-            screen::run(&locks, &settings.log)
+            screen::run(&locks, &settings.log, &Versions::new(&settings.versions))
         }
         [flag] if flag == "--once" => screen::once(&locks, &settings.log, 110, 30).map(|text| {
             let _ = io::stdout().write_all(text.as_bytes());

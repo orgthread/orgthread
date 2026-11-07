@@ -1,13 +1,15 @@
 //! The read-only terminal screen: `orgthread watch`. It draws what `watch.rs`
 //! reads, and it has no way to change a file.
 
-use crate::watch::{self, Entry, Snapshot, snapshot};
+use crate::versions::Versions;
+use crate::watch::{self, Entry, Row, Snapshot, snapshot};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use std::cell::Cell;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -38,7 +40,7 @@ impl Choice {
     pub fn key(&mut self, code: KeyCode, ctrl: bool, count: usize) -> bool {
         let place = self.place(count);
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('q') => return true,
             KeyCode::Char('c') if ctrl => return true,
             KeyCode::Up | KeyCode::Char('k') => self.set_place(place.saturating_sub(1), count),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -243,16 +245,115 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
         Paragraph::new(detail).block(Block::bordered().title("Chosen line")),
         info,
     );
-    frame.render_widget(Line::raw("up, down: line   g: newest   q: quit"), foot);
+    frame.render_widget(
+        Line::raw("up, down: line  enter: diff  g: newest  q: quit"),
+        foot,
+    );
+}
+
+/// The open diff screen.
+pub struct DiffView {
+    title: String,
+    body: Result<Vec<Row>, String>,
+    scroll: usize,
+    /// How far it can scroll, known once it is drawn at the terminal's size.
+    max_scroll: Cell<usize>,
+}
+
+impl DiffView {
+    pub fn open(entry: &Entry, versions: &Versions) -> DiffView {
+        DiffView {
+            title: format!("{}   {} ago", entry.path, watch::ago(&entry.time)),
+            body: watch::diff_of(entry, versions),
+            scroll: 0,
+            max_scroll: Cell::new(0),
+        }
+    }
+
+    /// Applies one key. True means go back to the main screen.
+    pub fn key(&mut self, code: KeyCode) -> bool {
+        let max = self.max_scroll.get();
+        match code {
+            KeyCode::Esc => return true,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll = (self.scroll + 1).min(max),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(20),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll = (self.scroll + 20).min(max),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.scroll = max,
+            _ => {}
+        }
+        false
+    }
+}
+
+/// One diff row as screen lines. A long line wraps under its own text.
+fn diff_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
+    const HEAD: usize = 8;
+    let (sign, line, text, style) = match row {
+        Row::Same { line, text } => (" ", *line, text, Style::new()),
+        Row::Removed { line, text } => ("-", *line, text, Style::new().fg(ORANGE)),
+        Row::Added { line, text } => ("+", *line, text, Style::new().fg(BLUE)),
+        Row::Gap => return vec![Line::raw("...")],
+    };
+    wrap(text, width.saturating_sub(HEAD))
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let head = if i == 0 {
+                format!("{sign} {line:>4}  ")
+            } else {
+                " ".repeat(HEAD)
+            };
+            Line::styled(format!("{head}{part}"), style)
+        })
+        .collect()
+}
+
+pub fn draw_diff(frame: &mut Frame, view: &DiffView) {
+    let width = usize::from(frame.area().width.saturating_sub(2));
+    let [head, body, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    let lines: Vec<Line> = match &view.body {
+        Ok(rows) => rows.iter().flat_map(|r| diff_lines(r, width)).collect(),
+        Err(reason) => plain(reason, width, Style::new().fg(ORANGE)),
+    };
+    let visible = usize::from(body.height.saturating_sub(2));
+    let max = lines.len().saturating_sub(visible);
+    view.max_scroll.set(max);
+    let scroll = view.scroll.min(max);
+    let shown: Vec<Line> = lines.into_iter().skip(scroll).collect();
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled("orgthread watch", bold),
+            Span::raw("   read only"),
+        ]),
+        head,
+    );
+    frame.render_widget(
+        Paragraph::new(shown).block(Block::bordered().title(view.title.clone())),
+        body,
+    );
+    frame.render_widget(Line::raw("up, down: scroll   Esc: back   q: quit"), foot);
 }
 
 /// Runs the screen until a quit key.
-pub fn run(lock_dir: &Path, log: &Path) -> io::Result<()> {
+pub fn run(lock_dir: &Path, log: &Path, versions: &Versions) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut choice = Choice::default();
+    let mut open: Option<DiffView> = None;
     let result = loop {
         let snap = snapshot(lock_dir, log);
-        if let Err(e) = terminal.draw(|frame| draw(frame, &snap, &choice)) {
+        let drawn = terminal.draw(|frame| match &open {
+            Some(view) => draw_diff(frame, view),
+            None => draw(frame, &snap, &choice),
+        });
+        if let Err(e) = drawn {
             break Err(e);
         }
         match event::poll(REFRESH) {
@@ -260,8 +361,22 @@ pub fn run(lock_dir: &Path, log: &Path) -> io::Result<()> {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    if choice.key(key.code, ctrl, snap.entries.len()) {
+                    let quit =
+                        key.code == KeyCode::Char('q') || (ctrl && key.code == KeyCode::Char('c'));
+                    if quit {
                         break Ok(());
+                    }
+                    if let Some(view) = &mut open {
+                        if view.key(key.code) {
+                            open = None;
+                        }
+                    } else if key.code == KeyCode::Enter {
+                        let place = choice.place(snap.entries.len());
+                        if let Some(entry) = snap.entries.iter().rev().nth(place) {
+                            open = Some(DiffView::open(entry, versions));
+                        }
+                    } else {
+                        choice.key(key.code, ctrl, snap.entries.len());
                     }
                 }
                 Ok(_) => {}
@@ -370,7 +485,10 @@ mod tests {
         c.key(KeyCode::Home, false, 3);
         assert_eq!(c.place(3), 0);
         assert!(c.key(KeyCode::Char('q'), false, 3));
-        assert!(c.key(KeyCode::Esc, false, 3));
+        assert!(
+            !c.key(KeyCode::Esc, false, 3),
+            "Esc never leaves the main screen"
+        );
         assert!(c.key(KeyCode::Char('c'), true, 3));
         assert!(!c.key(KeyCode::Char('c'), false, 3));
         assert!(!c.key(KeyCode::Down, false, 0), "an empty list is safe");
@@ -414,6 +532,89 @@ mod tests {
         assert_eq!(wrap("one two three", 7), ["one two", "three"]);
         assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
         assert_eq!(wrap("", 5), [""]);
+    }
+
+    fn diff_view(rows: Vec<Row>) -> DiffView {
+        DiffView {
+            title: "org/notes/a.md".to_string(),
+            body: Ok(rows),
+            scroll: 0,
+            max_scroll: Cell::new(0),
+        }
+    }
+
+    fn diff_screen(view: &DiffView, width: u16, height: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+        t.draw(|f| draw_diff(f, view)).unwrap();
+        text_of(&t)
+    }
+
+    #[test]
+    fn the_diff_screen_shows_removed_and_added_lines_and_how_to_go_back() {
+        let view = diff_view(vec![
+            Row::Same {
+                line: 9,
+                text: "kept".into(),
+            },
+            Row::Removed {
+                line: 10,
+                text: "old line".into(),
+            },
+            Row::Added {
+                line: 10,
+                text: "new line".into(),
+            },
+        ]);
+        let text = diff_screen(&view, 80, 12);
+        assert!(text.contains("org/notes/a.md"), "{text}");
+        assert!(text.contains("     9  kept"), "{text}");
+        assert!(text.contains("-   10  old line"), "{text}");
+        assert!(text.contains("+   10  new line"), "{text}");
+        assert!(text.contains("Esc: back"), "{text}");
+    }
+
+    #[test]
+    fn a_diff_with_no_copy_says_why() {
+        let view = DiffView {
+            title: "org/notes/a.md".to_string(),
+            body: Err("No copy of this version.".to_string()),
+            scroll: 0,
+            max_scroll: Cell::new(0),
+        };
+        assert!(diff_screen(&view, 80, 8).contains("No copy of this version."));
+    }
+
+    #[test]
+    fn esc_goes_back_and_scrolling_stays_inside() {
+        let rows = (1..=50)
+            .map(|line| Row::Added {
+                line,
+                text: format!("line {line}"),
+            })
+            .collect();
+        let mut view = diff_view(rows);
+        let text = diff_screen(&view, 80, 12);
+        assert!(text.contains("line 1"), "{text}");
+        assert!(!text.contains("line 50"), "{text}");
+        assert!(!view.key(KeyCode::Up));
+        assert_eq!(view.scroll, 0);
+        assert!(!view.key(KeyCode::End));
+        let text = diff_screen(&view, 80, 12);
+        assert!(text.contains("line 50"), "{text}");
+        let max = view.scroll;
+        assert!(!view.key(KeyCode::Down));
+        assert_eq!(view.scroll, max);
+        assert!(view.key(KeyCode::Esc));
+    }
+
+    #[test]
+    fn a_long_diff_line_wraps_and_nothing_is_lost() {
+        let view = diff_view(vec![Row::Added {
+            line: 1,
+            text: "x".repeat(100),
+        }]);
+        let text = diff_screen(&view, 49, 10);
+        assert_eq!(text.matches('x').count(), 100, "{text}");
     }
 
     #[test]

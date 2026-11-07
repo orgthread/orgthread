@@ -16,7 +16,7 @@ The steps of a write: take the lock with an exclusive create, compare the finger
 
 The fingerprint is the content hash that Dropbox reports. Today the tool writes to a local folder, behind one small storage interface.
 
-`orgthread watch` is a read-only screen: the locks held now, the latest writes and refusals, and the reason for each. It cannot change a file. `orgthread watch --once` prints the same screen as plain text.
+`orgthread watch` is a read-only screen: the locks held now, the latest writes and refusals, and the reason for each. It cannot change a file. Press Enter on a write to see what changed in it, and Esc to go back. For this, each write keeps a copy of the old and the new text for 30 days, outside the synced folder. `orgthread watch --once` prints the same screen as plain text.
 
 `orgthread serve` is the same read and write for a chat that has no shell. It speaks MCP over standard input and output, with two tools: `read` (file, who) and `write` (file, who, text). Each call starts the command itself, so the rules and the refusals are the same.
 
