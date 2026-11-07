@@ -89,6 +89,20 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
         data.extend_from_slice(&buf[..n]);
     }
     let body = data[end..].to_vec();
+    if head.starts_with("POST /oauth2/token") {
+        let form = String::from_utf8_lossy(&body).to_string();
+        assert!(header("Authorization").is_none());
+        let good = form.contains("grant_type=refresh_token")
+            && form.contains("refresh_token=invented-refresh")
+            && form.contains("client_id=invented-key")
+            && form.contains("client_secret=invented-secret");
+        return if good {
+            let v = json!({ "access_token": GOOD_TOKEN, "expires_in": 14400 });
+            reply(&mut stream, 200, v.to_string().as_bytes())
+        } else {
+            reply(&mut stream, 400, b"bad refresh")
+        };
+    }
     if header("Authorization").as_deref() != Some(&format!("Bearer {GOOD_TOKEN}")) {
         return reply(&mut stream, 401, b"bad token");
     }
@@ -387,4 +401,36 @@ fn no_text_stays_on_the_disk() {
             assert!(!found, "text found in {}", file.display());
         }
     }
+}
+
+#[test]
+fn a_refresh_token_gets_a_fresh_key_for_a_service() {
+    let f = Fake::new();
+    let run = |refresh: &str| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+        c.args(["write", FILE, "--who", "service"])
+            .env("ORGTHREAD_STORAGE", "dropbox")
+            .env("ORGTHREAD_DROPBOX_API", &f.url)
+            .env("ORGTHREAD_DROPBOX_CONTENT", &f.url)
+            .env("ORGTHREAD_LOG", f.dir.join("log"))
+            .env("ORGTHREAD_READS", f.dir.join("reads"))
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .env_remove("ORGTHREAD_DROPBOX_TOKEN")
+            .env("ORGTHREAD_DROPBOX_REFRESH", refresh)
+            .env("ORGTHREAD_DROPBOX_APP_KEY", "invented-key")
+            .env("ORGTHREAD_DROPBOX_APP_SECRET", "invented-secret")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        let _ = child.stdin.take().unwrap().write_all(b"text\n");
+        child.wait_with_output().unwrap()
+    };
+    let o = run("wrong-refresh");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(f.get(FILE).is_none());
+    let o = run("invented-refresh");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(FILE).unwrap(), b"text\n");
 }

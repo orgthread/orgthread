@@ -36,6 +36,7 @@ For a person:
   orgthread watch                                the read-only screen; Enter shows a diff, Esc goes back
   orgthread watch --once                         the same screen, as plain text
   orgthread fingerprint <file>                   the content hash Dropbox reports
+  orgthread serve [--http <address>]             the MCP tools, for a chat with no shell
 
 Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
@@ -401,11 +402,19 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_serve(args: &[String]) -> Result<i32, String> {
-    if !args.is_empty() {
-        return Err("serve takes nothing more".into());
-    }
     let exe = env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
-    match serve::run(io::stdin().lock(), io::stdout(), &exe) {
+    let result = match args {
+        [] => serve::run(io::stdin().lock(), io::stdout(), &exe),
+        [flag, address] if flag == "--http" => {
+            let secret = env::var("ORGTHREAD_HTTP_SECRET").unwrap_or_default();
+            if secret.len() < 32 {
+                return Err("--http needs ORGTHREAD_HTTP_SECRET, with 32 signs or more".into());
+            }
+            serve::run_http(address, &secret, &exe)
+        }
+        _ => return Err("serve takes nothing, or --http <address>".into()),
+    };
+    match result {
         Ok(()) => Ok(0),
         Err(e) => {
             say(format!("the server stopped: {e}"));

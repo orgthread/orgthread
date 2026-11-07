@@ -5,7 +5,8 @@
 //! refusal are the ones of the command.
 
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -36,6 +37,77 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, exe: &Path) -> io::R
             writeln!(output, "{answer}")?;
             output.flush()?;
         }
+    }
+}
+
+/// The door for a chat in the cloud: the same answers over HTTP, on one address
+/// with a long secret in it. It listens on this machine only, so a program that
+/// handles TLS must stand in front. There is no session and no stream: each POST
+/// gets one JSON answer, which the Streamable HTTP form of MCP allows.
+pub fn run_http(address: &str, secret: &str, exe: &Path) -> io::Result<()> {
+    let listener = TcpListener::bind(address)?;
+    let path = format!("/mcp/{secret}");
+    std::thread::scope(|scope| {
+        for stream in listener.incoming().flatten() {
+            let path = &path;
+            scope.spawn(move || {
+                let _ = handle(stream, path, exe);
+            });
+        }
+    });
+    Ok(())
+}
+
+const MAX_BODY: usize = 64 * 1024 * 1024;
+
+fn respond(stream: &mut TcpStream, status: &str, body: &[u8]) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)
+}
+
+fn handle(mut stream: TcpStream, path: &str, exe: &Path) -> io::Result<()> {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut first = String::new();
+    reader.by_ref().take(8192).read_line(&mut first)?;
+    let mut parts = first.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let mut length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.by_ref().take(8192).read_line(&mut line)? == 0 || line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    // A wrong address learns nothing, not even that this is the right server.
+    if target != path {
+        return respond(&mut stream, "404 Not Found", b"");
+    }
+    if method != "POST" {
+        return respond(&mut stream, "405 Method Not Allowed", b"");
+    }
+    if length > MAX_BODY {
+        return respond(&mut stream, "413 Content Too Large", b"");
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    let answered = match serde_json::from_slice::<Value>(&body) {
+        Ok(message) => answer(&message, exe),
+        Err(e) => Some(problem(Value::Null, NOT_JSON, &e.to_string())),
+    };
+    match answered {
+        Some(reply) => respond(&mut stream, "200 OK", reply.to_string().as_bytes()),
+        // A notification wants no answer.
+        None => respond(&mut stream, "202 Accepted", b""),
     }
 }
 
@@ -76,7 +148,7 @@ fn greeting(params: &Value) -> Value {
 }
 
 fn tools() -> Value {
-    let file = json!({"type": "string", "description": "The full path of the file"});
+    let file = json!({"type": "string", "description": "The full path of the file. On a server, from the root of the Dropbox: /org/a.md"});
     let who = json!({
         "type": "string",
         "description": "The name of this chat, the same one each time"

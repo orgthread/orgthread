@@ -12,8 +12,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const TOKEN: &str = "ORGTHREAD_DROPBOX_TOKEN";
+/// For a service: these three get a fresh short-lived token for each command.
+pub const REFRESH: [&str; 3] = [
+    "ORGTHREAD_DROPBOX_REFRESH",
+    "ORGTHREAD_DROPBOX_APP_KEY",
+    "ORGTHREAD_DROPBOX_APP_SECRET",
+];
 
 pub struct Dropbox {
+    token: String,
     api: String,
     content: String,
     lock_dir: String,
@@ -70,18 +77,61 @@ fn refused(reply: &Reply) -> io::Error {
 
 impl Dropbox {
     pub fn new(lock_dir: &str) -> Result<Self, String> {
-        if std::env::var_os(TOKEN).is_none_or(|t| t.is_empty()) {
-            return Err(format!("{TOKEN} is not set"));
-        }
         let url = |name: &str, default: &str| std::env::var(name).unwrap_or(default.to_string());
-        Ok(Dropbox {
+        let mut dropbox = Dropbox {
+            token: String::new(),
             api: url("ORGTHREAD_DROPBOX_API", "https://api.dropboxapi.com"),
             content: url(
                 "ORGTHREAD_DROPBOX_CONTENT",
                 "https://content.dropboxapi.com",
             ),
             lock_dir: lock_dir.trim_matches('/').to_string(),
-        })
+        };
+        dropbox.token = match std::env::var(TOKEN).ok().filter(|t| !t.is_empty()) {
+            Some(token) => token,
+            None => dropbox.fresh_token()?,
+        };
+        Ok(dropbox)
+    }
+
+    /// Text for a form field: everything but plain signs written as `%XX`.
+    fn form(text: &str) -> String {
+        text.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    fn fresh_token(&self) -> Result<String, String> {
+        let [refresh, key, secret] = REFRESH.map(|name| std::env::var(name).unwrap_or_default());
+        if refresh.is_empty() || key.is_empty() || secret.is_empty() {
+            return Err(format!(
+                "{TOKEN} is not set, and neither are the {} values",
+                REFRESH[0]
+            ));
+        }
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}&client_id={}&client_secret={}",
+            Self::form(&refresh),
+            Self::form(&key),
+            Self::form(&secret)
+        );
+        let url = format!("{}/oauth2/token", self.api);
+        let headers = ["Content-Type: application/x-www-form-urlencoded".to_string()];
+        let reply = self
+            .call(&url, &headers, Some(body.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        if reply.status != 200 {
+            return Err(format!("Dropbox gave no token: {}", reply.status));
+        }
+        serde_json::from_slice::<Value>(&reply.body)
+            .ok()
+            .and_then(|v| v["access_token"].as_str().map(str::to_string))
+            .ok_or_else(|| "Dropbox gave no token".to_string())
     }
 
     fn file(path: &str) -> String {
@@ -95,19 +145,22 @@ impl Dropbox {
     fn call(&self, url: &str, headers: &[String], body: Option<&[u8]>) -> io::Result<Reply> {
         let mut curl = Command::new("curl");
         curl.args(["-sS", "-X", "POST", "--max-time", "120"])
-            .args(["--variable", &format!("%{TOKEN}")])
-            .args([
+            .args(["-w", "\n%{http_code}"]);
+        // Only the request for a fresh token goes without one.
+        if !self.token.is_empty() {
+            curl.args(["--variable", &format!("%{TOKEN}")]).args([
                 "--expand-header",
                 &format!("Authorization: Bearer {{{{{TOKEN}}}}}"),
-            ])
-            .args(["-w", "\n%{http_code}"]);
+            ]);
+        }
         for header in headers {
             curl.args(["-H", header]);
         }
         if body.is_some() {
             curl.args(["--data-binary", "@-"]);
         }
-        curl.arg(url)
+        curl.env(TOKEN, &self.token)
+            .arg(url)
             .stdin(if body.is_some() {
                 Stdio::piped()
             } else {
@@ -341,6 +394,12 @@ mod tests {
         assert!(text.contains("\\ud83d\\ude00"));
         let back: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(back, arg);
+    }
+
+    #[test]
+    fn a_form_field_writes_odd_signs_safely() {
+        assert_eq!(Dropbox::form("a-b_c.d~1"), "a-b_c.d~1");
+        assert_eq!(Dropbox::form("a b&c=ü"), "a%20b%26c%3D%C3%BC");
     }
 
     #[test]
