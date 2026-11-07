@@ -8,13 +8,20 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 const PASSWORD: &str = "an invented long password";
 const BASE: &str = "https://door.test";
 const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 
+/// One door at a time. Side by side, about 2 runs in 100 failed here with a reset
+/// connection, while 5,400 requests to one running door showed none. The cause is
+/// not proven, and it seems to lie in running these tests in parallel on the Mac.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 struct Door {
+    _turn: MutexGuard<'static, ()>,
     port: u16,
     root: PathBuf,
     child: Child,
@@ -42,6 +49,7 @@ impl Door {
         Self::open_at(name, BASE)
     }
     fn open_at(name: &str, base: &str) -> Self {
+        let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let root =
             std::env::temp_dir().join(format!("orgthread-http-{name}-{}", std::process::id()));
         fs::create_dir_all(root.join("org/.locks")).unwrap();
@@ -74,7 +82,12 @@ impl Door {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        Door { port, root, child }
+        Door {
+            _turn: turn,
+            port,
+            root,
+            child,
+        }
     }
     fn raw(&self, method: &str, path: &str, extra: &str, body: &str) -> Reply {
         let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
