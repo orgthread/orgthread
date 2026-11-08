@@ -333,7 +333,7 @@ fn tools(remote: bool) -> Value {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "old": {"type": "string", "description": "The exact old text, whole lines"},
+                                "old": {"type": "string", "description": "The exact old text, whole lines with their newlines"},
                                 "new": {"type": "string", "description": "The new text"},
                                 "line": {"type": "integer", "minimum": 1, "description": "Only when the old text occurs more than once: the line where it starts"},
                             },

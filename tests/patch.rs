@@ -293,3 +293,21 @@ fn a_held_lock_gives_exit_3() {
     assert_eq!(code(&p.patch("a", EDIT_AND_APPEND)), 3);
     assert_eq!(p.text(), CSV.as_bytes());
 }
+
+#[test]
+fn an_old_text_without_its_last_newline_gets_a_hint() {
+    let p = Place::new();
+    p.put(CSV);
+    p.read("a");
+    let o = p.patch(
+        "a",
+        r#"{"edits":[{"old":"2026-11-07,park,3.8,","new":"2026-11-07,park,4.1,"}]}"#,
+    );
+    assert_eq!(code(&o), 11, "{}", err(&o));
+    assert!(
+        err(&o).contains("Edit 1: the old text has no newline at its end. Old and new are whole lines with their newlines: add \\n at the end of both."),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(p.text(), CSV.as_bytes());
+}

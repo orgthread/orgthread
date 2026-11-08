@@ -182,7 +182,14 @@ pub fn apply(old: &str, patch: &Patch) -> Result<Applied, String> {
                 } else {
                     whole_line_matches(old, &starts, &edit.new)
                 };
-                if let Some(&p) = found.first() {
+                let with_newline = format!("{}\n", edit.old);
+                if !edit.old.ends_with('\n')
+                    && !whole_line_matches(old, &starts, &with_newline).is_empty()
+                {
+                    said = format!(
+                        "Edit {n}: the old text has no newline at its end. Old and new are whole lines with their newlines: add \\n at the end of both."
+                    );
+                } else if let Some(&p) = found.first() {
                     said.push_str(&format!(
                         " Its new text is at line {}, so this patch may have gone through already.",
                         line_of(&starts, p)
@@ -294,6 +301,16 @@ Done.
             edits,
             append: None,
         }
+    }
+
+    #[test]
+    fn a_missing_last_newline_gets_a_hint() {
+        let e = apply(FILE, &patch(vec![edit("Done.", "All done.")])).unwrap_err();
+        assert!(e.contains("has no newline at its end"), "{e}");
+        assert!(e.contains("add \\n at the end of both"), "{e}");
+        // A text that is not there at all keeps the old words.
+        let e = apply(FILE, &patch(vec![edit("Gone.", "x")])).unwrap_err();
+        assert!(e.contains("check the old text sign by sign"), "{e}");
     }
 
     #[test]

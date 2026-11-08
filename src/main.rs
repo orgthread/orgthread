@@ -55,11 +55,11 @@ Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
 
 A patch is one JSON object: edits, a list of {old, new}, and append. Each edit
-replaces its exact old text, whole lines, which must occur once. If it occurs
-more than once, add a line that differs, or give line, the number where it
-starts. append adds lines at the end. All edits are applied, or none. The name
-must have read the file once, and a change elsewhere in the file needs no new
-read. patch takes --size too.
+replaces its exact old text, whole lines with their newlines, which must occur
+once. If it occurs more than once, add a line that differs, or give line, the
+number where it starts. append adds lines at the end. All edits are applied, or
+none. The name must have read the file once, and a change elsewhere in the file
+needs no new read. patch takes --size too.
 
 Options of list, also called ls: --depth <n> goes n levels down (default 1), and
 --depth all to the bottom. --all also shows the names that start with a dot.
