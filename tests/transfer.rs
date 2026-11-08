@@ -289,3 +289,21 @@ fn each_transfer_leaves_one_log_line_with_its_fingerprint() {
     assert_eq!(lines[1][5], fingerprint(&bytes));
     assert_eq!(lines[1][6], "1000");
 }
+
+#[test]
+fn the_local_server_offers_no_links() {
+    let p = Place::new();
+    let o = p.run(
+        &["serve"],
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"download\",\"arguments\":{\"files\":[\"/a\"],\"who\":\"a\"}}}\n",
+        &[],
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].contains("\"read\"") && !lines[0].contains("\"download\""),
+        "{out}"
+    );
+    assert!(lines[1].contains("there is no tool download"), "{out}");
+}
