@@ -49,10 +49,14 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, exe: &Path) -> io::R
 /// HTTP form of MCP allows.
 pub fn run_http(addresses: &[SocketAddr], login: &Login, exe: &Path) -> io::Result<()> {
     let listener = TcpListener::bind(addresses)?;
-    let base = login.resource();
+    // The links live on the host alone: a chat shows each command it runs, and
+    // a link with the secret path in it would give that path away.
+    let resource = login.resource();
+    let after = resource.strip_prefix("https://").unwrap_or(&resource);
+    let host = after.split('/').next().unwrap_or(after);
     let remote = Remote {
         links: Links::default(),
-        base: base.strip_suffix("/mcp").unwrap_or(&base).to_string(),
+        base: format!("https://{host}"),
     };
     let remote = &remote;
     std::thread::scope(|scope| {
@@ -69,7 +73,7 @@ pub fn run_http(addresses: &[SocketAddr], login: &Login, exe: &Path) -> io::Resu
 /// A chat on the same machine has the disk, and no address for a link.
 pub struct Remote {
     links: Links,
-    /// The public address, with no `/` at the end.
+    /// The scheme and host of the public address, with no path.
     base: String,
 }
 
@@ -143,12 +147,9 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> 
         }
     }
     // A link is the only login of a transfer, and its body can be large, so it
-    // is read only once the link is known.
+    // is read only once the link is known. Links live outside the secret path.
     let prefix = login.prefix();
-    if let Some(secret) = path
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix("/t/"))
-    {
+    if let Some(secret) = path.strip_prefix("/t/") {
         let request = Transfer {
             method,
             secret,
@@ -431,7 +432,8 @@ fn transfer_tools() -> [Value; 2] {
 const BLOCKED: &str = "If curl says CONNECT tunnel failed, response 403, the request \
     never reached this server: the sandbox may reach only the hosts its owner allowed. \
     Ask the owner to add the host of this server on claude.ai, under Settings, \
-    Capabilities, Allowed websites.";
+    Capabilities, Allowed websites. An empty answer with HTTP 404 means that the link \
+    was used already: ask the tool for a new one.";
 
 /// At most this many files in one call of download or upload.
 const MAX_FILES: usize = 25;
@@ -703,10 +705,9 @@ fn transfer(
             "405 Method Not Allowed",
             "This link is for the other direction: GET fetches with download, PUT sends with upload.\n",
         ),
-        Taken::Unknown => (
-            "404 Not Found",
-            "There is no such link, or it was used already. Ask the tool for a new one.\n",
-        ),
+        // As for any wrong address: the answer says nothing, not even that this
+        // is the right server.
+        Taken::Unknown => ("404 Not Found", ""),
     };
     refuse(stream, reader, request, status, text)
 }
@@ -721,7 +722,11 @@ fn refuse(
     status: &str,
     text: &str,
 ) -> io::Result<()> {
-    respond_text(stream, status, text)?;
+    if text.is_empty() {
+        respond(stream, status, "", b"")?;
+    } else {
+        respond_text(stream, status, text)?;
+    }
     if let Some(length) = request.length.filter(|n| *n > 0) {
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         let rest = (length as u64).min(MAX_BODY as u64);

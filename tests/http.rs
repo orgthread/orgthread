@@ -726,7 +726,7 @@ fn a_picture_goes_up_and_comes_back_through_links() {
     assert_eq!(d.bytes("GET", &down[0], "", b"").status, 404);
     let again = d.bytes("PUT", &up[0], "", &bytes);
     assert_eq!(again.status, 404);
-    assert!(String::from_utf8_lossy(&again.body).contains("used already"));
+    assert!(again.body.is_empty());
 }
 
 #[test]
@@ -882,4 +882,76 @@ fn the_curl_lines_of_the_tool_descriptions_work() {
         String::from_utf8_lossy(&down.stderr)
     );
     assert_eq!(fs::read(here.join("back.jpg")).unwrap(), bytes);
+}
+
+impl Door {
+    /// The whole login behind a secret path, and the access token.
+    fn log_in_under(&self, prefix: &str, base: &str) -> String {
+        let reg = self.raw(
+            "POST",
+            &format!("{prefix}/register"),
+            "",
+            &json!({"redirect_uris": [REDIRECT]}).to_string(),
+        );
+        let v: Value = serde_json::from_str(&reg.body).unwrap();
+        let client = v["client_id"].as_str().unwrap().to_string();
+        let resource = encode(&format!("{base}/mcp"));
+        let query = format!(
+            "client_id={client}&redirect_uri={}&response_type=code&code_challenge={}&code_challenge_method=S256&resource={resource}",
+            encode(REDIRECT),
+            challenge_of("v3"),
+        );
+        let sent = self.raw(
+            "POST",
+            &format!("{prefix}/authorize"),
+            "",
+            &format!("{query}&password={}", encode(PASSWORD)),
+        );
+        let location = sent
+            .head
+            .lines()
+            .find_map(|l| l.strip_prefix("Location: "))
+            .unwrap();
+        let code = location
+            .split("code=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        let token = self.raw(
+            "POST",
+            &format!("{prefix}/token"),
+            "",
+            &format!(
+                "grant_type=authorization_code&code={code}&client_id={client}&redirect_uri={}&code_verifier=v3&resource={resource}",
+                encode(REDIRECT)
+            ),
+        );
+        let v: Value = serde_json::from_str(&token.body).unwrap();
+        v["access_token"].as_str().unwrap().to_string()
+    }
+}
+
+#[test]
+fn a_link_never_holds_the_secret_path_of_the_door() {
+    let d = Door::open_at("transfer-secret", SECRET_BASE);
+    let t = d.log_in_under(SECRET, SECRET_BASE);
+    let file = d.scan("p1.jpg");
+    fs::write(&file, picture(10)).unwrap();
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"download","arguments":{"files":[&file],"who":"a"}}});
+    let extra = format!("Authorization: Bearer {t}\r\n");
+    let r = d.raw("POST", &format!("{SECRET}/mcp"), &extra, &call.to_string());
+    let reply: Value = serde_json::from_str(&r.body).unwrap();
+    let text = text_of(&reply);
+    assert!(!text.contains(SECRET), "{text}");
+    let link = links_in(text).remove(0);
+    assert!(link.starts_with("/t/"), "{link}");
+    // Under the secret path there is no link door.
+    assert_eq!(
+        d.bytes("GET", &format!("{SECRET}{link}"), "", b"").status,
+        404
+    );
+    assert_eq!(d.bytes("GET", &link, "", b"").body, picture(10));
 }

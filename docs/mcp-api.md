@@ -84,7 +84,7 @@ curl -sS -T p088-1.jpg '<link>'
 | 200 | Done |
 | 409 | Refused. The text starts with `exit code N`, as in the table below |
 | 410 | The link waited more than 60 seconds. Ask the tool for a new one |
-| 404 | No such link, or it was used already |
+| 404 | No such link, or it was used already. The answer is empty, as for any wrong address |
 | 405 | The link is for the other direction |
 
 If `curl` says `CONNECT tunnel failed, response 403`, the request never reached the server: the host is not on the list of allowed websites of claude.ai. See [mcp.md](mcp.md).

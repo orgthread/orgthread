@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "orgthread"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "jiff",
  "ratatui",
