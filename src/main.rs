@@ -629,16 +629,19 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
     } else {
         Versions::new(&settings.versions)
     };
+    let info = screen::Info::new(settings.dropbox, &settings.log);
     let result = match args {
         [] => {
             if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Err("watch needs a terminal. For plain text, use watch --once".into());
             }
-            screen::run(locks, &settings.log, &versions)
+            screen::run(locks, &settings.log, &versions, &info)
         }
-        [flag] if flag == "--once" => screen::once(locks, &settings.log, 110, 30).map(|text| {
-            let _ = io::stdout().write_all(text.as_bytes());
-        }),
+        [flag] if flag == "--once" => {
+            screen::once(locks, &settings.log, &info, 110, 30).map(|text| {
+                let _ = io::stdout().write_all(text.as_bytes());
+            })
+        }
         _ => return Err("watch takes only --once".into()),
     };
     match result {

@@ -5,10 +5,10 @@ use crate::versions::Versions;
 use crate::watch::{self, Entry, Row, Snapshot, snapshot};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use std::cell::Cell;
 use std::io;
 use std::path::Path;
@@ -17,9 +17,34 @@ use std::time::Duration;
 const BLUE: Color = Color::Rgb(0x22, 0x6D, 0xBD);
 const ORANGE: Color = Color::Rgb(0xE8, 0x74, 0x0C);
 const REFRESH: Duration = Duration::from_secs(1);
-/// The name, the version and the commit of this build.
-fn title() -> String {
-    format!("orgthread watch {}", crate::VERSION)
+/// What the screen tells about itself. Each part is fixed at build time, one word
+/// from a short list, or the path of the log, so no address, secret path, token or
+/// login hash can reach the screen through it.
+pub struct Info {
+    storage: &'static str,
+    log: String,
+}
+
+impl Info {
+    pub fn new(dropbox: bool, log: &Path) -> Info {
+        Info {
+            storage: crate::storage::kind(dropbox),
+            log: log.display().to_string(),
+        }
+    }
+}
+
+/// The name, the version, the commit of this build and the kind of storage.
+fn title(info: &Info) -> String {
+    format!("orgthread {} · {}", crate::VERSION, info.storage)
+}
+
+fn head_line(info: &Info) -> Line<'static> {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(title(info), bold),
+        Span::raw("   read only   ?: help"),
+    ])
 }
 
 /// Which line is chosen. `None` follows the newest line, and a number stays on
@@ -192,7 +217,7 @@ fn row_of(entry: &Entry, width: usize) -> String {
     }
 }
 
-pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
+pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice, info: &Info) {
     let width = usize::from(frame.area().width.saturating_sub(2));
     let top = top_lines(snap, width);
     let count = snap.entries.len();
@@ -200,7 +225,7 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
     let chosen = snap.entries.iter().rev().nth(place);
     let detail = chosen.map_or_else(Vec::new, |e| details(e, width));
 
-    let [head, locks, list, info, foot] = Layout::vertical([
+    let [head, locks, list, below, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length((top.len() as u16 + 2).min(10)),
         Constraint::Min(4),
@@ -209,11 +234,7 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
     ])
     .areas(frame.area());
 
-    let bold = Style::new().add_modifier(Modifier::BOLD);
-    frame.render_widget(
-        Line::from(vec![Span::styled(title(), bold), Span::raw("   read only")]),
-        head,
-    );
+    frame.render_widget(head_line(info), head);
     frame.render_widget(
         Paragraph::new(top).block(Block::bordered().title("Locks held now")),
         locks,
@@ -244,10 +265,10 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice) {
 
     frame.render_widget(
         Paragraph::new(detail).block(Block::bordered().title("Chosen line")),
-        info,
+        below,
     );
     frame.render_widget(
-        Line::raw("up, down: line  enter: diff  g: newest  q: quit"),
+        Line::raw("up, down: line  enter: diff  ?: help  q: quit"),
         foot,
     );
 }
@@ -311,7 +332,7 @@ fn diff_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-pub fn draw_diff(frame: &mut Frame, view: &DiffView) {
+pub fn draw_diff(frame: &mut Frame, view: &DiffView, info: &Info) {
     let width = usize::from(frame.area().width.saturating_sub(2));
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(1),
@@ -328,29 +349,130 @@ pub fn draw_diff(frame: &mut Frame, view: &DiffView) {
     view.max_scroll.set(max);
     let scroll = view.scroll.min(max);
     let shown: Vec<Line> = lines.into_iter().skip(scroll).collect();
-    let bold = Style::new().add_modifier(Modifier::BOLD);
-    frame.render_widget(
-        Line::from(vec![Span::styled(title(), bold), Span::raw("   read only")]),
-        head,
-    );
+    frame.render_widget(head_line(info), head);
     frame.render_widget(
         Paragraph::new(shown).block(Block::bordered().title(view.title.clone())),
         body,
     );
-    frame.render_widget(Line::raw("up, down: scroll   Esc: back   q: quit"), foot);
+    frame.render_widget(
+        Line::raw("up, down: scroll   Esc: back   ?: help   q: quit"),
+        foot,
+    );
+}
+
+/// The keys of the screen, as `Watch::key`, `Choice::key` and `DiffView::key`
+/// read them.
+const KEYS: [(&str, &str); 9] = [
+    ("Up, k", "one line up, or scroll up in a diff"),
+    ("Down, j", "one line down, or scroll down in a diff"),
+    ("Home, g", "the newest line, or the top of a diff"),
+    ("End, G", "the end of a diff"),
+    ("PgUp, PgDn", "a page up or down in a diff, also Space"),
+    ("Enter", "what changed in the chosen write"),
+    ("Esc", "back from a diff, or close this help"),
+    ("?", "open or close this help"),
+    ("q, Ctrl+C", "quit"),
+];
+
+fn help_lines(info: &Info, width: usize) -> Vec<Line<'static>> {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut lines = labelled("Version", crate::VERSION, width);
+    lines.extend(labelled("Storage", info.storage, width));
+    lines.extend(labelled("Log", &info.log, width));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Keys", bold));
+    const KEY: usize = 12;
+    for (key, what) in KEYS {
+        for (i, row) in wrap(what, width.saturating_sub(KEY))
+            .into_iter()
+            .enumerate()
+        {
+            let head = if i == 0 { key } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{head:<KEY$}"), bold),
+                Span::raw(row),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("The screen only reads. It cannot change a file."));
+    lines
+}
+
+/// The help panel, over the middle of the screen.
+pub fn draw_help(frame: &mut Frame, info: &Info) {
+    let area = frame.area();
+    let width = area.width.min(72);
+    let lines = help_lines(info, usize::from(width.saturating_sub(2)));
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let place = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, place);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title("Help   ?, Esc: close")),
+        place,
+    );
+}
+
+/// All that the screen holds between two keys.
+#[derive(Default)]
+pub struct Watch {
+    choice: Choice,
+    open: Option<DiffView>,
+    help: bool,
+}
+
+impl Watch {
+    /// Applies one key. True means quit.
+    pub fn key(&mut self, code: KeyCode, ctrl: bool, snap: &Snapshot, versions: &Versions) -> bool {
+        if code == KeyCode::Char('q') || (ctrl && code == KeyCode::Char('c')) {
+            return true;
+        }
+        if self.help {
+            if matches!(code, KeyCode::Char('?') | KeyCode::Esc) {
+                self.help = false;
+            }
+            return false;
+        }
+        if code == KeyCode::Char('?') {
+            self.help = true;
+        } else if let Some(view) = &mut self.open {
+            if view.key(code) {
+                self.open = None;
+            }
+        } else if code == KeyCode::Enter {
+            let place = self.choice.place(snap.entries.len());
+            if let Some(entry) = snap.entries.iter().rev().nth(place) {
+                self.open = Some(DiffView::open(entry, versions));
+            }
+        } else {
+            self.choice.key(code, ctrl, snap.entries.len());
+        }
+        false
+    }
+
+    pub fn draw(&self, frame: &mut Frame, snap: &Snapshot, info: &Info) {
+        match &self.open {
+            Some(view) => draw_diff(frame, view, info),
+            None => draw(frame, snap, &self.choice, info),
+        }
+        if self.help {
+            draw_help(frame, info);
+        }
+    }
 }
 
 /// Runs the screen until a quit key.
-pub fn run(lock_dir: &Path, log: &Path, versions: &Versions) -> io::Result<()> {
+pub fn run(lock_dir: &Path, log: &Path, versions: &Versions, info: &Info) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let mut choice = Choice::default();
-    let mut open: Option<DiffView> = None;
+    let mut watch = Watch::default();
     let result = loop {
         let snap = snapshot(lock_dir, log);
-        let drawn = terminal.draw(|frame| match &open {
-            Some(view) => draw_diff(frame, view),
-            None => draw(frame, &snap, &choice),
-        });
+        let drawn = terminal.draw(|frame| watch.draw(frame, &snap, info));
         if let Err(e) = drawn {
             break Err(e);
         }
@@ -359,22 +481,8 @@ pub fn run(lock_dir: &Path, log: &Path, versions: &Versions) -> io::Result<()> {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let quit =
-                        key.code == KeyCode::Char('q') || (ctrl && key.code == KeyCode::Char('c'));
-                    if quit {
+                    if watch.key(key.code, ctrl, &snap, versions) {
                         break Ok(());
-                    }
-                    if let Some(view) = &mut open {
-                        if view.key(key.code) {
-                            open = None;
-                        }
-                    } else if key.code == KeyCode::Enter {
-                        let place = choice.place(snap.entries.len());
-                        if let Some(entry) = snap.entries.iter().rev().nth(place) {
-                            open = Some(DiffView::open(entry, versions));
-                        }
-                    } else {
-                        choice.key(key.code, ctrl, snap.entries.len());
                     }
                 }
                 Ok(_) => {}
@@ -388,12 +496,18 @@ pub fn run(lock_dir: &Path, log: &Path, versions: &Versions) -> io::Result<()> {
 }
 
 /// The same screen as plain text, once, for a chat or a log.
-pub fn once(lock_dir: &Path, log: &Path, width: u16, height: u16) -> io::Result<String> {
+pub fn once(
+    lock_dir: &Path,
+    log: &Path,
+    info: &Info,
+    width: u16,
+    height: u16,
+) -> io::Result<String> {
     use ratatui::{Terminal, backend::TestBackend};
     let snap = snapshot(lock_dir, log);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).map_err(io::Error::other)?;
     terminal
-        .draw(|frame| draw(frame, &snap, &Choice::default()))
+        .draw(|frame| draw(frame, &snap, &Choice::default(), info))
         .map_err(io::Error::other)?;
     Ok(text_of(&terminal))
 }
@@ -423,9 +537,19 @@ mod tests {
         .unwrap()
     }
 
+    fn local() -> Info {
+        Info::new(false, Path::new("state/writes.log"))
+    }
+
     fn screen(snap: &Snapshot, choice: &Choice) -> String {
         let mut t = Terminal::new(TestBackend::new(100, 28)).unwrap();
-        t.draw(|f| draw(f, snap, choice)).unwrap();
+        t.draw(|f| draw(f, snap, choice, &local())).unwrap();
+        text_of(&t)
+    }
+
+    fn watch_screen(watch: &Watch, snap: &Snapshot, info: &Info) -> String {
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| watch.draw(f, snap, info)).unwrap();
         text_of(&t)
     }
 
@@ -440,7 +564,7 @@ mod tests {
     #[test]
     fn every_screen_shows_the_version_of_the_build_on_its_first_line() {
         use crate::versions::Versions;
-        let want = format!("orgthread watch {}", crate::VERSION);
+        let want = format!("orgthread {} · local folder", crate::VERSION);
         assert!(crate::VERSION.starts_with(env!("CARGO_PKG_VERSION")));
         let commit = std::process::Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
@@ -458,14 +582,112 @@ mod tests {
         assert!(text.lines().next().unwrap().contains(&want), "{text}");
 
         let none = Path::new("no-such-place");
-        let text = once(none, none, 100, 28).unwrap();
+        let text = once(none, none, &local(), 100, 28).unwrap();
         assert!(text.lines().next().unwrap().contains(&want), "{text}");
 
         let view = DiffView::open(&entry("written", "a"), &Versions::none());
         let mut t = Terminal::new(TestBackend::new(100, 28)).unwrap();
-        t.draw(|f| draw_diff(f, &view)).unwrap();
+        t.draw(|f| draw_diff(f, &view, &local())).unwrap();
         let text = text_of(&t);
         assert!(text.lines().next().unwrap().contains(&want), "{text}");
+
+        let dropbox = Info::new(true, Path::new("state/writes.log"));
+        let text = once(none, none, &dropbox, 100, 28).unwrap();
+        let want = format!("orgthread {} · Dropbox", crate::VERSION);
+        assert!(text.lines().next().unwrap().contains(&want), "{text}");
+    }
+
+    #[test]
+    fn question_mark_opens_the_help_and_question_mark_or_esc_closes_it() {
+        let snap = Snapshot {
+            entries: vec![entry("written", "a")],
+            ..Snapshot::default()
+        };
+        let none = Versions::none();
+        let info = local();
+        let mut w = Watch::default();
+        assert!(!watch_screen(&w, &snap, &info).contains("Keys"));
+        assert!(watch_screen(&w, &snap, &info).contains("?: help"));
+
+        assert!(!w.key(KeyCode::Char('?'), false, &snap, &none));
+        let text = watch_screen(&w, &snap, &info);
+        assert!(text.contains("Help"), "{text}");
+        assert!(text.contains(crate::VERSION), "{text}");
+        assert!(text.contains("local folder"), "{text}");
+        assert!(text.contains("state/writes.log"), "{text}");
+        for (key, _) in KEYS {
+            assert!(text.contains(key), "{key} is missing: {text}");
+        }
+        // Other keys do nothing while the help is open.
+        w.key(KeyCode::Enter, false, &snap, &none);
+        assert!(w.open.is_none());
+
+        assert!(!w.key(KeyCode::Char('?'), false, &snap, &none));
+        assert!(!watch_screen(&w, &snap, &info).contains("Keys"));
+
+        w.key(KeyCode::Char('?'), false, &snap, &none);
+        assert!(!w.key(KeyCode::Esc, false, &snap, &none));
+        assert!(!watch_screen(&w, &snap, &info).contains("Keys"));
+
+        // Over the diff too, and Esc closes the help before it leaves the diff.
+        w.key(KeyCode::Enter, false, &snap, &none);
+        assert!(w.open.is_some());
+        w.key(KeyCode::Char('?'), false, &snap, &none);
+        assert!(watch_screen(&w, &snap, &info).contains("Keys"));
+        w.key(KeyCode::Esc, false, &snap, &none);
+        assert!(w.open.is_some(), "the diff stays open");
+        assert!(!watch_screen(&w, &snap, &info).contains("Keys"));
+        w.key(KeyCode::Esc, false, &snap, &none);
+        assert!(w.open.is_none());
+
+        // q quits from the help too.
+        w.key(KeyCode::Char('?'), false, &snap, &none);
+        assert!(w.key(KeyCode::Char('q'), false, &snap, &none));
+        assert!(w.key(KeyCode::Char('c'), true, &snap, &none));
+    }
+
+    #[test]
+    fn the_help_shows_no_secret_even_when_the_settings_hold_one() {
+        const URL: &str = "https://example.com/invented-secret-path";
+        const HASH: &str = "invented-login-hash-7f3a";
+        // No other unit test reads these two settings.
+        unsafe {
+            std::env::set_var("ORGTHREAD_PUBLIC_URL", URL);
+            std::env::set_var("ORGTHREAD_LOGIN_HASH", HASH);
+        }
+        let snap = Snapshot::default();
+        for dropbox in [false, true] {
+            let info = Info::new(dropbox, Path::new("state/writes.log"));
+            let mut w = Watch::default();
+            w.key(KeyCode::Char('?'), false, &snap, &Versions::none());
+            let text = watch_screen(&w, &snap, &info);
+            assert!(text.contains("Keys"), "{text}");
+            for secret in ["example.com", "invented-secret-path", HASH, "token"] {
+                assert!(!text.contains(secret), "{secret} shows: {text}");
+            }
+        }
+        unsafe {
+            std::env::remove_var("ORGTHREAD_PUBLIC_URL");
+            std::env::remove_var("ORGTHREAD_LOGIN_HASH");
+        }
+    }
+
+    #[test]
+    fn the_help_fits_a_small_terminal() {
+        let mut w = Watch::default();
+        w.key(
+            KeyCode::Char('?'),
+            false,
+            &Snapshot::default(),
+            &Versions::none(),
+        );
+        let mut t = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        t.draw(|f| w.draw(f, &Snapshot::default(), &local()))
+            .unwrap();
+        let mut t = Terminal::new(TestBackend::new(49, 40)).unwrap();
+        t.draw(|f| w.draw(f, &Snapshot::default(), &local()))
+            .unwrap();
+        assert!(text_of(&t).contains("q, Ctrl+C"));
     }
 
     #[test]
@@ -475,7 +697,9 @@ mod tests {
             ..Snapshot::default()
         };
         let text = screen(&snap, &Choice::default());
-        assert!(text.find("newer").unwrap() < text.find("older").unwrap());
+        // Below the title, as "local folder" holds "older" too.
+        let list = text.split_once('\n').unwrap().1;
+        assert!(list.find("newer").unwrap() < list.find("older").unwrap());
         assert!(
             text.contains("Expected"),
             "the details follow the newest: {text}"
@@ -546,7 +770,8 @@ mod tests {
         };
         // The width of Silviu's Terminal panel on the first try.
         let mut t = Terminal::new(TestBackend::new(49, 50)).unwrap();
-        t.draw(|f| draw(f, &snap, &Choice::default())).unwrap();
+        t.draw(|f| draw(f, &snap, &Choice::default(), &local()))
+            .unwrap();
         let text = text_of(&t);
         assert!(text.contains("-invented-long-name.md"), "{text}");
         assert!(text.contains("Expected"), "{text}");
@@ -574,7 +799,7 @@ mod tests {
 
     fn diff_screen(view: &DiffView, width: u16, height: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
-        t.draw(|f| draw_diff(f, view)).unwrap();
+        t.draw(|f| draw_diff(f, view, &local())).unwrap();
         text_of(&t)
     }
 
@@ -653,6 +878,7 @@ mod tests {
             ..Snapshot::default()
         };
         let mut t = Terminal::new(TestBackend::new(20, 5)).unwrap();
-        t.draw(|f| draw(f, &snap, &Choice::default())).unwrap();
+        t.draw(|f| draw(f, &snap, &Choice::default(), &local()))
+            .unwrap();
     }
 }

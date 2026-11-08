@@ -610,6 +610,9 @@ fn the_screen_on_a_server_needs_no_key_and_no_network() {
     let screen = String::from_utf8_lossy(&o.stdout);
     assert!(screen.contains("No writes yet"), "{screen}");
     assert!(!screen.contains("cannot read"), "{screen}");
+    let first = screen.lines().next().unwrap();
+    assert!(first.starts_with("orgthread "), "{first}");
+    assert!(first.contains(" · Dropbox"), "{first}");
 }
 
 #[test]

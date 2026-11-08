@@ -400,7 +400,7 @@ fn version(remote: bool) -> Value {
     let door = if remote { "remote" } else { "local" };
     // The same test as the commands make, which read the same environment.
     let dropbox = std::env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
-    let storage = if dropbox { "Dropbox" } else { "local folder" };
+    let storage = crate::storage::kind(dropbox);
     let offered = tools(remote);
     let names: Vec<&str> = offered["tools"]
         .as_array()

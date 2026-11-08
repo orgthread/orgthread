@@ -59,6 +59,12 @@ pub enum Listing {
     Missing,
 }
 
+/// The kind of storage in plain words, for the screen and the tool `version`. It is
+/// fixed text, so no path, address or key can reach a screen or a chat through it.
+pub fn kind(dropbox: bool) -> &'static str {
+    if dropbox { "Dropbox" } else { "local folder" }
+}
+
 pub trait Storage {
     /// The bytes of a file, or `None` when it does not exist.
     fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>>;

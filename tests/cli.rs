@@ -437,6 +437,33 @@ fn watch_once_shows_the_writes_and_a_held_lock() {
 }
 
 #[test]
+fn watch_once_starts_with_the_version_and_the_storage_and_no_secret() {
+    const URL: &str = "https://example.com/invented-secret-path";
+    const HASH: &str = "invented-login-hash-7f3a";
+    let p = Place::new();
+    let version = p.run(&["--version"], b"");
+    let version = String::from_utf8(version.stdout).unwrap();
+    let version = version.trim();
+    assert!(version.starts_with("orgthread "), "{version}");
+    let o = p
+        .command(&["watch", "--once"])
+        .env("ORGTHREAD_PUBLIC_URL", URL)
+        .env("ORGTHREAD_LOGIN_HASH", HASH)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    let first = text.lines().next().unwrap();
+    assert!(
+        first.starts_with(&format!("{version} · local folder")),
+        "{first}"
+    );
+    for secret in ["example.com", "invented-secret-path", HASH] {
+        assert!(!text.contains(secret), "{secret} shows: {text}");
+    }
+}
+
+#[test]
 fn watch_without_a_terminal_says_what_to_do_and_changes_nothing() {
     let p = Place::new();
     let o = p.run(&["watch"], b"");
