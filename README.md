@@ -31,7 +31,7 @@ The old text must occur once, or the patch is refused with exit code 11, and not
 
 For a file that is not text, such as a picture or a PDF, `download` gives the exact bytes, and `upload` writes them with the rules of `write`. A download notes what this name read, so the same name may then replace the file. A file that is not text may go only to the folders named in `ORGTHREAD_BINARY_ALLOW`, and with that setting empty, to none. A download may have up to 250 MB and passes through in parts, and an upload up to 20 MB. `--check` checks the rules and the size, and moves nothing.
 
-The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists them.
+The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists the codes, and [docs/exit-codes.md](docs/exit-codes.md) says which command gives each one and what to do.
 
 The fingerprint is the content hash that Dropbox reports. Today the tool writes to a local folder, behind one small storage interface.
 

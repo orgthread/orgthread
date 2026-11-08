@@ -6,6 +6,7 @@
 
 use crate::login::{Login, Refused};
 use crate::transfer::{self, Direction, Links, Taken};
+use crate::write::exit;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -511,12 +512,12 @@ fn links_for(
                     }
                 }
                 Err(e) => {
-                    first_failed.get_or_insert(1);
-                    format!("{file}  refused, exit code 1: {e}")
+                    first_failed.get_or_insert(exit::FAILED);
+                    format!("{file}  refused, exit code {}: {e}", exit::FAILED)
                 }
             },
             Ok(out) => {
-                let code = out.status.code().unwrap_or(1);
+                let code = out.status.code().unwrap_or(exit::FAILED);
                 first_failed.get_or_insert(code);
                 let said = String::from_utf8_lossy(&out.stderr);
                 let reason = said.lines().next().unwrap_or("");
@@ -524,8 +525,11 @@ fn links_for(
                 format!("{file}  refused, exit code {code}: {reason}")
             }
             Err(e) => {
-                first_failed.get_or_insert(1);
-                format!("{file}  refused, exit code 1: could not start the command: {e}")
+                first_failed.get_or_insert(exit::FAILED);
+                format!(
+                    "{file}  refused, exit code {}: could not start the command: {e}",
+                    exit::FAILED
+                )
             }
         };
         lines.push(line);
@@ -789,13 +793,14 @@ fn receive_file(
     let limit = match transfer::upload_limit() {
         Ok(limit) => limit,
         Err(e) => {
-            let text = format!("exit code 2\n{e}\n");
+            let text = format!("exit code {}\n{e}\n", exit::USAGE);
             return refuse(stream, reader, request, "409 Conflict", &text);
         }
     };
     if length as u64 > limit {
         let text = format!(
-            "exit code 2\norgthread: refused, nothing written. The new file has more than the limit of {}.\n",
+            "exit code {}\norgthread: refused, nothing written. The new file has more than the limit of {}.\n",
+            exit::USAGE,
             transfer::megabytes(limit)
         );
         return refuse(stream, reader, request, "409 Conflict", &text);

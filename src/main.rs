@@ -107,6 +107,7 @@ Exit codes:
   4  changed: read it again  10 written, but its clean-up did not finish
   5  exists: read it first, or for --to, the copy exists
   11 an edit of a patch does not fit: nothing written
+Each code and what to do: https://github.com/orgthread/orgthread/blob/main/docs/exit-codes.md
 ";
 
 fn main() -> ExitCode {

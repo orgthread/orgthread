@@ -4,6 +4,7 @@
 //! the time come first and the name last, so a space in a name does no harm.
 
 use crate::storage::{Entry, Listing, Storage};
+use crate::write::exit;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
@@ -159,13 +160,15 @@ impl Run<'_> {
 
     fn top(&mut self, shown: &str, path: &str) {
         if let Err(reason) = (self.limits)(named(path), false) {
-            return self.problem(shown, 2, &reason);
+            return self.problem(shown, exit::USAGE, &reason);
         }
         match self.storage.list(path, self.left) {
-            Err(e) => self.problem(shown, 1, &format!("could not list {shown}: {e}")),
-            Ok(Listing::Missing) => {
-                self.problem(shown, 6, &format!("there is no file or folder {shown}"))
-            }
+            Err(e) => self.problem(shown, exit::FAILED, &format!("could not list {shown}: {e}")),
+            Ok(Listing::Missing) => self.problem(
+                shown,
+                exit::MISSING,
+                &format!("there is no file or folder {shown}"),
+            ),
             Ok(Listing::File(entry)) => {
                 self.group(parent(shown));
                 if self.left == 0 {
@@ -230,7 +233,11 @@ impl Run<'_> {
                 }
                 // Gone or changed into a file since the line above: nothing to show.
                 Ok(_) => {}
-                Err(e) => self.problem(&sub_shown, 1, &format!("could not list {sub_shown}: {e}")),
+                Err(e) => self.problem(
+                    &sub_shown,
+                    exit::FAILED,
+                    &format!("could not list {sub_shown}: {e}"),
+                ),
             }
         }
     }

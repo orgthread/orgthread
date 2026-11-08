@@ -99,7 +99,7 @@ tools: read, write, patch, list, download, upload, version
 | Status | When |
 |---|---|
 | 200 | Done |
-| 409 | Refused. The text starts with `exit code N`, as in the table below |
+| 409 | Refused. The text starts with `exit code N`, as in [exit-codes.md](exit-codes.md) |
 | 410 | The link waited more than 60 seconds. Ask the tool for a new one |
 | 404 | No such link, or it was used already. The answer is empty, as for any wrong address |
 | 405 | The link is for the other direction |
@@ -117,19 +117,7 @@ exit code 4
 orgthread: refused, nothing written. notes/a.md changed since you read it. Read it again and build the change from that text.
 ```
 
-| Code | Meaning | What to do |
-|---|---|---|
-| 1 | Failed, the file is unchanged | Read the reason |
-| 2 | Wrong use, or not text: an empty text, a NUL sign, a path outside the root, a path the limits forbid, a missing setting | Read the reason |
-| 3 | Busy: another writer holds the lock | Try again in a moment |
-| 4 | Changed since this name read it. For `patch`: changed during the patch | Read it again and build the change from that text. For `patch`: send the same patch again |
-| 5 | Exists, and this name has not read it | Read it first |
-| 6 | Missing: there is no such file or folder, or it is gone since the read | Look for the file |
-| 7 | The check after the write failed, and the old state is back | Read the reason |
-| 8 | Written, but the log line failed | Look at the log file |
-| 9 | The check after the write failed, and the old state is NOT back | Look at the file now |
-| 10 | Written, but the clean-up did not finish, or another writer may have been at work | Read the message. If it names another writer, check the file. If not, there is nothing to do: the file is free again within 15 minutes |
-| 11 | An edit of a patch does not fit: its old text is not in the file, it occurs more than once with no fitting `line`, two edits overlap, or the new text drops the newline of the old text. Nothing is written | Read the message. It names the edit and the lines. Fix the edit and send the patch again. No new read is needed |
+Each code, the commands that give it and what to do are in [exit-codes.md](exit-codes.md).
 
 So `isError` does not always mean that nothing changed. With 8 and 10, the text is written. With 9, the file may be damaged.
 
