@@ -1,10 +1,11 @@
 [package]
 name = "orgthread"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+jiff = "0.2.40"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"

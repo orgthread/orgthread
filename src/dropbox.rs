@@ -9,7 +9,7 @@
 //! The locks are small local files beside the program: a lock costs no web call.
 //! Between writers elsewhere, Dropbox's own version check decides.
 
-use crate::storage::{Expect, LocalFolder, Storage, WriteError};
+use crate::storage::{Entry, Expect, Listing, LocalFolder, Storage, WriteError};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::Path;
@@ -60,6 +60,43 @@ fn ascii_json(value: &Value) -> String {
         }
     }
     out
+}
+
+/// One entry of a `list_folder` answer. `None` for a deleted entry or an odd one.
+fn entry_of(v: &Value) -> Option<Entry> {
+    let name = v["name"].as_str()?.to_string();
+    match v[".tag"].as_str()? {
+        "folder" => Some(Entry {
+            name,
+            folder: true,
+            size: None,
+            modified: None,
+        }),
+        "file" => Some(Entry {
+            name,
+            folder: false,
+            size: v["size"].as_u64(),
+            modified: v["server_modified"]
+                .as_str()
+                .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+                .map(|t| t.as_second()),
+        }),
+        _ => None,
+    }
+}
+
+/// The entries of one page of a `list_folder` answer, its cursor, and whether
+/// more pages follow.
+fn page_of(body: &[u8]) -> io::Result<(Vec<Entry>, String, bool)> {
+    let v: Value = serde_json::from_slice(body)?;
+    let entries = v["entries"]
+        .as_array()
+        .ok_or_else(|| failure("Dropbox gave no entries".to_string()))?
+        .iter()
+        .filter_map(entry_of)
+        .collect();
+    let cursor = v["cursor"].as_str().unwrap_or_default().to_string();
+    Ok((entries, cursor, v["has_more"].as_bool().unwrap_or(false)))
 }
 
 fn summary(body: &[u8]) -> String {
@@ -282,6 +319,51 @@ impl Dropbox {
 }
 
 impl Storage for Dropbox {
+    fn list(&self, path: &str, max: usize) -> io::Result<Listing> {
+        // Dropbox names its root with an empty path.
+        let full = if path.is_empty() {
+            String::new()
+        } else {
+            Self::file(path)
+        };
+        let arg = json!({ "path": full, "recursive": false, "include_deleted": false });
+        let reply = self.rpc("list_folder", &arg)?;
+        if reply.status == 409 {
+            let text = summary(&reply.body);
+            if text.contains("not_found") {
+                return Ok(Listing::Missing);
+            }
+            if text.contains("not_folder") {
+                let reply = self.rpc("get_metadata", &json!({ "path": full }))?;
+                if reply.status != 200 {
+                    return Err(refused(&reply));
+                }
+                let v: Value = serde_json::from_slice(&reply.body)?;
+                return entry_of(&v)
+                    .map(Listing::File)
+                    .ok_or_else(|| failure(format!("{full} is neither a file nor a folder")));
+            }
+        }
+        if reply.status != 200 {
+            return Err(refused(&reply));
+        }
+        let (mut entries, mut cursor, mut more) = page_of(&reply.body)?;
+        // Each page costs a web call, so it stops once the list is full.
+        while more && entries.len() <= max {
+            let reply = self.rpc("list_folder/continue", &json!({ "cursor": cursor }))?;
+            if reply.status != 200 {
+                return Err(refused(&reply));
+            }
+            let (next, next_cursor, next_more) = page_of(&reply.body)?;
+            entries.extend(next);
+            (cursor, more) = (next_cursor, next_more);
+        }
+        Ok(Listing::Folder {
+            entries,
+            complete: !more,
+        })
+    }
+
     fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
         self.download(&Self::file(path))
     }
@@ -371,6 +453,35 @@ mod tests {
     fn a_form_field_writes_odd_signs_safely() {
         assert_eq!(Dropbox::form("a-b_c.d~1"), "a-b_c.d~1");
         assert_eq!(Dropbox::form("a b&c=ü"), "a%20b%26c%3D%C3%BC");
+    }
+
+    #[test]
+    fn a_page_of_list_folder_becomes_entries() {
+        let body = br#"{"entries":[
+            {".tag":"file","name":"a.md","size":12,"server_modified":"2026-11-07T10:00:00Z"},
+            {".tag":"folder","name":"drafts"},
+            {".tag":"deleted","name":"gone.md"}
+        ],"cursor":"next-page","has_more":true}"#;
+        let (entries, cursor, more) = page_of(body).unwrap();
+        assert_eq!(cursor, "next-page");
+        assert!(more);
+        assert_eq!(
+            entries,
+            [
+                Entry {
+                    name: "a.md".into(),
+                    folder: false,
+                    size: Some(12),
+                    modified: Some(1_794_045_600),
+                },
+                Entry {
+                    name: "drafts".into(),
+                    folder: true,
+                    size: None,
+                    modified: None,
+                },
+            ]
+        );
     }
 
     #[test]

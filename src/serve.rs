@@ -273,6 +273,36 @@ fn tools() -> Value {
                 "required": ["file", "who", "text"],
             },
         },
+        {
+            "name": "list",
+            "description": "Lists the files and folders in one or more folders: one group per \
+                folder, and per entry its size in bytes, its time and its name. A folder name \
+                ends with /. To read a file, join the header of its group and its name. One \
+                level by default. Names that start with a dot are hidden.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "folders": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "The full paths of the folders. On a server, from the root of the Dropbox: /org/notes",
+                    },
+                    "depth": {
+                        "oneOf": [
+                            {"type": "integer", "minimum": 1},
+                            {"type": "string", "enum": ["all"]},
+                        ],
+                        "description": "How many levels down: 1 by default, or all",
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "true also shows the names that start with a dot",
+                    },
+                },
+                "required": ["folders"],
+            },
+        },
     ]})
 }
 
@@ -298,6 +328,11 @@ fn call(params: &Value, exe: &Path) -> Result<Value, (i32, String)> {
             let args = vec!["write", "--who", who, "--size", size.as_str(), file];
             return Ok(result(name, start(exe, &args, Some(text))));
         }
+        Some("list") => {
+            let owned = list_args(params)?;
+            let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+            return Ok(result(name, start(exe, &args, None)));
+        }
         _ => {
             return Err((
                 INVALID_PARAMS,
@@ -306,6 +341,39 @@ fn call(params: &Value, exe: &Path) -> Result<Value, (i32, String)> {
         }
     };
     Ok(result(name, start(exe, &args, text)))
+}
+
+/// The command line of a list. The folders come after `--`, so a folder named
+/// like an option stays a folder.
+fn list_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
+    let wrong = |what: &str| (INVALID_PARAMS, format!("list needs {what}"));
+    let arguments = &params["arguments"];
+    let folders = arguments["folders"]
+        .as_array()
+        .filter(|f| !f.is_empty())
+        .ok_or_else(|| wrong("folders, as a list of paths"))?;
+    let mut args = vec!["list".to_string()];
+    match &arguments["depth"] {
+        Value::Null => {}
+        Value::String(all) if all == "all" => args.extend(["--depth".into(), "all".into()]),
+        Value::Number(n) if n.as_u64().is_some_and(|n| n >= 1) => {
+            args.extend(["--depth".into(), n.to_string()]);
+        }
+        _ => return Err(wrong("depth as a number from 1, or \"all\"")),
+    }
+    match &arguments["all"] {
+        Value::Null | Value::Bool(false) => {}
+        Value::Bool(true) => args.push("--all".into()),
+        _ => return Err(wrong("all as true or false")),
+    }
+    args.push("--".into());
+    for folder in folders {
+        let folder = folder
+            .as_str()
+            .ok_or_else(|| wrong("each folder as text"))?;
+        args.push(folder.to_string());
+    }
+    Ok(args)
 }
 
 fn start(exe: &Path, args: &[&str], text: Option<&str>) -> io::Result<Output> {

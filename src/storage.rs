@@ -34,6 +34,31 @@ impl From<io::Error> for WriteError {
     }
 }
 
+/// One entry of a folder, as a list shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub folder: bool,
+    /// The size in bytes. A folder has none.
+    pub size: Option<u64>,
+    /// Seconds since 1970-01-01 UTC. A folder has none, as Dropbox gives none.
+    pub modified: Option<i64>,
+}
+
+/// What a path holds, one level down.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// A folder and its entries, in no order. `complete` is false when more
+    /// entries exist than were fetched.
+    Folder {
+        entries: Vec<Entry>,
+        complete: bool,
+    },
+    /// The path names a file.
+    File(Entry),
+    Missing,
+}
+
 pub trait Storage {
     /// The bytes of a file, or `None` when it does not exist.
     fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>>;
@@ -56,6 +81,17 @@ pub trait Storage {
     /// Removes a lock older than `max_age`. Returns its line if this call won.
     fn lock_take_stale(&self, name: &str, max_age: Duration) -> io::Result<Option<String>>;
     fn lock_remove(&self, name: &str) -> io::Result<()>;
+
+    /// The entries of a folder, one level down. `path` is from the root, and
+    /// empty for the root itself. It may stop after a little more than `max`
+    /// entries, and then says the folder is not complete.
+    fn list(&self, path: &str, max: usize) -> io::Result<Listing> {
+        let _ = (path, max);
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "this storage cannot list a folder",
+        ))
+    }
 }
 
 /// Files in a local folder, for example the Dropbox mirror on a Mac.
@@ -121,7 +157,69 @@ impl LocalFolder {
     }
 }
 
+/// Seconds since 1970-01-01 UTC, also for a time before it.
+fn seconds(time: std::time::SystemTime) -> Option<i64> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).ok(),
+        Err(e) => i64::try_from(e.duration().as_secs()).ok().map(|s| -s),
+    }
+}
+
+impl LocalFolder {
+    /// The entry for a path, following links. `None` for a link that leads
+    /// nowhere or out of the root, and for a name that is not valid UTF-8.
+    fn entry(&self, full: &Path, name: &std::ffi::OsStr) -> Option<Entry> {
+        let name = name.to_str()?.to_string();
+        if fs::symlink_metadata(full).ok()?.file_type().is_symlink() {
+            let real = fs::canonicalize(full).ok()?;
+            let root = fs::canonicalize(&self.root).ok()?;
+            if !real.starts_with(root) {
+                return None;
+            }
+        }
+        let meta = fs::metadata(full).ok()?;
+        let folder = meta.is_dir();
+        Some(Entry {
+            name,
+            folder,
+            size: (!folder).then_some(meta.len()),
+            modified: if folder {
+                None
+            } else {
+                meta.modified().ok().and_then(seconds)
+            },
+        })
+    }
+}
+
 impl Storage for LocalFolder {
+    fn list(&self, path: &str, _max: usize) -> io::Result<Listing> {
+        let full = self.full(path);
+        let meta = match fs::metadata(&full) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Listing::Missing),
+            Err(e) => return Err(e),
+        };
+        if !meta.is_dir() {
+            let name = full.file_name().unwrap_or_default();
+            return match self.entry(&full, name) {
+                Some(entry) => Ok(Listing::File(entry)),
+                None => Ok(Listing::Missing),
+            };
+        }
+        let mut entries = Vec::new();
+        for item in fs::read_dir(&full)? {
+            let item = item?;
+            if let Some(entry) = self.entry(&item.path(), &item.file_name()) {
+                entries.push(entry);
+            }
+        }
+        Ok(Listing::Folder {
+            entries,
+            complete: true,
+        })
+    }
+
     fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
         match fs::read(self.full(path)) {
             Ok(bytes) => Ok(Some(bytes)),

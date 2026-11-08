@@ -31,9 +31,55 @@ struct State {
     second_writer: bool,
     /// The next update stores this in place of what was sent, as if a person edited it.
     edit_instead: Option<Vec<u8>>,
+    /// Entries per page of `list_folder`, so that a test sees the cursor at work.
+    page: usize,
+    /// How many `list_folder` calls came in, the first page and the next ones.
+    list_calls: u32,
 }
 
 impl State {
+    /// The entries of a folder as `list_folder` gives them, or why not.
+    fn children(&self, path: &str) -> Result<Vec<Value>, &'static str> {
+        if self.files.contains_key(path) {
+            return Err("path/not_folder/..");
+        }
+        let prefix = format!("{path}/");
+        let mut seen = std::collections::BTreeMap::new();
+        for (key, file) in &self.files {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let entry = match rest.split_once('/') {
+                Some((folder, _)) => json!({ ".tag": "folder", "name": folder }),
+                None => json!({
+                    ".tag": "file",
+                    "name": rest,
+                    "size": file.bytes.len(),
+                    "server_modified": file.modified,
+                }),
+            };
+            let name = entry["name"].as_str().unwrap().to_string();
+            seen.insert(name, entry);
+        }
+        if seen.is_empty() && !path.is_empty() {
+            return Err("path/not_found/..");
+        }
+        Ok(seen.into_values().collect())
+    }
+
+    /// One page from `start`, with the cursor for the next one.
+    fn page_from(&mut self, path: &str, start: usize) -> Result<Value, &'static str> {
+        self.list_calls += 1;
+        let all = self.children(path)?;
+        let size = if self.page == 0 { 100 } else { self.page };
+        let end = (start + size).min(all.len());
+        Ok(json!({
+            "entries": all[start..end],
+            "cursor": format!("{path}|{end}"),
+            "has_more": end < all.len(),
+        }))
+    }
+
     fn put(&mut self, path: &str, bytes: &[u8]) {
         self.next_rev += 1;
         let stored = Stored {
@@ -121,10 +167,27 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
             Some(file) => reply(&mut stream, 200, &file.bytes),
             None => error(&mut stream, "path/not_found/.."),
         },
+        "/2/files/list_folder" => {
+            assert_eq!(arg["recursive"], false);
+            match s.page_from(&path, 0) {
+                Ok(v) => reply(&mut stream, 200, v.to_string().as_bytes()),
+                Err(summary) => error(&mut stream, summary),
+            }
+        }
+        "/2/files/list_folder/continue" => {
+            let cursor = arg["cursor"].as_str().unwrap_or("").to_string();
+            let (folder, start) = cursor.rsplit_once('|').unwrap();
+            match s.page_from(folder, start.parse().unwrap()) {
+                Ok(v) => reply(&mut stream, 200, v.to_string().as_bytes()),
+                Err(summary) => error(&mut stream, summary),
+            }
+        }
         "/2/files/get_metadata" => match s.files.get(&path) {
             Some(file) => {
                 let v = json!({
                     ".tag": "file",
+                    "name": path.rsplit('/').next().unwrap_or(""),
+                    "size": file.bytes.len(),
                     "rev": file.rev.to_string(),
                     "content_hash": fingerprint(&file.bytes),
                     "server_modified": file.modified,
@@ -699,4 +762,62 @@ fn the_limits_hold_for_reads_and_writes() {
     assert_eq!(code(&o), 2, "{o:?}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("read only"));
     assert_eq!(f.get("/org/tasks.org").unwrap(), b"* TODO\n");
+}
+
+#[test]
+fn a_list_follows_the_cursor_over_several_pages() {
+    let f = Fake::new();
+    f.state.lock().unwrap().page = 2;
+    f.put("/org/notes/a.md", b"four");
+    f.put("/org/notes/b.md", b"12");
+    f.put("/org/notes/.DS_Store", b"x");
+    f.put("/org/notes/drafts/c.md", b"c");
+    let o = f.run_with(Some(GOOD_TOKEN), &["list", "/org/notes"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "/org/notes:");
+    assert!(
+        lines[1].ends_with("  a.md") && lines[1].contains("        4  2026-11-07"),
+        "{text}"
+    );
+    assert!(lines[2].ends_with("  b.md"), "{text}");
+    assert!(
+        lines[3].ends_with("  drafts/") && lines[3].contains("  -  -  "),
+        "{text}"
+    );
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(f.state.lock().unwrap().list_calls, 2, "two pages of two");
+}
+
+#[test]
+fn a_list_of_the_root_a_file_and_a_missing_folder() {
+    let f = Fake::new();
+    f.put("/org/notes/a.md", b"four");
+    let o = f.run(&["list", "/", "/org/notes/a.md", "/org/gone", "/org/"], b"");
+    assert_eq!(code(&o), 6, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.starts_with("/:\n"), "{text}");
+    assert!(text.contains("  org/\n"), "{text}");
+    assert!(
+        text.contains("\n/org/notes:\n") && text.contains("  a.md\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("/org/gone:\n  there is no file or folder /org/gone\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("/org/:\n") && text.contains("  notes/\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_list_in_dropbox_needs_a_clean_path() {
+    let f = Fake::new();
+    for folder in ["org/notes", "/org/../x", "/org//notes"] {
+        let o = f.run(&["list", folder], b"");
+        assert_eq!(code(&o), 2, "{folder}: {o:?}");
+    }
 }

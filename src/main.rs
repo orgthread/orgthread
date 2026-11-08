@@ -1,5 +1,7 @@
+use jiff::tz::TimeZone;
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::fingerprint;
+use orgthread::list::{self, Options, Target};
 use orgthread::log;
 use orgthread::login::Login;
 use orgthread::reads::Reads;
@@ -19,11 +21,12 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 orgthread reads and writes a plain text file the same way every time.
 
-For an agent, two commands:
+For an agent, three commands:
 
   orgthread read <file> --who <name>             prints the exact text
   orgthread read <file> --who <name> --to <copy> saves an exact copy instead
   orgthread write <file> --who <name>            < the whole new text
+  orgthread list <folder>...                     the size, time and name of each entry
 
 Give the same name each time. To change a file, read it first. A new file needs
 no read. orgthread remembers what each name read, and it refuses a write when
@@ -31,7 +34,7 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read and write, as MCP tools
+  orgthread serve                                the same read, write and list, as MCP tools
 
 For a person:
 
@@ -42,6 +45,11 @@ For a person:
 
 Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
+
+Options of list, also called ls: --depth <n> goes n levels down (default 1), and
+--depth all to the bottom. --all also shows the names that start with a dot.
+After --, each word is a folder. A list shows at most 1000 entries, leaves out
+closed paths, and marks read-only ones. The time is in the zone of TZ.
 
 Settings, from the environment:
   A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
@@ -128,6 +136,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("fingerprint") => cmd_fingerprint(&args[1..]),
         Some("read") => cmd_read(&args[1..]),
         Some("write") => cmd_write(&args[1..]),
+        Some("list" | "ls") => cmd_list(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("password-hash") => {
@@ -278,6 +287,79 @@ fn path_in_root(file: &str, root: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("the path of {file} is not valid UTF-8"))
 }
 
+struct ListArgs {
+    folders: Vec<String>,
+    depth: Option<usize>,
+    all: bool,
+}
+
+fn parse_list(args: &[String]) -> Result<ListArgs, String> {
+    let mut folders = Vec::new();
+    let mut depth = Some(1);
+    let mut all = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            // After --, each word is a folder, also one named like an option.
+            "--" => folders.extend(rest.by_ref().cloned()),
+            "--all" => all = true,
+            "--depth" => {
+                let value = rest.next().ok_or("--depth needs a number from 1, or all")?;
+                depth = match value.as_str() {
+                    "all" => None,
+                    n => match n.parse::<usize>() {
+                        Ok(n) if n >= 1 => Some(n),
+                        _ => return Err(format!("--depth needs a number from 1, or all, not {n}")),
+                    },
+                };
+            }
+            other if other.starts_with("--") => return Err(format!("there is no option {other}")),
+            other => folders.push(other.to_string()),
+        }
+    }
+    if folders.is_empty() {
+        return Err("list needs a folder".into());
+    }
+    Ok(ListArgs {
+        folders,
+        depth,
+        all,
+    })
+}
+
+/// The files and folders in each folder, one group per folder.
+fn cmd_list(args: &[String]) -> Result<i32, String> {
+    let ListArgs {
+        folders,
+        depth,
+        all,
+    } = parse_list(args)?;
+    let settings = Settings::load()?;
+    let storage = settings.storage()?;
+    let targets: Vec<Target> = folders
+        .iter()
+        .map(|shown| Target {
+            shown: shown.clone(),
+            path: settings.folder_of(shown),
+        })
+        .collect();
+    let options = Options {
+        depth,
+        all,
+        zone: TimeZone::system(),
+    };
+    let limits = |path: &str, writing: bool| settings.limits(path, writing);
+    let (text, code) = list::list(storage.as_ref(), &targets, &options, &limits);
+    let mut out = io::stdout();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(code),
+        Err(e) => {
+            say(format!("could not hand over the list: {e}"));
+            Ok(exit::FAILED)
+        }
+    }
+}
+
 /// The exact text, and a note of what this name read, from one single read.
 fn cmd_read(args: &[String]) -> Result<i32, String> {
     let ReadArgs { file, who, to } = parse_read(args)?;
@@ -411,6 +493,37 @@ impl Settings {
 }
 
 impl Settings {
+    /// The path of a folder from the root, empty for the root itself. A path
+    /// that names nothing gets exit code 6, and any other problem exit code 2.
+    fn folder_of(&self, folder: &str) -> Result<String, (i32, String)> {
+        if self.dropbox {
+            let inside = folder
+                .strip_prefix('/')
+                .ok_or_else(|| {
+                    (
+                        exit::USAGE,
+                        format!("{folder} must start with / in Dropbox"),
+                    )
+                })?
+                .trim_end_matches('/');
+            let bad = !inside.is_empty()
+                && inside
+                    .split('/')
+                    .any(|p| p.is_empty() || p == "." || p == "..");
+            if bad {
+                return Err((exit::USAGE, format!("{folder} is not a clean path")));
+            }
+            return Ok(inside.to_string());
+        }
+        if fs::symlink_metadata(folder).is_err() {
+            return Err((
+                exit::MISSING,
+                format!("there is no file or folder {folder}"),
+            ));
+        }
+        path_in_root(folder, &self.root).map_err(|reason| (exit::USAGE, reason))
+    }
+
     fn load() -> Result<Settings, String> {
         let dropbox = env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
         // Locks, log and notes live beside the program, and nowhere else.

@@ -11,6 +11,7 @@ pub const VERSION: &str = concat!(
 
 pub mod dropbox;
 pub mod fingerprint;
+pub mod list;
 pub mod log;
 pub mod login;
 pub mod reads;

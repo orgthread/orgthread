@@ -551,3 +551,75 @@ fn a_local_folder_keeps_locks_and_log_beside_the_program_too() {
     let o = run(&["watch", "--once"], b"");
     assert!(String::from_utf8_lossy(&o.stdout).contains("other writer"));
 }
+
+#[test]
+fn list_and_ls_give_the_folder_and_its_exit_code() {
+    let p = Place::new();
+    fs::write(p.file(), "four").unwrap();
+    let notes = p.root.join("org/notes");
+    let notes = notes.to_str().unwrap();
+    for command in ["list", "ls"] {
+        let o = p
+            .command(&[command, notes])
+            .env("TZ", "Europe/Vienna")
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 0, "{o:?}");
+        let text = String::from_utf8(o.stdout).unwrap();
+        assert!(text.starts_with(&format!("{notes}:\n")), "{text}");
+        assert!(text.ends_with("  invented.md\n"), "{text}");
+    }
+}
+
+#[test]
+fn list_refuses_wrong_use_and_paths_outside_the_root() {
+    let p = Place::new();
+    let notes = p.root.join("org/notes");
+    let notes = notes.to_str().unwrap();
+    for args in [
+        vec!["list"],
+        vec!["list", notes, "--depth"],
+        vec!["list", notes, "--depth", "0"],
+        vec!["list", notes, "--depth", "two"],
+        vec!["list", notes, "--deep"],
+    ] {
+        let o = p.command(&args).output().unwrap();
+        assert_eq!(code(&o), 2, "{args:?}: {o:?}");
+    }
+    let outside = p.outside("");
+    let o = p
+        .command(&["list", outside.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "{o:?}");
+    let o = p.command(&["list", "--", "--all"]).output().unwrap();
+    assert_eq!(code(&o), 6, "a folder named like an option: {o:?}");
+}
+
+#[test]
+fn list_keeps_to_the_limits_of_the_door() {
+    let p = Place::new();
+    fs::write(p.file(), "four").unwrap();
+    fs::create_dir_all(p.root.join("org/notes/private")).unwrap();
+    fs::write(p.root.join("org/notes/private/x.md"), "secret").unwrap();
+    let notes = p.root.join("org/notes");
+    let notes = notes.to_str().unwrap();
+    let o = p
+        .command(&["list", notes, "--depth", "all"])
+        .env("ORGTHREAD_DENY", "org/notes/private")
+        .env("ORGTHREAD_READ_ONLY", "org/notes/invented.md")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(!text.contains("  private/"), "{text}");
+    assert!(text.contains("  invented.md  (read only)\n"), "{text}");
+    let private = p.root.join("org/notes/private");
+    let o = p
+        .command(&["list", private.to_str().unwrap()])
+        .env("ORGTHREAD_DENY", "org/notes/private")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("x.md"));
+}

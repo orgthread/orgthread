@@ -123,7 +123,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_only_the_two_tools() {
+fn it_greets_and_offers_the_three_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -137,12 +137,13 @@ fn it_greets_and_offers_only_the_two_tools() {
     let list = server.ask("tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read", "write"]);
+    assert_eq!(names, ["read", "write", "list"]);
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
         json!(["file", "who", "text"])
     );
+    assert_eq!(tools[2]["inputSchema"]["required"], json!(["folders"]));
 }
 
 #[test]
@@ -313,5 +314,97 @@ fn wrong_messages_get_an_error_and_the_server_goes_on() {
     assert_eq!(no_who["error"]["code"], -32602);
     assert!(no_who["error"]["message"].as_str().unwrap().contains("who"));
 
+    assert_eq!(server.ask("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn a_list_gives_the_same_text_as_the_command() {
+    let place = Place::new();
+    fs::write(place.file(), "four").unwrap();
+    fs::write(place.root.join("org/notes/.DS_Store"), "x").unwrap();
+    fs::create_dir_all(place.root.join("org/notes/drafts")).unwrap();
+    fs::write(place.root.join("org/notes/drafts/c.md"), "c").unwrap();
+    let notes = place.root.join("org/notes");
+    let notes = notes.to_str().unwrap();
+    let mut server = place.serve();
+    let (said, refused) = server.tool("list", json!({"folders": [notes]}));
+    assert!(!refused, "{said}");
+    let command = place
+        .command(&["list", notes])
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    assert!(said.starts_with(&format!("{notes}:\n")), "{said}");
+    assert!(said.contains("        4  "), "{said}");
+    assert!(said.contains("  invented.md\n"), "{said}");
+    assert!(said.contains("  drafts/\n"), "{said}");
+    assert!(!said.contains(".DS_Store"), "{said}");
+    assert!(!said.contains("c.md"), "{said}");
+    // The times may differ by zone, so the rest is compared line by line.
+    assert_eq!(
+        said.lines().count(),
+        String::from_utf8(command.stdout).unwrap().lines().count()
+    );
+
+    let (said, _) = server.tool("list", json!({"folders": [notes], "depth": 2, "all": true}));
+    assert!(said.contains(".DS_Store"), "{said}");
+    assert!(said.contains("/drafts:\n"), "{said}");
+    assert!(said.contains("  c.md\n"), "{said}");
+    let (said, _) = server.tool("list", json!({"folders": [notes], "depth": "all"}));
+    assert!(said.contains("  c.md\n"), "{said}");
+}
+
+#[test]
+fn a_list_that_fails_in_part_is_an_error_with_the_rest_still_listed() {
+    let place = Place::new();
+    fs::write(place.file(), "four").unwrap();
+    let notes = place.root.join("org/notes");
+    let gone = place.root.join("org/gone");
+    let mut server = place.serve();
+    let (said, refused) = server.tool(
+        "list",
+        json!({"folders": [gone.to_str().unwrap(), notes.to_str().unwrap()]}),
+    );
+    assert!(refused);
+    assert!(said.starts_with("exit code 6\n"), "{said}");
+    assert!(said.contains("invented.md"), "{said}");
+    let outside = place.root.with_extension("outside");
+    let (said, refused) = server.tool("list", json!({"folders": [outside.to_str().unwrap()]}));
+    assert!(refused);
+    assert!(said.starts_with("exit code 2\n"), "{said}");
+}
+
+#[test]
+fn a_folder_named_like_an_option_stays_a_folder() {
+    let place = Place::new();
+    let mut server = place.serve();
+    for folder in ["--all", "--depth", "--help"] {
+        let (said, refused) = server.tool("list", json!({"folders": [folder]}));
+        assert!(refused, "{folder}: {said}");
+        assert!(said.starts_with("exit code 6\n"), "{folder}: {said}");
+    }
+}
+
+#[test]
+fn wrong_list_fields_get_an_error_and_the_server_goes_on() {
+    let place = Place::new();
+    let mut server = place.serve();
+    let notes = place.root.join("org/notes");
+    let notes = notes.to_str().unwrap();
+    for arguments in [
+        json!({}),
+        json!({"folders": []}),
+        json!({"folders": notes}),
+        json!({"folders": [1]}),
+        json!({"folders": [notes], "depth": 0}),
+        json!({"folders": [notes], "depth": "deep"}),
+        json!({"folders": [notes], "all": "yes"}),
+    ] {
+        let answer = server.ask(
+            "tools/call",
+            json!({"name": "list", "arguments": arguments}),
+        );
+        assert_eq!(answer["error"]["code"], -32602, "{arguments}");
+    }
     assert_eq!(server.ask("ping", json!({}))["result"], json!({}));
 }
