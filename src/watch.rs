@@ -171,13 +171,19 @@ pub fn ago(time: &str) -> String {
 
 /// True for an outcome that wrote what was asked.
 pub fn is_written(outcome: &str) -> bool {
-    outcome == "written"
+    outcome == "written" || outcome == "patched"
 }
 
 /// The reason in plain words.
 pub fn why(outcome: &str) -> &'static str {
     match outcome {
         "written" => "The file was written and read back. Every byte matches.",
+        "patched" => "The patch was applied, written and read back. Every byte matches.",
+        "misfit" => "An edit of the patch did not fit the file. Nothing was written.",
+        "not-text" => {
+            "The patch would have made a text that is not plain text. Nothing was written."
+        }
+        "not-read" => "A patch came from a name that had not read the file. Nothing was written.",
         "locked" => "Another writer held the lock. Nothing was written.",
         "changed" => "The file changed after this chat read it. Nothing was written.",
         "exists" => "A new file was asked for, but a file is there. Nothing was written.",

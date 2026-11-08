@@ -14,6 +14,7 @@ pub mod fingerprint;
 pub mod list;
 pub mod log;
 pub mod login;
+pub mod patch;
 pub mod reads;
 pub mod screen;
 pub mod serve;

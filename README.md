@@ -7,6 +7,7 @@ The first block: an agent reads and writes a plain text file, and it deals with 
 ```
 orgthread read <file> --who <name>
 orgthread write <file> --who <name>   < the whole new text
+orgthread patch <file> --who <name>   < only the changes, as JSON
 orgthread list <folder>...
 orgthread watch
 ```
@@ -14,6 +15,17 @@ orgthread watch
 To see what a folder holds, list it: `orgthread list notes tasks` shows each folder as a group, with the size, the time and the name of each entry, as `ls` does. `ls` is a short form of `list`. It goes one level down, and `--depth 3` or `--depth all` goes deeper. Names that start with a dot stay out, unless you add `--all`. Paths that the limits close stay out too, and read-only ones get a mark.
 
 To change a file, read it first with the same name. A new file needs no read. orgthread remembers what each name read, and it refuses a write when the file changed since.
+
+For a small change to a large file, `patch` sends only the change. Each edit names its exact old lines and their new text, and `append` adds lines at the end:
+
+```
+orgthread patch notes/walks.csv --who me <<'END'
+{"edits": [{"old": "2026-11-07,park,3.8,\n", "new": "2026-11-07,park,4.1,\n"}],
+ "append": "2026-11-08,forest,7.5,\n"}
+END
+```
+
+The old text must occur once, or the patch is refused with exit code 11, and nothing is written. The exact text is the check, so a change elsewhere in the file since the read does no harm. The rules and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists them.
 
@@ -29,7 +41,7 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## MCP
 
-Two MCP servers give the same read, write and list to a chat that has no shell: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
+Two MCP servers give the same read, write, patch and list to a chat that has no shell: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 ## Licence
 

@@ -11,11 +11,15 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | `write` | `file` | The full path of the file |
 | | `who` | The name of this chat, on one line, the same one each time |
 | | `text` | The whole new text |
+| `patch` | `file` | The full path of the file |
+| | `who` | The name of this chat, the same one as for the read |
+| | `edits` | Optional: a list of changes, each with `old` and `new`, and an optional `line` |
+| | `append` | Optional: lines to add at the end. A patch needs an edit, an append or both |
 | `list` | `folders` | A list of full paths of folders, at least one |
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
 
-The fields of `read` and `write` are all required. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`. A list may name the root itself: `/`.
+The fields of `read` and `write` are all required, and `file` and `who` of `patch`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`. A list may name the root itself: `/`.
 
 `read` gives the exact text of the file, and notes what this name read.
 
@@ -26,6 +30,26 @@ written: notes/a.md, 4 bytes
 ```
 
 The path in the answer is the path from the root.
+
+`patch` changes part of a file, so that a large file need not be sent whole. Each edit replaces its exact `old` text with its `new` text:
+
+- `old` must be whole lines, with their newlines, and it must occur once in the file. A match never starts or ends in the middle of a line.
+- If `old` occurs more than once, the patch is refused, and the refusal names the lines. Add a line before or after it that differs, such as the heading of the section, or give `line`, the number of the line where it starts. `line` only picks between equal matches, and it must pick exactly.
+- An empty `new` deletes the old text. To insert, take the line before as `old`, and that line plus the new lines as `new`.
+- `append` adds lines at the end, after the edits. A missing newline before or after them is added.
+- All edits are applied, or none. Two edits must not touch the same lines.
+- This name must have read the file once. A change elsewhere in the file since the read does no harm, as the exact text is the check. After a patch, the same name may write or patch again with no new read.
+- A file that does not exist yet is made with `write`.
+
+A patch answers like this:
+
+```
+patched: notes/walks.csv, 1 edit, 1 append, 120 bytes
+```
+
+If a `line` was given for a text that occurs once, at another line, the edit is applied, and a line `note: edit 1 found at line 14, not 12` follows.
+
+A task that may send the same patch twice, for example after a lost answer, puts its new lines into an edit, with the lines before them as `old`, and not into `append`. A second try of such an edit is refused with code 11 and the words "may have gone through already". A second `append` would add the lines twice.
 
 `list` gives one group per folder. The header is the folder as given, then a colon. Each line is the size in bytes, the time and the name. A folder name ends with `/`, and a folder shows `-` for its size and its time. To read a file, join the header and the name. The sort order is by name, and capitals do not count.
 
@@ -52,13 +76,14 @@ orgthread: refused, nothing written. notes/a.md changed since you read it. Read 
 | 1 | Failed, the file is unchanged | Read the reason |
 | 2 | Wrong use, or not text: an empty text, a NUL sign, a path outside the root, a path the limits forbid, a missing setting | Read the reason |
 | 3 | Busy: another writer holds the lock | Try again in a moment |
-| 4 | Changed since this name read it | Read it again and build the change from that text |
+| 4 | Changed since this name read it. For `patch`: changed during the patch | Read it again and build the change from that text. For `patch`: send the same patch again |
 | 5 | Exists, and this name has not read it | Read it first |
 | 6 | Missing: there is no such file or folder, or it is gone since the read | Look for the file |
 | 7 | The check after the write failed, and the old state is back | Read the reason |
 | 8 | Written, but the log line failed | Look at the log file |
 | 9 | The check after the write failed, and the old state is NOT back | Look at the file now |
 | 10 | Written, but the clean-up did not finish, or another writer may have been at work | Read the message. If it names another writer, check the file. If not, there is nothing to do: the file is free again within 15 minutes |
+| 11 | An edit of a patch does not fit: its old text is not in the file, it occurs more than once with no fitting `line`, two edits overlap, or the new text drops the newline of the old text. Nothing is written | Read the message. It names the edit and the lines. Fix the edit and send the patch again. No new read is needed |
 
 So `isError` does not always mean that nothing changed. With 8 and 10, the text is written. With 9, the file may be damaged.
 
@@ -146,4 +171,45 @@ Reply:
 
 ```json
 {"id":6,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 6\n/tmp/claude/example/notes:\n         11  2026-11-08 Sun 14:05  a.md\n          -  -                     drafts/\n\n/tmp/claude/example/notes/drafts:\n          6  2026-11-07 Sat 19:12  b.md\n\n/tmp/claude/example/tasks:\n  there is no file or folder /tmp/claude/example/tasks\n","type":"text"}],"isError":true}}
+```
+
+### `patch`
+
+This comes from a second real run of the local server, with `ORGTHREAD_ROOT=/tmp/claude/example-patch`. The file `notes/walks.csv` held four lines, and this name had read it:
+
+```
+date,place,km,notes
+2026-11-05,park,4.2,
+2026-11-06,river,6.0,"windy, cold"
+2026-11-07,park,3.8,
+```
+
+One edit corrects a row, and an append adds one.
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"patch","arguments":{"file":"/tmp/claude/example-patch/notes/walks.csv","who":"chat a","edits":[{"old":"2026-11-07,park,3.8,\n","new":"2026-11-07,park,4.1,\n"}],"append":"2026-11-08,forest,7.5,\n"}}}
+```
+
+Reply:
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"patched: notes/walks.csv, 1 edit, 1 append, 120 bytes\n","type":"text"}],"isError":false}}
+```
+
+### A patch sent again
+
+The same edit, sent a second time. Its old text is gone, and its new text is in the file.
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"patch","arguments":{"file":"/tmp/claude/example-patch/notes/walks.csv","who":"chat a","edits":[{"old":"2026-11-07,park,3.8,\n","new":"2026-11-07,park,4.1,\n"}]}}}
+```
+
+Reply:
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 11\norgthread: refused, nothing written. Edit 1: the old text is not in the file. Its new text is at line 4, so this patch may have gone through already.\n","type":"text"}],"isError":true}}
 ```

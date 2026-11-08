@@ -123,7 +123,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_the_three_tools() {
+fn it_greets_and_offers_the_four_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -137,13 +137,14 @@ fn it_greets_and_offers_the_three_tools() {
     let list = server.ask("tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read", "write", "list"]);
+    assert_eq!(names, ["read", "write", "patch", "list"]);
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
         json!(["file", "who", "text"])
     );
-    assert_eq!(tools[2]["inputSchema"]["required"], json!(["folders"]));
+    assert_eq!(tools[2]["inputSchema"]["required"], json!(["file", "who"]));
+    assert_eq!(tools[3]["inputSchema"]["required"], json!(["folders"]));
 }
 
 #[test]
@@ -407,4 +408,58 @@ fn wrong_list_fields_get_an_error_and_the_server_goes_on() {
         assert_eq!(answer["error"]["code"], -32602, "{arguments}");
     }
     assert_eq!(server.ask("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn a_patch_changes_part_of_the_file() {
+    let place = Place::new();
+    fs::write(place.file(), "date,km\n2026-11-07,3.8\n").unwrap();
+    let mut server = place.serve();
+    server.read(&place.f(), "chat a");
+    let (said, refused) = server.tool(
+        "patch",
+        json!({"file": place.f(), "who": "chat a",
+               "edits": [{"old": "2026-11-07,3.8\n", "new": "2026-11-07,4.1\n"}],
+               "append": "2026-11-08,7.5\n"}),
+    );
+    assert!(!refused, "{said}");
+    assert_eq!(
+        said,
+        "patched: org/notes/invented.md, 1 edit, 1 append, 38 bytes\n"
+    );
+    assert_eq!(
+        fs::read(place.file()).unwrap(),
+        b"date,km\n2026-11-07,4.1\n2026-11-08,7.5\n"
+    );
+    let log = fs::read_to_string(place.log()).unwrap();
+    assert!(log.contains("patched") && log.contains("chat a"), "{log}");
+}
+
+#[test]
+fn a_patch_that_does_not_fit_is_refused_with_exit_11() {
+    let place = Place::new();
+    fs::write(place.file(), "a\na\n").unwrap();
+    let mut server = place.serve();
+    server.read(&place.f(), "chat a");
+    let (said, refused) = server.tool(
+        "patch",
+        json!({"file": place.f(), "who": "chat a", "edits": [{"old": "a\n", "new": "b\n"}]}),
+    );
+    assert!(refused);
+    assert!(said.starts_with("exit code 11\n"), "{said}");
+    assert!(said.contains("at lines 1 and 2"), "{said}");
+    assert_eq!(fs::read(place.file()).unwrap(), b"a\na\n");
+}
+
+#[test]
+fn a_patch_of_an_unread_file_is_refused_with_exit_5() {
+    let place = Place::new();
+    fs::write(place.file(), "a\n").unwrap();
+    let (said, refused) = place.serve().tool(
+        "patch",
+        json!({"file": place.f(), "who": "chat a", "append": "b\n"}),
+    );
+    assert!(refused);
+    assert!(said.starts_with("exit code 5\n"), "{said}");
+    assert_eq!(fs::read(place.file()).unwrap(), b"a\n");
 }

@@ -2,14 +2,14 @@
 
 Not ready. Do not use them on real files yet.
 
-MCP is a standard way for a chat to call tools. The program has two MCP servers, for a chat that has no shell. Both offer the same three tools: `read`, `write` and `list`.
+MCP is a standard way for a chat to call tools. The program has two MCP servers, for a chat that has no shell. Both offer the same four tools: `read`, `write`, `patch` and `list`.
 
 | Server | Start it with | For | Login |
 |---|---|---|---|
 | Local | `orgthread serve` | A client on the same machine, such as Claude Code | None |
 | Remote | `orgthread serve --http <address>` | A chat in the cloud, such as claude.ai | One password |
 
-Each tool call starts the command itself: `orgthread read`, `orgthread write` or `orgthread list`. So the rules, the log and the refusals are the same as in the shell. A chat never deals with a lock.
+Each tool call starts the command itself: `orgthread read`, `orgthread write`, `orgthread patch` or `orgthread list`. So the rules, the log and the refusals are the same as in the shell. A chat never deals with a lock.
 
 The tools, their refusals and examples are in [mcp-api.md](mcp-api.md).
 

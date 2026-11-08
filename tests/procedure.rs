@@ -566,3 +566,77 @@ fn a_stale_look_gone_fresh_hands_the_lock_back() {
     let left = fs::read_dir(f.0.join("org/.locks")).unwrap().count();
     assert_eq!(left, 1, "only the lock itself is there");
 }
+
+mod patch {
+    use super::*;
+    use orgthread::write::{Refusal, patch_unless_stopped};
+    use std::sync::atomic::AtomicBool;
+
+    fn no_stop() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    #[test]
+    fn a_patch_builds_from_the_file_under_the_lock() {
+        let f = Folder::new();
+        f.put(FILE, b"a\nb\n");
+        let build = |old: &[u8]| -> Result<(Vec<u8>, Vec<String>), Refusal> {
+            assert_eq!(old, b"a\nb\n");
+            Ok((b"a\nc\n".to_vec(), vec!["a note".into()]))
+        };
+        let r = patch_unless_stopped(&f.storage(), FILE, &build, LINE, &no_stop());
+        match &r.outcome {
+            Outcome::Written {
+                notes, new_text, ..
+            } => {
+                assert_eq!(notes, &vec!["a note".to_string()]);
+                assert_eq!(new_text, b"a\nc\n");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.get(FILE), b"a\nc\n");
+        f.assert_locks_empty();
+    }
+
+    #[test]
+    fn a_misfit_writes_nothing_and_gets_exit_11() {
+        let f = Folder::new();
+        f.put(FILE, b"a\n");
+        let build = |_: &[u8]| -> Result<(Vec<u8>, Vec<String>), Refusal> {
+            Err(Refusal::Misfit("Edit 1: no".into()))
+        };
+        let r = patch_unless_stopped(&f.storage(), FILE, &build, LINE, &no_stop());
+        assert!(matches!(r.outcome, Outcome::Misfit { .. }), "{r:?}");
+        assert_eq!(r.exit_code(true), 11);
+        assert_eq!(f.get(FILE), b"a\n");
+        f.assert_locks_empty();
+    }
+
+    #[test]
+    fn a_missing_file_gets_exit_6() {
+        let f = Folder::new();
+        let build = |_: &[u8]| -> Result<(Vec<u8>, Vec<String>), Refusal> {
+            panic!("no file, so nothing to build")
+        };
+        let r = patch_unless_stopped(&f.storage(), FILE, &build, LINE, &no_stop());
+        assert!(matches!(r.outcome, Outcome::Missing { .. }), "{r:?}");
+        assert_eq!(r.exit_code(true), exit::MISSING);
+    }
+
+    #[test]
+    fn a_change_during_the_patch_is_refused_with_exit_4() {
+        let f = Folder::new();
+        f.put(FILE, b"a\n");
+        let path = f.0.join(FILE);
+        // A person saves while the patch is built: after the read, before the write.
+        let build = |_: &[u8]| -> Result<(Vec<u8>, Vec<String>), Refusal> {
+            fs::write(&path, b"a person's line\n").unwrap();
+            Ok((b"b\n".to_vec(), Vec::new()))
+        };
+        let r = patch_unless_stopped(&f.storage(), FILE, &build, LINE, &no_stop());
+        assert!(matches!(r.outcome, Outcome::Changed { .. }), "{r:?}");
+        assert_eq!(r.exit_code(true), exit::CHANGED);
+        assert_eq!(f.get(FILE), b"a person's line\n");
+        f.assert_locks_empty();
+    }
+}

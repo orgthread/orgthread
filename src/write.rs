@@ -22,6 +22,7 @@ pub mod exit {
     pub const NOT_LOGGED: i32 = 8;
     pub const NOT_RESTORED: i32 = 9;
     pub const LOCK_PROBLEM: i32 = 10;
+    pub const MISFIT: i32 = 11;
 }
 
 /// The lock name of a file: its path from the root with each `/` written as `--`.
@@ -88,6 +89,18 @@ pub enum Outcome {
         size: usize,
         /// The old text, so that the caller can keep a copy.
         old_text: Option<Vec<u8>>,
+        /// The new text, as written.
+        new_text: Vec<u8>,
+        /// Notes of a patch for the answer.
+        notes: Vec<String>,
+    },
+    /// An edit of a patch does not fit the file. Nothing was written.
+    Misfit {
+        reason: String,
+    },
+    /// The text a patch would make is not plain text. Nothing was written.
+    NotText {
+        reason: String,
     },
     Locked {
         holder: String,
@@ -130,6 +143,8 @@ impl Outcome {
             Outcome::Restored { .. } => exit::RESTORED,
             Outcome::NotRestored { .. } => exit::NOT_RESTORED,
             Outcome::Failed { .. } => exit::FAILED,
+            Outcome::Misfit { .. } => exit::MISFIT,
+            Outcome::NotText { .. } => exit::USAGE,
         }
     }
 
@@ -144,6 +159,8 @@ impl Outcome {
             Outcome::Restored { .. } => "restored",
             Outcome::NotRestored { .. } => "not-restored",
             Outcome::Failed { .. } => "failed",
+            Outcome::Misfit { .. } => "misfit",
+            Outcome::NotText { .. } => "not-text",
         }
     }
 }
@@ -253,13 +270,30 @@ fn failed(step: &str, e: impl std::fmt::Display) -> Outcome {
     }
 }
 
+/// Why a patch could not make its new text.
+#[derive(Debug)]
+pub enum Refusal {
+    Misfit(String),
+    NotText(String),
+}
+
+/// What a patch makes of the old bytes: the new text and notes for the answer.
+pub type Build<'a> = &'a dyn Fn(&[u8]) -> Result<(Vec<u8>, Vec<String>), Refusal>;
+
+/// What the write puts in the file.
+enum Plan<'a> {
+    /// A whole new text, when the file is as the caller expects.
+    Text { expect: &'a Expect, text: &'a [u8] },
+    /// A text made from the file as it is under the lock. The file must exist.
+    Patch(Build<'a>),
+}
+
 /// The steps between taking and releasing the lock.
 fn change(
     storage: &dyn Storage,
     held: &Held,
     path: &str,
-    expect: &Expect,
-    new: &[u8],
+    plan: &Plan,
     stop: &AtomicBool,
 ) -> Outcome {
     let old = match storage.read(path) {
@@ -267,25 +301,44 @@ fn change(
         Err(e) => return failed("could not read the file", e),
     };
     let old_print = old.as_deref().map(fingerprint);
-    match (expect, &old_print) {
-        (Expect::Absent, Some(found)) => {
-            return Outcome::Exists {
-                found: found.clone(),
-            };
+    let (expect, new, notes) = match plan {
+        Plan::Text { expect, text } => {
+            match (expect, &old_print) {
+                (Expect::Absent, Some(found)) => {
+                    return Outcome::Exists {
+                        found: found.clone(),
+                    };
+                }
+                (Expect::Fingerprint(want), None) => {
+                    return Outcome::Missing {
+                        expected: want.clone(),
+                    };
+                }
+                (Expect::Fingerprint(want), Some(found)) if want != found => {
+                    return Outcome::Changed {
+                        expected: want.clone(),
+                        found: found.clone(),
+                    };
+                }
+                _ => {}
+            }
+            ((*expect).clone(), text.to_vec(), Vec::new())
         }
-        (Expect::Fingerprint(want), None) => {
-            return Outcome::Missing {
-                expected: want.clone(),
+        Plan::Patch(build) => {
+            let (Some(old), Some(print)) = (&old, &old_print) else {
+                return Outcome::Missing {
+                    expected: String::new(),
+                };
             };
+            match build(old) {
+                // The file must still be the one the patch was applied to.
+                Ok((new, notes)) => (Expect::Fingerprint(print.clone()), new, notes),
+                Err(Refusal::Misfit(reason)) => return Outcome::Misfit { reason },
+                Err(Refusal::NotText(reason)) => return Outcome::NotText { reason },
+            }
         }
-        (Expect::Fingerprint(want), Some(found)) if want != found => {
-            return Outcome::Changed {
-                expected: want.clone(),
-                found: found.clone(),
-            };
-        }
-        _ => {}
-    }
+    };
+    let (expect, new) = (&expect, new.as_slice());
 
     // The last safe point: from here on, the write runs to its end and its check.
     if stop.load(Ordering::SeqCst) {
@@ -331,6 +384,8 @@ fn change(
                 new: fingerprint(new),
                 size: new.len(),
                 old_text: old,
+                new_text: new.to_vec(),
+                notes,
             };
         }
         Ok(Some(back)) => format!(
@@ -391,6 +446,23 @@ pub fn write_unless_stopped(
     line: &str,
     stop: &AtomicBool,
 ) -> Report {
+    let plan = Plan::Text { expect, text: new };
+    run(storage, path, &plan, line, stop)
+}
+
+/// A patch: `build` makes the new text from the file as it is under the lock,
+/// and the write goes on as any write, with the same lock, check and read-back.
+pub fn patch_unless_stopped(
+    storage: &dyn Storage,
+    path: &str,
+    build: Build,
+    line: &str,
+    stop: &AtomicBool,
+) -> Report {
+    run(storage, path, &Plan::Patch(build), line, stop)
+}
+
+fn run(storage: &dyn Storage, path: &str, plan: &Plan, line: &str, stop: &AtomicBool) -> Report {
     let name = lock_name(path);
     let refused = |outcome| Report {
         outcome,
@@ -409,7 +481,7 @@ pub fn write_unless_stopped(
         line: line.to_string(),
         done: false,
     };
-    let outcome = change(storage, &held, path, expect, new, stop);
+    let outcome = change(storage, &held, path, plan, stop);
     let (lock_left, lock_lost) = match held.release() {
         Ok(Release::Done) => (None, None),
         Ok(Release::NotOurs(other)) => (

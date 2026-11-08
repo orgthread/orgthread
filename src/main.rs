@@ -4,13 +4,14 @@ use orgthread::fingerprint::fingerprint;
 use orgthread::list::{self, Options, Target};
 use orgthread::log;
 use orgthread::login::Login;
+use orgthread::patch::{self, Patch};
 use orgthread::reads::Reads;
 use orgthread::screen;
 use orgthread::serve;
 use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage};
 use orgthread::versions::Versions;
-use orgthread::write::{self, Outcome, exit};
+use orgthread::write::{self, Outcome, Refusal, exit};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -21,11 +22,12 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 orgthread reads and writes a plain text file the same way every time.
 
-For an agent, three commands:
+For an agent, four commands:
 
   orgthread read <file> --who <name>             prints the exact text
   orgthread read <file> --who <name> --to <copy> saves an exact copy instead
   orgthread write <file> --who <name>            < the whole new text
+  orgthread patch <file> --who <name>            < only the changes, as JSON
   orgthread list <folder>...                     the size, time and name of each entry
 
 Give the same name each time. To change a file, read it first. A new file needs
@@ -34,7 +36,7 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read, write and list, as MCP tools
+  orgthread serve                                the same read, write, patch and list, as MCP tools
 
 For a person:
 
@@ -45,6 +47,13 @@ For a person:
 
 Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
+
+A patch is one JSON object: edits, a list of {old, new}, and append. Each edit
+replaces its exact old text, whole lines, which must occur once. If it occurs
+more than once, add a line that differs, or give line, the number where it
+starts. append adds lines at the end. All edits are applied, or none. The name
+must have read the file once, and a change elsewhere in the file needs no new
+read. patch takes --size too.
 
 Options of list, also called ls: --depth <n> goes n levels down (default 1), and
 --depth all to the bottom. --all also shows the names that start with a dot.
@@ -80,6 +89,7 @@ Exit codes:
   3  busy: another writer   9  check failed, old state NOT put back
   4  changed: read it again  10 written, but its clean-up did not finish
   5  exists: read it first, or for --to, the copy exists
+  11 an edit of a patch does not fit: nothing written
 ";
 
 fn main() -> ExitCode {
@@ -136,6 +146,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("fingerprint") => cmd_fingerprint(&args[1..]),
         Some("read") => cmd_read(&args[1..]),
         Some("write") => cmd_write(&args[1..]),
+        Some("patch") => cmd_patch(&args[1..]),
         Some("list" | "ls") => cmd_list(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
@@ -224,7 +235,7 @@ struct WriteArgs {
     size: Option<usize>,
 }
 
-fn parse_write(args: &[String]) -> Result<WriteArgs, String> {
+fn parse_write(args: &[String], command: &str) -> Result<WriteArgs, String> {
     let mut file = None;
     let mut who = None;
     let mut size = None;
@@ -242,13 +253,13 @@ fn parse_write(args: &[String]) -> Result<WriteArgs, String> {
             other if other.starts_with("--") => return Err(format!("there is no option {other}")),
             other => {
                 if file.replace(other.to_string()).is_some() {
-                    return Err("write takes one file".into());
+                    return Err(format!("{command} takes one file"));
                 }
             }
         }
     }
     Ok(WriteArgs {
-        file: file.ok_or("write needs a file")?,
+        file: file.ok_or(format!("{command} needs a file"))?,
         who: checked_who(who)?,
         size,
     })
@@ -672,25 +683,15 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_write(args: &[String]) -> Result<i32, String> {
-    let args = parse_write(args)?;
+    let args = parse_write(args, "write")?;
     let settings = Settings::load()?;
     let reads = Reads::new(&settings.reads);
     let path = settings.path_of(&args.file)?;
     settings.limits(&path, true)?;
 
-    let mut text = Vec::new();
-    io::stdin()
-        .read_to_end(&mut text)
-        .map_err(|e| format!("could not read the new text: {e}"))?;
+    let text = read_input("the new text")?;
     write::check_text(&text)?;
-    if let Some(size) = args.size
-        && size != text.len()
-    {
-        return Err(format!(
-            "the new text has {} bytes, not the {size} of --size, so it may be cut off",
-            text.len()
-        ));
-    }
+    check_size(args.size, &text, "the new text")?;
 
     // What this name read decides what must hold. An unread file must be new.
     let expect = match reads.recall(&args.who, &path) {
@@ -705,18 +706,132 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     let now = log::utc_now();
     let storage = settings.storage()?;
     let lock_line = format!("orgthread {} {now} pid {}", args.who, std::process::id());
-    let stop = match stop::arm() {
-        Ok(stop) => stop,
+    let Some(stop) = arm_stop() else {
+        return Ok(exit::FAILED);
+    };
+    let report =
+        write::write_unless_stopped(storage.as_ref(), &path, &expect, &text, &lock_line, &stop);
+    Ok(finish(
+        &settings,
+        &reads,
+        &path,
+        &args.who,
+        &now,
+        &report,
+        Kind::Write,
+    ))
+}
+
+fn cmd_patch(args: &[String]) -> Result<i32, String> {
+    let args = parse_write(args, "patch")?;
+    let settings = Settings::load()?;
+    let reads = Reads::new(&settings.reads);
+    let path = settings.path_of(&args.file)?;
+    settings.limits(&path, true)?;
+
+    let input = read_input("the patch")?;
+    check_size(args.size, &input, "the patch")?;
+    let patch = Patch::parse(&input)?;
+
+    let now = log::utc_now();
+    // The exact text of each edit is the check, but this name must know the file.
+    match reads.recall(&args.who, &path) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let line = log::line(&[&now, "not-read", &path, &args.who, "", "", ""]);
+            let logged = log::append(&settings.log, &line);
+            say(format!(
+                "refused, nothing written. {} has not read {path}. Read it first with: orgthread read <file> --who <same name>",
+                args.who
+            ));
+            if let Err(e) = &logged {
+                say(format!(
+                    "the log line failed, {}: {e}. The line: {line}",
+                    settings.log.display()
+                ));
+            }
+            return Ok(exit::EXISTS);
+        }
+        Err(e) => {
+            say(format!("could not look up what {} read: {e}", args.who));
+            return Ok(exit::FAILED);
+        }
+    }
+
+    let storage = settings.storage()?;
+    let lock_line = format!("orgthread {} {now} pid {}", args.who, std::process::id());
+    let Some(stop) = arm_stop() else {
+        return Ok(exit::FAILED);
+    };
+    let build = |old: &[u8]| -> Result<(Vec<u8>, Vec<String>), Refusal> {
+        let old = std::str::from_utf8(old)
+            .map_err(|_| Refusal::NotText("the file is not valid UTF-8".into()))?;
+        let applied = patch::apply(old, &patch).map_err(Refusal::Misfit)?;
+        let text = applied.text.into_bytes();
+        write::check_text(&text).map_err(|reason| {
+            Refusal::NotText(reason.replace("the new text", "the text after the patch"))
+        })?;
+        Ok((text, applied.notes))
+    };
+    let report = write::patch_unless_stopped(storage.as_ref(), &path, &build, &lock_line, &stop);
+    let kind = Kind::Patch {
+        edits: patch.edits.len(),
+        append: patch.append.is_some(),
+    };
+    Ok(finish(
+        &settings, &reads, &path, &args.who, &now, &report, kind,
+    ))
+}
+
+/// The whole standard input.
+fn read_input(what: &str) -> Result<Vec<u8>, String> {
+    let mut input = Vec::new();
+    io::stdin()
+        .read_to_end(&mut input)
+        .map_err(|e| format!("could not read {what}: {e}"))?;
+    Ok(input)
+}
+
+/// With --size, a cut-off input is refused.
+fn check_size(size: Option<usize>, input: &[u8], what: &str) -> Result<(), String> {
+    match size {
+        Some(size) if size != input.len() => Err(format!(
+            "{what} has {} bytes, not the {size} of --size, so it may be cut off",
+            input.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn arm_stop() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    match stop::arm() {
+        Ok(stop) => Some(stop),
         Err(e) => {
             say(format!(
                 "could not prepare for a stop, so nothing is written: {e}"
             ));
-            return Ok(exit::FAILED);
+            None
         }
-    };
-    let report =
-        write::write_unless_stopped(storage.as_ref(), &path, &expect, &text, &lock_line, &stop);
+    }
+}
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Write,
+    Patch { edits: usize, append: bool },
+}
+
+/// The log line, the answer and the exit code of a write or a patch.
+fn finish(
+    settings: &Settings,
+    reads: &Reads,
+    path: &str,
+    who: &str,
+    now: &str,
+    report: &write::Report,
+    kind: Kind,
+) -> i32 {
+    let patching = matches!(kind, Kind::Patch { .. });
     let (before, after, size) = match &report.outcome {
         Outcome::Written { old, new, size, .. } => (
             old.clone().unwrap_or_default(),
@@ -727,15 +842,11 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
         Outcome::Changed { expected, found } => (expected.clone(), found.clone(), String::new()),
         _ => (String::new(), String::new(), String::new()),
     };
-    let line = log::line(&[
-        &now,
-        report.outcome.word(),
-        &path,
-        &args.who,
-        &before,
-        &after,
-        &size,
-    ]);
+    let word = match (&report.outcome, patching) {
+        (Outcome::Written { .. }, true) => "patched",
+        (outcome, _) => outcome.word(),
+    };
+    let line = log::line(&[now, word, path, who, &before, &after, &size]);
 
     // First the log. A closed output must never hide what happened to the file.
     let logged = log::append(&settings.log, &line);
@@ -748,6 +859,8 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
             new,
             size,
             old_text,
+            new_text,
+            notes,
             ..
         } => {
             // Only for a person's diff, so a failure here does not fail the write.
@@ -759,32 +872,55 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
                     Some(old) => versions.save(old),
                     None => Ok(()),
                 };
-                if let Err(e) = kept.and_then(|()| versions.save(&text)) {
+                if let Err(e) = kept.and_then(|()| versions.save(new_text)) {
                     say(format!("could not keep a copy for the diff screen: {e}"));
                 }
             }
             // A next write of this agent needs no new read: it knows this text.
-            if let Err(e) = reads.remember(&args.who, &path, new) {
+            if let Err(e) = reads.remember(who, path, new) {
                 say(format!(
                     "could not note this write, so read before the next one: {e}"
                 ));
             }
-            let _ = writeln!(io::stdout(), "written: {path}, {size} bytes");
+            let mut out = io::stdout();
+            let _ = match kind {
+                Kind::Write => writeln!(out, "written: {path}, {size} bytes"),
+                Kind::Patch { edits, append } => {
+                    let mut parts = Vec::new();
+                    if edits > 0 {
+                        parts.push(format!("{edits} edit{}", if edits == 1 { "" } else { "s" }));
+                    }
+                    if append {
+                        parts.push("1 append".to_string());
+                    }
+                    writeln!(out, "patched: {path}, {}, {size} bytes", parts.join(", "))
+                }
+            };
+            for note in notes {
+                let _ = writeln!(out, "note: {note}");
+            }
         }
         Outcome::Locked { holder, age } => say(format!(
             "refused, nothing written. {path} is busy since {} s with another writer: {holder}. Try again in a moment.",
             age.as_secs()
         )),
+        Outcome::Changed { .. } if patching => say(format!(
+            "refused, nothing written. {path} changed during the patch. Send the same patch again."
+        )),
         Outcome::Changed { .. } => say(format!(
             "refused, nothing written. {path} changed since you read it. Read it again and build the change from that text."
         )),
         Outcome::Exists { .. } => say(format!(
-            "refused, nothing written. {path} exists, and {} has not read it. Read it first with: orgthread read <file> --who <same name>",
-            args.who
+            "refused, nothing written. {path} exists, and {who} has not read it. Read it first with: orgthread read <file> --who <same name>"
+        )),
+        Outcome::Missing { .. } if patching => say(format!(
+            "refused, nothing written. There is no file {path}. A new file is made with write."
         )),
         Outcome::Missing { .. } => say(format!(
             "refused, nothing written. {path} is gone since you read it."
         )),
+        Outcome::Misfit { reason } => say(format!("refused, nothing written. {reason}")),
+        Outcome::NotText { reason } => say(format!("refused, nothing written. {path}: {reason}")),
         Outcome::Restored { reason, rescued } => say(format!(
             "the check after the write failed: {reason}. The old state of {path} is back.{}",
             saved(rescued)
@@ -816,7 +952,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
             "the file is written, but orgthread's clean-up did not finish: {reason}. There is nothing to do: {path} is free again within 15 minutes."
         ));
     }
-    Ok(report.exit_code(logged.is_ok()))
+    report.exit_code(logged.is_ok())
 }
 
 /// A closed error output must not stop the command.

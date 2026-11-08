@@ -274,6 +274,39 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "patch",
+            "description": "Changes part of a file, so that a large file need not be sent whole. \
+                Each edit replaces its exact old text, whole lines with their newlines, by its \
+                new text. The old text must occur once. If it occurs more than once, add a line \
+                before or after it that differs, such as the heading of the section, or give the \
+                line where it starts. append adds lines at the end. All edits are applied, or \
+                none. Read the file first with the same name; a change elsewhere in the file \
+                needs no new read. A task that may send the same patch twice puts new lines \
+                into an edit, with the lines before them as old text, not into append.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": file,
+                    "who": who,
+                    "edits": {
+                        "type": "array",
+                        "description": "The changes. An empty new text deletes the old text",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old": {"type": "string", "description": "The exact old text, whole lines"},
+                                "new": {"type": "string", "description": "The new text"},
+                                "line": {"type": "integer", "minimum": 1, "description": "Only when the old text occurs more than once: the line where it starts"},
+                            },
+                            "required": ["old", "new"],
+                        },
+                    },
+                    "append": {"type": "string", "description": "Lines to add at the end of the file"},
+                },
+                "required": ["file", "who"],
+            },
+        },
+        {
             "name": "list",
             "description": "Lists the files and folders in one or more folders: one group per \
                 folder, and per entry its size in bytes, its time and its name. A folder name \
@@ -327,6 +360,21 @@ fn call(params: &Value, exe: &Path) -> Result<Value, (i32, String)> {
             let (who, file) = (text_of("who")?, text_of("file")?);
             let args = vec!["write", "--who", who, "--size", size.as_str(), file];
             return Ok(result(name, start(exe, &args, Some(text))));
+        }
+        Some("patch") => {
+            let arguments = &params["arguments"];
+            let mut patch = serde_json::Map::new();
+            for key in ["edits", "append"] {
+                if !arguments[key].is_null() {
+                    patch.insert(key.to_string(), arguments[key].clone());
+                }
+            }
+            // The command checks the patch itself, so the refusals are the same.
+            let text = Value::Object(patch).to_string();
+            let size = text.len().to_string();
+            let (who, file) = (text_of("who")?, text_of("file")?);
+            let args = vec!["patch", "--who", who, "--size", size.as_str(), file];
+            return Ok(result(name, start(exe, &args, Some(&text))));
         }
         Some("list") => {
             let owned = list_args(params)?;
