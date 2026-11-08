@@ -368,6 +368,62 @@ impl Storage for Dropbox {
         self.download(&Self::file(path))
     }
 
+    fn size(&self, path: &str) -> io::Result<Option<u64>> {
+        let full = Self::file(path);
+        let reply = self.rpc("get_metadata", &json!({ "path": full }))?;
+        match reply.status {
+            200 => {
+                let v: Value = serde_json::from_slice(&reply.body)?;
+                if v[".tag"] != "file" {
+                    return Err(failure(format!("{full} is not a file")));
+                }
+                v["size"]
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| failure(format!("Dropbox gave no size for {full}")))
+            }
+            409 if summary(&reply.body).contains("not_found") => Ok(None),
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    /// The bytes pass through in parts, from curl to `out`. There is no time
+    /// limit for the whole transfer, as a large file takes long: only a transfer
+    /// that stalls for 60 seconds is stopped.
+    fn read_to(&self, path: &str, out: &mut dyn Write) -> io::Result<bool> {
+        if self.size(path)?.is_none() {
+            return Ok(false);
+        }
+        let url = format!("{}/2/files/download", self.content);
+        let arg = ascii_json(&json!({ "path": Self::file(path) }));
+        let mut child = Command::new("curl")
+            .args(["-sS", "-f", "-X", "POST", "--connect-timeout", "30"])
+            .args(["--speed-limit", "1", "--speed-time", "60"])
+            .args(["--variable", &format!("%{TOKEN}")])
+            .args([
+                "--expand-header",
+                &format!("Authorization: Bearer {{{{{TOKEN}}}}}"),
+            ])
+            .args(["-H", &format!("Dropbox-API-Arg: {arg}")])
+            .env(TOKEN, &self.token)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| failure(format!("could not start curl: {e}")))?;
+        let copied = match child.stdout.take() {
+            Some(mut stdout) => io::copy(&mut stdout, out).map(|_| ()),
+            None => Err(failure("curl gave no output".to_string())),
+        };
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let text = String::from_utf8_lossy(&output.stderr);
+            return Err(failure(format!("curl failed: {}", text.trim())));
+        }
+        copied.map(|()| true)
+    }
+
     fn write_if_unchanged(
         &self,
         path: &str,

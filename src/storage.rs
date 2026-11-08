@@ -92,6 +92,20 @@ pub trait Storage {
             "this storage cannot list a folder",
         ))
     }
+
+    /// The size of a file in bytes, or `None` when it does not exist.
+    fn size(&self, path: &str) -> io::Result<Option<u64>> {
+        Ok(self.read(path)?.map(|bytes| bytes.len() as u64))
+    }
+
+    /// Copies the bytes of a file to `out`, in parts where the storage can, so
+    /// that a large file never sits whole in memory. False when it does not exist.
+    fn read_to(&self, path: &str, out: &mut dyn Write) -> io::Result<bool> {
+        match self.read(path)? {
+            Some(bytes) => out.write_all(&bytes).map(|()| true),
+            None => Ok(false),
+        }
+    }
 }
 
 /// Files in a local folder, for example the Dropbox mirror on a Mac.
@@ -193,6 +207,28 @@ impl LocalFolder {
 }
 
 impl Storage for LocalFolder {
+    fn size(&self, path: &str) -> io::Result<Option<u64>> {
+        match fs::metadata(self.full(path)) {
+            Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
+            Ok(_) => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("{path} is not a file"),
+            )),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_to(&self, path: &str, out: &mut dyn Write) -> io::Result<bool> {
+        let mut file = match File::open(self.full(path)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        io::copy(&mut file, out)?;
+        Ok(true)
+    }
+
     fn list(&self, path: &str, _max: usize) -> io::Result<Listing> {
         let full = self.full(path);
         let meta = match fs::metadata(&full) {

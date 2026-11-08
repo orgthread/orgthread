@@ -19,9 +19,63 @@ pub fn fingerprint(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The same fingerprint, for bytes that come in parts, as in a stream.
+#[derive(Default)]
+pub struct Fingerprinter {
+    outer: Sha256,
+    block: Vec<u8>,
+    size: u64,
+}
+
+impl Fingerprinter {
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        self.size += bytes.len() as u64;
+        while !bytes.is_empty() {
+            let room = BLOCK - self.block.len();
+            let take = room.min(bytes.len());
+            self.block.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.block.len() == BLOCK {
+                self.outer.update(Sha256::digest(&self.block));
+                self.block.clear();
+            }
+        }
+    }
+
+    /// How many bytes came in so far.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn finish(mut self) -> String {
+        if !self.block.is_empty() {
+            self.outer.update(Sha256::digest(&self.block));
+        }
+        self.outer
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parts_give_the_same_fingerprint_as_the_whole() {
+        let bytes: Vec<u8> = (0..BLOCK * 2 + 123).map(|i| (i % 251) as u8).collect();
+        for step in [3, 1000, BLOCK - 1, BLOCK, BLOCK + 7] {
+            let mut f = Fingerprinter::default();
+            for part in bytes.chunks(step) {
+                f.update(part);
+            }
+            assert_eq!(f.size(), bytes.len() as u64);
+            assert_eq!(f.finish(), fingerprint(&bytes), "step {step}");
+        }
+        assert_eq!(Fingerprinter::default().finish(), fingerprint(b""));
+    }
 
     // Expected values computed separately with Python's hashlib.
     #[test]

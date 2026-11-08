@@ -1,6 +1,6 @@
 use jiff::tz::TimeZone;
 use orgthread::dropbox::Dropbox;
-use orgthread::fingerprint::fingerprint;
+use orgthread::fingerprint::{Fingerprinter, fingerprint};
 use orgthread::list::{self, Options, Target};
 use orgthread::log;
 use orgthread::login::Login;
@@ -10,6 +10,7 @@ use orgthread::screen;
 use orgthread::serve;
 use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage};
+use orgthread::transfer;
 use orgthread::versions::Versions;
 use orgthread::write::{self, Outcome, Refusal, exit};
 use std::env;
@@ -22,13 +23,16 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 orgthread reads and writes a plain text file the same way every time.
 
-For an agent, four commands:
+For an agent:
 
   orgthread read <file> --who <name>             prints the exact text
   orgthread read <file> --who <name> --to <copy> saves an exact copy instead
   orgthread write <file> --who <name>            < the whole new text
   orgthread patch <file> --who <name>            < only the changes, as JSON
   orgthread list <folder>...                     the size, time and name of each entry
+  orgthread download <file> --who <name> --to <copy>
+                                                 any file, also not text, as exact bytes
+  orgthread upload <file> --who <name>           < any file, with the rules of write
 
 Give the same name each time. To change a file, read it first. A new file needs
 no read. orgthread remembers what each name read, and it refuses a write when
@@ -37,6 +41,7 @@ the file changed since. The agent never handles anything else.
 For a chat with no shell:
 
   orgthread serve                                the same read, write, patch and list, as MCP tools
+  orgthread serve --http <address>               also download and upload, through one-time links
 
 For a person:
 
@@ -60,6 +65,12 @@ Options of list, also called ls: --depth <n> goes n levels down (default 1), and
 After --, each word is a folder. A list shows at most 1000 entries, leaves out
 closed paths, and marks read-only ones. The time is in the zone of TZ.
 
+download without --to sends the bytes to its output, never to a terminal. It
+notes what this name read, as read does. upload takes --size too. A text file
+may go wherever write may write. A file that is not text may go only to the
+folders of ORGTHREAD_BINARY_ALLOW. With --check, either one only checks the
+rules and the size, and moves nothing.
+
 Settings, from the environment:
   A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
   setting of this list that the environment does not hold.
@@ -78,6 +89,11 @@ Settings, from the environment:
                       (default: state/versions beside the program)
   ORGTHREAD_LOGINS    the logins of a door over a restart: hashes of its tokens, no raw token
                       and no text of a note (default: state/logins.json beside the program)
+  ORGTHREAD_BINARY_ALLOW
+                      comma-separated folders where an upload of a file that is not text may go
+                      (default: none)
+  ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
+                      the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
   ORGTHREAD_LISTEN_ANYWHERE
                       yes: let serve --http listen on an address that others can reach, with
                       no encryption (default: only 127.0.0.1, [::1] and localhost)
@@ -148,6 +164,8 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("write") => cmd_write(&args[1..]),
         Some("patch") => cmd_patch(&args[1..]),
         Some("list" | "ls") => cmd_list(&args[1..]),
+        Some("download") => cmd_download(&args[1..]),
+        Some("upload") => cmd_upload(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("password-hash") => {
@@ -197,7 +215,7 @@ struct ReadArgs {
     to: Option<String>,
 }
 
-fn parse_read(args: &[String]) -> Result<ReadArgs, String> {
+fn parse_read(args: &[String], command: &str) -> Result<ReadArgs, String> {
     let mut file = None;
     let mut who = None;
     let mut to = None;
@@ -209,13 +227,13 @@ fn parse_read(args: &[String]) -> Result<ReadArgs, String> {
             other if other.starts_with("--") => return Err(format!("there is no option {other}")),
             other => {
                 if file.replace(other.to_string()).is_some() {
-                    return Err("read takes one file".into());
+                    return Err(format!("{command} takes one file"));
                 }
             }
         }
     }
     Ok(ReadArgs {
-        file: file.ok_or("read needs a file")?,
+        file: file.ok_or(format!("{command} needs a file"))?,
         who: checked_who(who)?,
         to,
     })
@@ -373,7 +391,7 @@ fn cmd_list(args: &[String]) -> Result<i32, String> {
 
 /// The exact text, and a note of what this name read, from one single read.
 fn cmd_read(args: &[String]) -> Result<i32, String> {
-    let ReadArgs { file, who, to } = parse_read(args)?;
+    let ReadArgs { file, who, to } = parse_read(args, "read")?;
     let (file, to) = (&file, to.as_ref());
     let settings = Settings::load()?;
     let path = settings.path_of(file)?;
@@ -407,33 +425,9 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
             out.write_all(&bytes)
         }
         Some(to) => {
-            let copy = Path::new(to);
-            let parent = match copy.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            let parent = fs::canonicalize(parent)
-                .map_err(|e| format!("the folder of {to} does not exist: {e}"))?;
-            if !settings.dropbox && parent.starts_with(&settings.root) {
-                return Err(format!(
-                    "{to} is inside {}, where a working copy would sync to every device",
-                    settings.root.display()
-                ));
-            }
-            let created = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(copy);
-            let mut made = match created {
+            let mut made = match new_copy(to, &settings)? {
                 Ok(made) => made,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    say(format!("refused: {to} exists already. Name a new copy."));
-                    return Ok(exit::EXISTS);
-                }
-                Err(e) => {
-                    say(format!("could not make {to}: {e}"));
-                    return Ok(exit::FAILED);
-                }
+                Err(code) => return Ok(code),
             };
             // The note comes last: a failed copy must not count as read.
             made.write_all(&bytes)
@@ -446,6 +440,39 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
         Err(e) => {
             say(format!("could not hand over {path}: {e}"));
             Ok(exit::FAILED)
+        }
+    }
+}
+
+/// A new working copy at `to`, never inside the root, where it would sync to
+/// every device. An exit code when it cannot be made.
+fn new_copy(to: &str, settings: &Settings) -> Result<Result<fs::File, i32>, String> {
+    let copy = Path::new(to);
+    let parent = match copy.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent =
+        fs::canonicalize(parent).map_err(|e| format!("the folder of {to} does not exist: {e}"))?;
+    if !settings.dropbox && parent.starts_with(&settings.root) {
+        return Err(format!(
+            "{to} is inside {}, where a working copy would sync to every device",
+            settings.root.display()
+        ));
+    }
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(copy);
+    match created {
+        Ok(made) => Ok(Ok(made)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            say(format!("refused: {to} exists already. Name a new copy."));
+            Ok(Err(exit::EXISTS))
+        }
+        Err(e) => {
+            say(format!("could not make {to}: {e}"));
+            Ok(Err(exit::FAILED))
         }
     }
 }
@@ -692,34 +719,234 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     let text = read_input("the new text")?;
     write::check_text(&text)?;
     check_size(args.size, &text, "the new text")?;
-
-    // What this name read decides what must hold. An unread file must be new.
-    let expect = match reads.recall(&args.who, &path) {
-        Ok(Some(print)) => Expect::Fingerprint(print),
-        Ok(None) => Expect::Absent,
-        Err(e) => {
-            say(format!("could not look up what {} read: {e}", args.who));
-            return Ok(exit::FAILED);
-        }
-    };
-
-    let now = log::utc_now();
-    let storage = settings.storage()?;
-    let lock_line = format!("orgthread {} {now} pid {}", args.who, std::process::id());
-    let Some(stop) = arm_stop() else {
+    let Some(expect) = expected(&reads, &args.who, &path) else {
         return Ok(exit::FAILED);
     };
-    let report =
-        write::write_unless_stopped(storage.as_ref(), &path, &expect, &text, &lock_line, &stop);
-    Ok(finish(
+    write_whole(
         &settings,
         &reads,
         &path,
         &args.who,
-        &now,
-        &report,
+        &expect,
+        &text,
         Kind::Write,
-    ))
+    )
+}
+
+/// What this name read decides what must hold. An unread file must be new.
+fn expected(reads: &Reads, who: &str, path: &str) -> Option<Expect> {
+    match reads.recall(who, path) {
+        Ok(Some(print)) => Some(Expect::Fingerprint(print)),
+        Ok(None) => Some(Expect::Absent),
+        Err(e) => {
+            say(format!("could not look up what {who} read: {e}"));
+            None
+        }
+    }
+}
+
+/// The write procedure for the whole new bytes, with its log line and answer.
+fn write_whole(
+    settings: &Settings,
+    reads: &Reads,
+    path: &str,
+    who: &str,
+    expect: &Expect,
+    bytes: &[u8],
+    kind: Kind,
+) -> Result<i32, String> {
+    let now = log::utc_now();
+    let storage = settings.storage()?;
+    let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
+    let Some(stop) = arm_stop() else {
+        return Ok(exit::FAILED);
+    };
+    let report =
+        write::write_unless_stopped(storage.as_ref(), path, expect, bytes, &lock_line, &stop);
+    Ok(finish(settings, reads, path, who, &now, &report, kind))
+}
+
+/// Takes `--check` out of the arguments, and says if it was there.
+fn without_check(args: &[String]) -> (Vec<String>, bool) {
+    let check = args.iter().any(|a| a == "--check");
+    let rest = args.iter().filter(|a| *a != "--check").cloned().collect();
+    (rest, check)
+}
+
+/// Bytes on their way out, counted and fingerprinted, and cut at the limit.
+struct Counted<W: Write> {
+    out: W,
+    print: Fingerprinter,
+    limit: u64,
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.print.size() + buf.len() as u64 > self.limit {
+            return Err(io::Error::other("the file grew past the limit"));
+        }
+        let n = self.out.write(buf)?;
+        self.print.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// Any file as exact bytes, in parts, so a large file never sits whole in memory.
+fn cmd_download(args: &[String]) -> Result<i32, String> {
+    let (args, check) = without_check(args);
+    let ReadArgs { file, who, to } = parse_read(&args, "download")?;
+    let settings = Settings::load()?;
+    let path = settings.path_of(&file)?;
+    settings.limits(&path, false)?;
+    let limit = transfer::download_limit()?;
+    let storage = settings.storage()?;
+    let size = match storage.size(&path) {
+        Ok(Some(size)) => size,
+        Ok(None) => {
+            say(format!("there is no file {path}"));
+            return Ok(exit::MISSING);
+        }
+        Err(e) => {
+            say(format!("could not look at {path}: {e}"));
+            return Ok(exit::FAILED);
+        }
+    };
+    if size > limit {
+        say(format!(
+            "refused: {path} has {size} bytes, more than the limit of {}",
+            transfer::megabytes(limit)
+        ));
+        return Ok(exit::USAGE);
+    }
+    if check {
+        println!("{size}");
+        return Ok(0);
+    }
+    if to.is_none() && io::stdout().is_terminal() {
+        return Err("download gives bytes, not text for a terminal: add --to <copy>".into());
+    }
+    let reads = Reads::new(&settings.reads);
+    reads.tidy();
+    let out: Box<dyn Write> = match &to {
+        None => Box::new(io::stdout().lock()),
+        Some(to) => match new_copy(to, &settings)? {
+            Ok(made) => Box::new(made),
+            Err(code) => return Ok(code),
+        },
+    };
+    let mut counted = Counted {
+        out,
+        print: Fingerprinter::default(),
+        limit,
+    };
+    let sent = storage
+        .read_to(&path, &mut counted)
+        .and_then(|found| counted.flush().map(|()| found));
+    let failed = |reason: String| {
+        if let Some(to) = &to {
+            let _ = fs::remove_file(to);
+        }
+        say(reason);
+    };
+    match sent {
+        Ok(true) => {}
+        Ok(false) => {
+            failed(format!("there is no file {path}"));
+            return Ok(exit::MISSING);
+        }
+        Err(e) => {
+            failed(format!("could not hand over {path}: {e}"));
+            return Ok(exit::FAILED);
+        }
+    }
+    let size = counted.print.size().to_string();
+    let print = counted.print.finish();
+    // The note comes last: a failed copy must not count as read.
+    if let Err(e) = reads.remember(&who, &path, &print) {
+        say(format!("could not note this download: {e}"));
+        return Ok(exit::FAILED);
+    }
+    let now = log::utc_now();
+    let line = log::line(&[&now, "downloaded", &path, &who, "", &print, &size]);
+    if let Err(e) = log::append(&settings.log, &line) {
+        say(format!(
+            "the log line failed, {}: {e}. The line: {line}",
+            settings.log.display()
+        ));
+        return Ok(exit::NOT_LOGGED);
+    }
+    Ok(0)
+}
+
+/// Any file, with the rules of write. A file that is not text may go only to
+/// the folders of ORGTHREAD_BINARY_ALLOW.
+fn cmd_upload(args: &[String]) -> Result<i32, String> {
+    let (args, check) = without_check(args);
+    let args = parse_write(&args, "upload")?;
+    let settings = Settings::load()?;
+    let reads = Reads::new(&settings.reads);
+    let path = settings.path_of(&args.file)?;
+    settings.limits(&path, true)?;
+    let limit = transfer::upload_limit()?;
+    let Some(expect) = expected(&reads, &args.who, &path) else {
+        return Ok(exit::FAILED);
+    };
+    if check {
+        // Only what can be known before the bytes come: they are checked again then.
+        if expect == Expect::Absent {
+            match settings.storage()?.size(&path) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    say(format!(
+                        "refused: {path} exists, and {} has not read it. Download it first with the same name.",
+                        args.who
+                    ));
+                    return Ok(exit::EXISTS);
+                }
+                Err(e) => {
+                    say(format!("could not look at {path}: {e}"));
+                    return Ok(exit::FAILED);
+                }
+            }
+        }
+        return Ok(0);
+    }
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("could not read the new file: {e}"))?;
+    if bytes.len() as u64 > limit {
+        say(format!(
+            "refused, nothing written. The new file has more than the limit of {}.",
+            transfer::megabytes(limit)
+        ));
+        return Ok(exit::USAGE);
+    }
+    check_size(args.size, &bytes, "the new file")?;
+    if bytes.is_empty() {
+        return Err("the new file is empty, and an empty upload is refused".into());
+    }
+    let binary = write::check_text(&bytes).is_err();
+    if binary && !transfer::binary_allowed(&path) {
+        say(format!(
+            "refused, nothing written. {path} is not text, and a file that is not text may go only to the folders of {}.",
+            transfer::BINARY_ALLOW
+        ));
+        return Ok(exit::USAGE);
+    }
+    write_whole(
+        &settings,
+        &reads,
+        &path,
+        &args.who,
+        &expect,
+        &bytes,
+        Kind::Upload { binary },
+    )
 }
 
 fn cmd_patch(args: &[String]) -> Result<i32, String> {
@@ -818,7 +1045,14 @@ fn arm_stop() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
 #[derive(Clone, Copy)]
 enum Kind {
     Write,
-    Patch { edits: usize, append: bool },
+    Patch {
+        edits: usize,
+        append: bool,
+    },
+    /// A file that is not text gets no copy for the diff screen.
+    Upload {
+        binary: bool,
+    },
 }
 
 /// The log line, the answer and the exit code of a write or a patch.
@@ -865,7 +1099,7 @@ fn finish(
         } => {
             // Only for a person's diff, so a failure here does not fail the write.
             // In Dropbox mode, on a server, no text may stay on the disk.
-            if !settings.dropbox {
+            if !settings.dropbox && !matches!(kind, Kind::Upload { binary: true }) {
                 let versions = Versions::new(&settings.versions);
                 versions.tidy();
                 let kept = match old_text {
@@ -884,7 +1118,7 @@ fn finish(
             }
             let mut out = io::stdout();
             let _ = match kind {
-                Kind::Write => writeln!(out, "written: {path}, {size} bytes"),
+                Kind::Write | Kind::Upload { .. } => writeln!(out, "written: {path}, {size} bytes"),
                 Kind::Patch { edits, append } => {
                     let mut parts = Vec::new();
                     if edits > 0 {

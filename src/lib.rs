@@ -20,6 +20,7 @@ pub mod screen;
 pub mod serve;
 pub mod stop;
 pub mod storage;
+pub mod transfer;
 pub mod versions;
 pub mod watch;
 pub mod write;

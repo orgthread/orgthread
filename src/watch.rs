@@ -191,6 +191,7 @@ pub fn why(outcome: &str) -> &'static str {
         "restored" => "The check after the write failed. The old state is back.",
         "not-restored" => "The check failed and the old state is NOT back. Look at this file now.",
         "failed" => "The write failed, and the file is unchanged.",
+        "downloaded" => "This chat got the exact bytes of the file. Nothing was written.",
         _ => "This outcome is not known to this version.",
     }
 }
