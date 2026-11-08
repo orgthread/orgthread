@@ -307,3 +307,30 @@ fn the_local_server_offers_no_links() {
     );
     assert!(lines[1].contains("there is no tool download"), "{out}");
 }
+
+#[test]
+fn a_check_refuses_a_picture_name_outside_the_allowed_folders() {
+    let p = Place::new();
+    fs::create_dir_all(p.path("notes")).unwrap();
+    let out = p.run(
+        &["upload", "--check", &p.path("notes/test.png"), "--who", "a"],
+        b"",
+        &[],
+    );
+    assert_eq!(code(&out), 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ORGTHREAD_BINARY_ALLOW"));
+    // A text name there is still fine, and a picture name in an allowed folder too.
+    let text = p.run(
+        &["upload", "--check", &p.path("notes/a.md"), "--who", "a"],
+        b"",
+        &[],
+    );
+    assert_eq!(code(&text), 0);
+    let allowed = p.run(
+        &["upload", "--check", &p.path("scans/p9.PNG"), "--who", "a"],
+        b"",
+        &[],
+    );
+    assert_eq!(code(&allowed), 0);
+    assert!(p.log().is_empty());
+}

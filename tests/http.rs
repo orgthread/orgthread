@@ -816,9 +816,21 @@ fn an_upload_over_the_limit_or_to_a_text_folder_writes_nothing() {
     assert!(said.starts_with("exit code 2\n"), "{said:?}");
     assert!(!Path::new(&file).exists());
 
-    let notes = d
+    // A picture name in a text folder is refused before any link is made.
+    let named = d
         .root
         .join("org/notes/p1.jpg")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let reply = d.call(&t, "upload", json!({"files": [&named], "who": "a"}));
+    assert!(links_in(text_of(&reply)).is_empty(), "{reply}");
+    assert!(text_of(&reply).contains("ORGTHREAD_BINARY_ALLOW"), "{reply}");
+
+    // A name that does not show it gets a link, and the bytes are refused.
+    let notes = d
+        .root
+        .join("org/notes/p1.bin")
         .to_str()
         .unwrap()
         .to_string();

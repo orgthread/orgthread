@@ -897,6 +897,13 @@ fn cmd_upload(args: &[String]) -> Result<i32, String> {
     };
     if check {
         // Only what can be known before the bytes come: they are checked again then.
+        if transfer::named_binary(&path) && !transfer::binary_allowed(&path) {
+            say(format!(
+                "refused, no link made. {path} has the name of a file that is not text, and such a file may go only to the folders of {}.",
+                transfer::BINARY_ALLOW
+            ));
+            return Ok(exit::USAGE);
+        }
         if expect == Expect::Absent {
             match settings.storage()?.size(&path) {
                 Ok(None) => {}

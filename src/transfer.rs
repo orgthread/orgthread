@@ -59,6 +59,24 @@ pub fn binary_allowed(path: &str) -> bool {
         .any(|rule| is_under(path, rule.trim()))
 }
 
+/// True when the name of `path` ends in the extension of a file that is never
+/// text, such as `.png` or `.pdf`. Used before the bytes come, so a link is
+/// not made for an upload that would be refused.
+pub fn named_binary(path: &str) -> bool {
+    const NEVER_TEXT: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "ico",
+        "pdf", "zip", "gz", "tgz", "7z", "rar", "mp3", "m4a", "wav", "mp4", "mov", "epub",
+        "docx", "xlsx", "pptx", "sqlite",
+    ];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            NEVER_TEXT.contains(&ext.to_ascii_lowercase().as_str())
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Download,
