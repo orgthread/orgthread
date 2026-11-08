@@ -688,6 +688,12 @@ fn only_the_remote_door_offers_download_and_upload() {
     assert!(list.body.contains("\"download\""), "{}", list.body);
     assert!(list.body.contains("\"upload\""));
     assert!(list.body.contains("Up to 1 MB"), "{}", list.body);
+    assert_eq!(
+        list.body.matches("Allowed websites").count(),
+        2,
+        "{}",
+        list.body
+    );
 }
 
 #[test]

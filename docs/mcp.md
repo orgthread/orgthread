@@ -99,7 +99,7 @@ Each POST to `/mcp` gets one JSON answer. There is no session and no stream. A r
 
 `download` and `upload` give a link for each file, at `<public address>/t/<secret>`. The code sandbox of the chat uses it with `curl`, so the bytes go between the sandbox and this server, and never through the chat. A link works once and must start within 60 seconds. Once it starts, a transfer may take as long as it needs. The links live in memory only, so a restart ends them all. They work without a login, which is why they are short-lived, and they never go into the log.
 
-The sandbox of claude.ai reaches only the hosts on its list. Add the host of the public address on claude.ai, under Settings, Capabilities, Allowed websites. Without it, `curl` gets `CONNECT tunnel failed, response 403`.
+The sandbox of claude.ai reaches only the hosts on its list. Add the host of the public address on claude.ai, under Settings, Capabilities, Allowed websites. For the public address `https://notes.example.com/a-long-invented-secret`, the host is `notes.example.com`: no `https://` and no path, so the secret stays out of the list. Without it, `curl` in the sandbox gets `CONNECT tunnel failed, response 403`. That answer comes from the proxy of claude.ai, not from this server, so the log of this server shows nothing.
 
 A file that is not text may be uploaded only into the folders of `ORGTHREAD_BINARY_ALLOW`. With that setting empty, the default, no such upload works.
 

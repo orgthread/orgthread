@@ -87,6 +87,8 @@ curl -sS -T p088-1.jpg '<link>'
 | 404 | No such link, or it was used already |
 | 405 | The link is for the other direction |
 
+If `curl` says `CONNECT tunnel failed, response 403`, the request never reached the server: the host is not on the list of allowed websites of claude.ai. See [mcp.md](mcp.md).
+
 A download sends the bytes in chunks. If it fails halfway, the last chunk never comes, so `curl` reports an error instead of a short file.
 
 ## Refusals

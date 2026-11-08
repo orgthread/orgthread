@@ -400,8 +400,8 @@ fn transfer_tools() -> [Value; 2] {
                 into your code sandbox: curl -sS -o <name> '<link>'. For any file, also not \
                 text, up to {}. Each line gives the path, the size and the link, or why the file \
                 is refused. A link works once and must start within 60 seconds, so use it at once. \
-                Never show, store or log a link. Notes what this name read, as read does.",
-                mb(transfer::download_limit())),
+                Never show, store or log a link. Notes what this name read, as read does. {}",
+                mb(transfer::download_limit()), BLOCKED),
             "inputSchema": {
                 "type": "object",
                 "properties": {"files": files, "who": who},
@@ -415,8 +415,8 @@ fn transfer_tools() -> [Value; 2] {
                 or exit code N and the refusal. The rules of write hold: to replace a file, \
                 download or read it first with the same name. A file that is not text may go \
                 only to the folders that the owner allowed. Up to {}. A link works once and must \
-                start within 60 seconds, so use it at once. Never show, store or log a link.",
-                mb(transfer::upload_limit())),
+                start within 60 seconds, so use it at once. Never show, store or log a link. {}",
+                mb(transfer::upload_limit()), BLOCKED),
             "inputSchema": {
                 "type": "object",
                 "properties": {"files": files, "who": who},
@@ -425,6 +425,13 @@ fn transfer_tools() -> [Value; 2] {
         }),
     ]
 }
+
+/// The answer of the claude.ai proxy when the host of this door is not on its
+/// list. It never reaches the door, so only the tool description can explain it.
+const BLOCKED: &str = "If curl says CONNECT tunnel failed, response 403, the request \
+    never reached this server: the sandbox may reach only the hosts its owner allowed. \
+    Ask the owner to add the host of this server on claude.ai, under Settings, \
+    Capabilities, Allowed websites.";
 
 /// At most this many files in one call of download or upload.
 const MAX_FILES: usize = 25;
