@@ -40,7 +40,8 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read, write, patch and list, as MCP tools
+  orgthread serve                                the same read, write, patch and list, as MCP tools,
+                                                 and version: the build, the door, the storage, the tools
   orgthread serve --http <address>               also download and upload, through one-time links
 
 For a person:

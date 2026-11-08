@@ -375,10 +375,44 @@ fn tools(remote: bool) -> Value {
             },
         },
     ]});
-    if remote && let Some(list) = tools["tools"].as_array_mut() {
-        list.extend(transfer_tools());
+    if let Some(list) = tools["tools"].as_array_mut() {
+        if remote {
+            list.extend(transfer_tools());
+        }
+        list.push(json!({
+            "name": "version",
+            "description": "Gives the version and the commit of this server, which door \
+                answers, local or remote, the kind of storage, and the names of the tools it \
+                gives now. If a name is missing from your own list of tools, ask the owner \
+                to refresh it. Needs nothing.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }));
     }
     tools
+}
+
+/// The answer of the tool `version`. It is built in this process, so it names the
+/// build that answers, also when a newer program waits on the disk for a restart.
+/// Each line is fixed at build time or one word from a short list, so no setting,
+/// path, address or limit can reach a chat through it.
+fn version(remote: bool) -> Value {
+    let door = if remote { "remote" } else { "local" };
+    // The same test as the commands make, which read the same environment.
+    let dropbox = std::env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
+    let storage = if dropbox { "Dropbox" } else { "local folder" };
+    let offered = tools(remote);
+    let names: Vec<&str> = offered["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    let text = format!(
+        "orgthread {}\ndoor: {door}\nstorage: {storage}\ntools: {}\n",
+        crate::VERSION,
+        names.join(", ")
+    );
+    json!({"content": [{"type": "text", "text": text}], "isError": false})
 }
 
 fn transfer_tools() -> [Value; 2] {
@@ -551,6 +585,7 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
             };
             return links_for(params, exe, remote, direction);
         }
+        Some("version") => return Ok(version(remote.is_some())),
         Some("list") => {
             let owned = list_args(params)?;
             let args: Vec<&str> = owned.iter().map(String::as_str).collect();

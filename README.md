@@ -45,7 +45,7 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## MCP
 
-Two MCP servers give the same read, write, patch and list to a chat that has no shell: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
+Two MCP servers give the same read, write, patch and list to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 ## Licence
 

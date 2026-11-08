@@ -22,6 +22,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one each time |
 | `upload` | `files` | A list of 1 to 25 full paths, where the files will go. Remote server only |
 | | `who` | The name of this chat, the same one each time |
+| `version` | | No fields |
 
 The fields of `read` and `write` are all required, and `file` and `who` of `patch`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`. A list may name the root itself: `/`.
 
@@ -76,6 +77,22 @@ curl -sS -T p088-1.jpg '<link>'
 - A download gives any file, also a text, as exact bytes, up to 250 MB. It notes what this name read, as `read` does.
 - An upload keeps the rules of `write`: a new file needs no read, and a replace needs a download or a read by the same name first. A text file may go wherever `write` may write. A file that is not text may go only to the folders that the owner allowed. It may have up to 20 MB.
 - The checks run when the tool makes the link, so that a refusal comes early, and again when the bytes arrive.
+
+`version` gives four lines: the version and the commit, the door, the storage and the tools:
+
+```
+orgthread 0.2.5 (abc1234)
+door: remote
+storage: Dropbox
+tools: read, write, patch, list, download, upload, version
+```
+
+- The first line is the same as `orgthread --version`. A `+` after the commit means that the build had changes not yet committed.
+- `door` is `local` for `orgthread serve` and `remote` for `orgthread serve --http`.
+- `storage` is `local folder` or `Dropbox`.
+- `tools` names the tools that this server gives now. If the list of tools of the chat lacks one of them, refresh that list in the client.
+- The server itself answers, and starts no command. So the answer names the build that runs, also when a newer program is already on the disk and waits for a restart.
+- The answer holds no path, no address, no setting and no limit. A list notes nothing, and neither does `version`.
 
 `curl` prints what an upload answers: the same `written:` line as `write`, or `exit code N` and the refusal. The HTTP status says the same:
 
@@ -241,6 +258,22 @@ Reply:
 
 ```json
 {"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 11\norgthread: refused, nothing written. Edit 1: the old text is not in the file. Its new text is at line 4, so this patch may have gone through already.\n","type":"text"}],"isError":true}}
+```
+
+### `version`
+
+From the same run of the local server, with the commit shown as `abc1234`:
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"version","arguments":{}}}
+```
+
+Reply:
+
+```json
+{"id":7,"jsonrpc":"2.0","result":{"content":[{"text":"orgthread 0.2.5 (abc1234)\ndoor: local\nstorage: local folder\ntools: read, write, patch, list, version\n","type":"text"}],"isError":false}}
 ```
 
 ### `download` and `upload`

@@ -697,6 +697,38 @@ fn only_the_remote_door_offers_download_and_upload() {
 }
 
 #[test]
+fn the_version_tool_of_the_remote_door_gives_no_secret() {
+    let d = Door::open("version");
+    let t = d.log_in();
+    let list = d.mcp(&t, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+    assert!(list.body.contains("\"version\""), "{}", list.body);
+    let r = d.call(&t, "version", json!({}));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = text_of(&r);
+    let want = format!(
+        "orgthread {}\ndoor: remote\nstorage: local folder\n\
+         tools: read, write, patch, list, download, upload, version\n",
+        orgthread::VERSION
+    );
+    assert_eq!(text, want);
+    // Not the address, not the token, not a path, not a limit, not a setting.
+    for secret in [BASE, "door.test", &t, d.root.to_str().unwrap(), "org/scans", "MB"] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
+}
+
+#[test]
+fn the_version_tool_needs_the_login() {
+    let d = Door::open("version-closed");
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"version","arguments":{}}})
+    .to_string();
+    let r = d.raw("POST", "/mcp", "", &call);
+    assert_eq!(r.status, 401);
+    assert!(r.body.is_empty());
+}
+
+#[test]
 fn a_picture_goes_up_and_comes_back_through_links() {
     let d = Door::open("transfer-both");
     let t = d.log_in();

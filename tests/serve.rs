@@ -49,8 +49,12 @@ impl Place {
         c
     }
     fn serve(&self) -> Server {
-        let mut child = self
-            .command(&["serve"])
+        self.serve_with(&[])
+    }
+    fn serve_with(&self, settings: &[(&str, &str)]) -> Server {
+        let mut command = self.command(&["serve"]);
+        command.envs(settings.iter().copied());
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -123,7 +127,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_the_four_tools() {
+fn it_greets_and_offers_the_five_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -137,7 +141,8 @@ fn it_greets_and_offers_the_four_tools() {
     let list = server.ask("tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read", "write", "patch", "list"]);
+    assert_eq!(names, ["read", "write", "patch", "list", "version"]);
+    assert_eq!(tools[4]["inputSchema"]["properties"], json!({}));
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
@@ -145,6 +150,41 @@ fn it_greets_and_offers_the_four_tools() {
     );
     assert_eq!(tools[2]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(tools[3]["inputSchema"]["required"], json!(["folders"]));
+}
+
+#[test]
+fn the_version_tool_names_the_build_the_door_the_storage_and_the_tools() {
+    let place = Place::new();
+    let mut server = place.serve();
+    let (text, refused) = server.tool("version", json!({}));
+    assert!(!refused, "{text}");
+    let want = format!(
+        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, list, version\n",
+        orgthread::VERSION
+    );
+    assert_eq!(text, want);
+    // The commit is in it, as with --version, and no path of this machine.
+    assert!(text.contains(env!("CARGO_PKG_VERSION")));
+    assert!(text.contains(" ("));
+    assert!(!text.contains(place.root.to_str().unwrap()), "{text}");
+}
+
+#[test]
+fn the_version_tool_names_dropbox_and_no_setting() {
+    let place = Place::new();
+    let token = "invented-dropbox-token-a1b2c3";
+    let mut server = place.serve_with(&[
+        ("ORGTHREAD_STORAGE", "dropbox"),
+        ("ORGTHREAD_DROPBOX_TOKEN", token),
+        ("ORGTHREAD_ALLOW", "/org/invented-allowed"),
+    ]);
+    // Arguments that it does not need change nothing.
+    let (text, refused) = server.tool("version", json!({"file": "/org/a.md"}));
+    assert!(!refused, "{text}");
+    assert!(text.contains("\nstorage: Dropbox\n"), "{text}");
+    for secret in [token, "invented-allowed", place.root.to_str().unwrap()] {
+        assert!(!text.contains(secret), "{text}");
+    }
 }
 
 #[test]
