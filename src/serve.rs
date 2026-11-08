@@ -676,36 +676,51 @@ fn transfer(
     let direction = match request.method {
         "GET" => Direction::Download,
         "PUT" => Direction::Upload,
-        _ => return respond(stream, "405 Method Not Allowed", "", b""),
-    };
-    let link = match remote.links.take(request.secret, direction) {
-        Taken::Ready(link) => link,
-        Taken::Expired => {
-            return respond_text(
-                stream,
-                "410 Gone",
-                "This link waited more than 60 seconds, and it is gone now. Ask the tool for a new one.\n",
-            );
-        }
-        Taken::WrongDirection => {
-            return respond_text(
-                stream,
-                "405 Method Not Allowed",
-                "This link is for the other direction: GET fetches with download, PUT sends with upload.\n",
-            );
-        }
-        Taken::Unknown => {
-            return respond_text(
-                stream,
-                "404 Not Found",
-                "There is no such link, or it was used already. Ask the tool for a new one.\n",
-            );
+        _ => {
+            let text = "A link takes GET to fetch a file, or PUT to send one.\n";
+            return refuse(stream, reader, request, "405 Method Not Allowed", text);
         }
     };
-    match direction {
-        Direction::Download => send_file(stream, &link, exe),
-        Direction::Upload => receive_file(stream, reader, request, &link, exe),
+    let (status, text) = match remote.links.take(request.secret, direction) {
+        Taken::Ready(link) => {
+            return match direction {
+                Direction::Download => send_file(stream, &link, exe),
+                Direction::Upload => receive_file(stream, reader, request, &link, exe),
+            };
+        }
+        Taken::Expired => (
+            "410 Gone",
+            "This link waited more than 60 seconds, and it is gone now. Ask the tool for a new one.\n",
+        ),
+        Taken::WrongDirection => (
+            "405 Method Not Allowed",
+            "This link is for the other direction: GET fetches with download, PUT sends with upload.\n",
+        ),
+        Taken::Unknown => (
+            "404 Not Found",
+            "There is no such link, or it was used already. Ask the tool for a new one.\n",
+        ),
+    };
+    refuse(stream, reader, request, status, text)
+}
+
+/// The answer to a request that moves nothing. A client that sends at once must
+/// not lose it to a reset connection, so what it sends is read and dropped, up to
+/// a bound. A client that waits for 100 Continue sends nothing, so the wait is short.
+fn refuse(
+    stream: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    request: &Transfer,
+    status: &str,
+    text: &str,
+) -> io::Result<()> {
+    respond_text(stream, status, text)?;
+    if let Some(length) = request.length.filter(|n| *n > 0) {
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let rest = (length as u64).min(MAX_BODY as u64);
+        let _ = io::copy(&mut reader.take(rest), &mut io::sink());
     }
+    Ok(())
 }
 
 /// The whole file is held in memory: the write procedure needs it, to put the
@@ -726,21 +741,17 @@ fn receive_file(
     };
     let limit = match transfer::upload_limit() {
         Ok(limit) => limit,
-        Err(e) => return respond_text(stream, "409 Conflict", &format!("exit code 2\n{e}\n")),
+        Err(e) => {
+            let text = format!("exit code 2\n{e}\n");
+            return refuse(stream, reader, request, "409 Conflict", &text);
+        }
     };
     if length as u64 > limit {
         let text = format!(
             "exit code 2\norgthread: refused, nothing written. The new file has more than the limit of {}.\n",
             transfer::megabytes(limit)
         );
-        respond_text(stream, "409 Conflict", &text)?;
-        // A client that sends at once must not lose this answer to a reset
-        // connection, so the rest is read and dropped, up to a bound. A client
-        // that waits for 100 Continue sends nothing, so the wait is short.
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let rest = (length as u64).min(MAX_BODY as u64);
-        let _ = io::copy(&mut reader.take(rest), &mut io::sink());
-        return Ok(());
+        return refuse(stream, reader, request, "409 Conflict", &text);
     }
     if request.wants_continue {
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;

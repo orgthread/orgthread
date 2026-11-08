@@ -18,6 +18,10 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | `list` | `folders` | A list of full paths of folders, at least one |
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
+| `download` | `files` | A list of 1 to 25 full paths of files. Remote server only |
+| | `who` | The name of this chat, the same one each time |
+| `upload` | `files` | A list of 1 to 25 full paths, where the files will go. Remote server only |
+| | `who` | The name of this chat, the same one each time |
 
 The fields of `read` and `write` are all required, and `file` and `who` of `patch`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`. A list may name the root itself: `/`.
 
@@ -61,6 +65,29 @@ A task that may send the same patch twice, for example after a lost answer, puts
 - The time is in the time zone of the machine that runs the server, with the day name. On a server, set `TZ`, for example `TZ=Europe/Vienna`.
 
 A list notes nothing, so it needs no `who`.
+
+`download` and `upload` give one line for each file, in the order given. A line that works gives the path, for a download the size, and the link last. A file that is refused gets `refused, exit code N:` and the reason, and the others still get their links. With a refusal, the text starts with `exit code N` of the first file that failed. Use each link at once in the code sandbox, and never show, store or log it:
+
+```
+curl -sS -o magazine-2026-11.pdf '<link>'
+curl -sS -T p088-1.jpg '<link>'
+```
+
+- A download gives any file, also a text, as exact bytes, up to 250 MB. It notes what this name read, as `read` does.
+- An upload keeps the rules of `write`: a new file needs no read, and a replace needs a download or a read by the same name first. A text file may go wherever `write` may write. A file that is not text may go only to the folders that the owner allowed. It may have up to 20 MB.
+- The checks run when the tool makes the link, so that a refusal comes early, and again when the bytes arrive.
+
+`curl` prints what an upload answers: the same `written:` line as `write`, or `exit code N` and the refusal. The HTTP status says the same:
+
+| Status | When |
+|---|---|
+| 200 | Done |
+| 409 | Refused. The text starts with `exit code N`, as in the table below |
+| 410 | The link waited more than 60 seconds. Ask the tool for a new one |
+| 404 | No such link, or it was used already |
+| 405 | The link is for the other direction |
+
+A download sends the bytes in chunks. If it fails halfway, the last chunk never comes, so `curl` reports an error instead of a short file.
 
 ## Refusals
 
@@ -212,4 +239,40 @@ Reply:
 
 ```json
 {"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 11\norgthread: refused, nothing written. Edit 1: the old text is not in the file. Its new text is at line 4, so this patch may have gone through already.\n","type":"text"}],"isError":true}}
+```
+
+### `download` and `upload`
+
+These come from a real run of the remote server on the same machine, with `ORGTHREAD_ROOT=/tmp/claude/example-transfer`, `ORGTHREAD_BINARY_ALLOW=scans` and the invented public address `https://notes.example.com`. The secret of each link is shown as `LINK`. The file `scans/magazine-2026-11.pdf` held 18 bytes, and there was no file `scans/none.pdf`.
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"download","arguments":{"files":["/tmp/claude/example-transfer/scans/magazine-2026-11.pdf","/tmp/claude/example-transfer/scans/none.pdf"],"who":"chat a"}}}
+```
+
+Reply. The second file is refused, and the first still gets its link:
+
+```json
+{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 6\n/tmp/claude/example-transfer/scans/magazine-2026-11.pdf  18 bytes  https://notes.example.com/t/LINK\n/tmp/claude/example-transfer/scans/none.pdf  refused, exit code 6: there is no file scans/none.pdf\n","type":"text"}],"isError":true}}
+```
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"upload","arguments":{"files":["/tmp/claude/example-transfer/scans/p088-1.jpg"],"who":"chat a"}}}
+```
+
+Reply:
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"/tmp/claude/example-transfer/scans/p088-1.jpg  https://notes.example.com/t/LINK\n","type":"text"}],"isError":false}}
+```
+
+Then the download link fetched the file, and the upload link sent a picture of 48211 bytes. In this run on one machine, `curl` used the local address of the server in place of the public one:
+
+```
+$ curl -sS -o magazine-2026-11.pdf 'https://notes.example.com/t/LINK'
+$ curl -sS -T p088-1.jpg 'https://notes.example.com/t/LINK'
+written: scans/p088-1.jpg, 48211 bytes
 ```

@@ -2,14 +2,14 @@
 
 Not ready. Do not use them on real files yet.
 
-MCP is a standard way for a chat to call tools. The program has two MCP servers, for a chat that has no shell. Both offer the same four tools: `read`, `write`, `patch` and `list`.
+MCP is a standard way for a chat to call tools. The program has two MCP servers, for a chat that has no shell. Both offer the same four tools: `read`, `write`, `patch` and `list`. The remote server also offers `download` and `upload`, for files that are not text, through one-time links.
 
 | Server | Start it with | For | Login |
 |---|---|---|---|
 | Local | `orgthread serve` | A client on the same machine, such as Claude Code | None |
 | Remote | `orgthread serve --http <address>` | A chat in the cloud, such as claude.ai | One password |
 
-Each tool call starts the command itself: `orgthread read`, `orgthread write`, `orgthread patch` or `orgthread list`. So the rules, the log and the refusals are the same as in the shell. A chat never deals with a lock.
+Each tool call starts the command itself: `orgthread read`, `orgthread write`, `orgthread patch`, `orgthread list`, `orgthread download` or `orgthread upload`. So the rules, the log and the refusals are the same as in the shell. A chat never deals with a lock.
 
 The tools, their refusals and examples are in [mcp-api.md](mcp-api.md).
 
@@ -95,6 +95,14 @@ Five wrong passwords within 15 minutes close the login for up to 15 minutes, eve
 
 Each POST to `/mcp` gets one JSON answer. There is no session and no stream. A request may hold up to 64 MiB.
 
+### Links for files that are not text
+
+`download` and `upload` give a link for each file, at `<public address>/t/<secret>`. The code sandbox of the chat uses it with `curl`, so the bytes go between the sandbox and this server, and never through the chat. A link works once and must start within 60 seconds. Once it starts, a transfer may take as long as it needs. The links live in memory only, so a restart ends them all. They work without a login, which is why they are short-lived, and they never go into the log.
+
+The sandbox of claude.ai reaches only the hosts on its list. Add the host of the public address on claude.ai, under Settings, Capabilities, Allowed websites. Without it, `curl` gets `CONNECT tunnel failed, response 403`.
+
+A file that is not text may be uploaded only into the folders of `ORGTHREAD_BINARY_ALLOW`. With that setting empty, the default, no such upload works.
+
 ## Settings
 
 Each setting comes from the environment. A file `.env` beside the program, with lines `ORGTHREAD_NAME=value`, fills in each setting that the environment does not hold. Write a value with no quotes, as quotes count as part of it.
@@ -108,6 +116,9 @@ Each setting comes from the environment. A file `.env` beside the program, with 
 | `ORGTHREAD_PUBLIC_URL` | The public address of the remote server | None, required by it |
 | `ORGTHREAD_LOGIN_HASH` | The hash of its password | None, required by it |
 | `ORGTHREAD_LOGINS` | The file of the logins | `state/logins.json` beside the program |
+| `ORGTHREAD_BINARY_ALLOW` | Comma-separated folders where an upload of a file that is not text may go | None |
+| `ORGTHREAD_DOWNLOAD_MB` | The largest download, in MB of 1,000,000 bytes | 250 |
+| `ORGTHREAD_UPLOAD_MB` | The largest upload, in MB of 1,000,000 bytes | 20 |
 | `ORGTHREAD_LISTEN_ANYWHERE` | `yes` lets the remote server listen on an address that others can reach, with no encryption | Only `127.0.0.1`, `[::1]` and `localhost` |
 | `ORGTHREAD_LOCK_DIR` | The locks. For a local folder, keep them on the same disk as the root | `.locks` beside the program |
 | `ORGTHREAD_LOG` | The log file | `state/writes.log` beside the program |

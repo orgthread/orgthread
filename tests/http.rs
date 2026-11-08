@@ -716,9 +716,11 @@ fn a_picture_goes_up_and_comes_back_through_links() {
     let got = d.bytes("GET", &down[0], "", b"");
     assert_eq!(got.status, 200, "{}", got.head);
     assert_eq!(got.body, bytes);
-    // Each link works once.
+    // Each link works once, and a second try gets a clear answer, not a reset.
     assert_eq!(d.bytes("GET", &down[0], "", b"").status, 404);
-    assert_eq!(d.bytes("PUT", &up[0], "", b"x").status, 404);
+    let again = d.bytes("PUT", &up[0], "", &bytes);
+    assert_eq!(again.status, 404);
+    assert!(String::from_utf8_lossy(&again.body).contains("used already"));
 }
 
 #[test]

@@ -285,6 +285,29 @@ impl Fake {
     fn run(&self, args: &[&str], stdin: &[u8]) -> Output {
         self.run_with(Some(GOOD_TOKEN), args, stdin)
     }
+    fn run_with_env(&self, args: &[&str], stdin: &[u8], env: &[(&str, &str)]) -> Output {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+        c.args(args)
+            .env("ORGTHREAD_STORAGE", "dropbox")
+            .env("ORGTHREAD_DROPBOX_API", &self.url)
+            .env("ORGTHREAD_DROPBOX_CONTENT", &self.url)
+            .env("ORGTHREAD_LOCK_DIR", self.dir.join("locks"))
+            .env("ORGTHREAD_LOG", self.dir.join("log"))
+            .env("ORGTHREAD_READS", self.dir.join("reads"))
+            .env("ORGTHREAD_VERSIONS", self.dir.join("versions"))
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .env("ORGTHREAD_DROPBOX_TOKEN", GOOD_TOKEN)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in env {
+            c.env(name, value);
+        }
+        let mut child = c.spawn().unwrap();
+        let _ = child.stdin.take().unwrap().write_all(stdin);
+        child.wait_with_output().unwrap()
+    }
     fn read(&self, who: &str) -> Output {
         self.run(&["read", FILE, "--who", who], b"")
     }
@@ -820,4 +843,62 @@ fn a_list_in_dropbox_needs_a_clean_path() {
         let o = f.run(&["list", folder], b"");
         assert_eq!(code(&o), 2, "{folder}: {o:?}");
     }
+}
+
+/// Bytes that are not text: a NUL sign and no valid UTF-8.
+fn picture(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i * 7 % 256) as u8).collect()
+}
+
+#[test]
+fn a_picture_goes_up_and_comes_back_through_dropbox() {
+    let f = Fake::new();
+    let bytes = picture(5_000_000);
+    let file = "/org/scans/p1.jpg";
+    let up = f.run_with_env(
+        &["upload", file, "--who", "a"],
+        &bytes,
+        &[("ORGTHREAD_BINARY_ALLOW", "org/scans")],
+    );
+    assert_eq!(code(&up), 0, "{}", String::from_utf8_lossy(&up.stderr));
+    assert_eq!(f.get(file).unwrap(), bytes);
+    let down = f.run(&["download", file, "--who", "b"], b"");
+    assert_eq!(code(&down), 0, "{}", String::from_utf8_lossy(&down.stderr));
+    assert_eq!(down.stdout, bytes);
+    // The download counts as a read, so the same name may replace the file.
+    let again = f.run_with_env(
+        &["upload", file, "--who", "b"],
+        &picture(10),
+        &[("ORGTHREAD_BINARY_ALLOW", "org/scans")],
+    );
+    assert_eq!(
+        code(&again),
+        0,
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(f.get(file).unwrap(), picture(10));
+}
+
+#[test]
+fn a_download_from_dropbox_knows_the_size_first() {
+    let f = Fake::new();
+    f.put("/org/scans/big.pdf", &picture(2_000_000));
+    let check = f.run(
+        &["download", "--check", "/org/scans/big.pdf", "--who", "a"],
+        b"",
+    );
+    assert_eq!(code(&check), 0);
+    assert_eq!(String::from_utf8_lossy(&check.stdout), "2000000\n");
+    let over = f.run_with_env(
+        &["download", "/org/scans/big.pdf", "--who", "a"],
+        b"",
+        &[("ORGTHREAD_DOWNLOAD_MB", "1")],
+    );
+    assert_eq!(code(&over), 2);
+    assert!(over.stdout.is_empty());
+    assert_eq!(
+        code(&f.run(&["download", "/org/scans/none.pdf", "--who", "a"], b"")),
+        6
+    );
 }
