@@ -28,7 +28,7 @@ impl Reads {
     }
 
     pub fn remember(&self, who: &str, path: &str, print: &str) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
+        crate::log::private_dir(&self.dir)?;
         let note = self.note(who, path);
         let temp = note.with_extension(format!("{}.tmp", std::process::id()));
         fs::write(&temp, print)?;
@@ -72,6 +72,18 @@ mod tests {
 
     fn place(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("orgthread-reads-{name}-{}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_folder_of_notes_is_for_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = place("mode");
+        let _ = fs::remove_dir_all(&dir);
+        Reads::new(&dir).remember("agent", "/a.md", "print").unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
