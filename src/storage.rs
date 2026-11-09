@@ -4,7 +4,7 @@
 //! later: `write_if_unchanged` maps to an upload with a rev check, and the locks
 //! stay files in the same lock folder.
 
-use crate::fingerprint::fingerprint;
+use crate::fingerprint::{Fingerprinter, fingerprint};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,44 @@ pub enum RemoveError {
 impl From<io::Error> for RemoveError {
     fn from(e: io::Error) -> Self {
         RemoveError::Io(e)
+    }
+}
+
+/// What a copy made. The two fingerprints are equal when every byte arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Copied {
+    /// The fingerprint of the source, as the copy found it.
+    pub source: String,
+    /// The fingerprint of the new file, as the storage reports it or it reads back.
+    pub target: String,
+    /// The size in bytes of the new file.
+    pub size: u64,
+    /// The version of the new file, where the storage names one, for a remove.
+    pub rev: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum CopyError {
+    /// A file or folder is at the target already. Nothing was copied.
+    Exists,
+    /// There is no source. Nothing was copied.
+    Missing,
+    /// The source is a folder, or no plain file. Nothing was copied.
+    Folder,
+    /// The source is not the version the caller gave. Nothing was copied.
+    Changed {
+        found: String,
+    },
+    /// Something was made at the target, but it is not a file.
+    Unexpected {
+        reason: String,
+    },
+    Io(io::Error),
+}
+
+impl From<io::Error> for CopyError {
+    fn from(e: io::Error) -> Self {
+        CopyError::Io(e)
     }
 }
 
@@ -171,6 +209,18 @@ pub trait Storage {
         )))
     }
 
+    /// Copies one file to a new name. It never replaces anything at `to`, and it
+    /// makes the missing parent folders of `to`. With `expect`, the source must
+    /// have that fingerprint, or nothing is copied. The caller compares the two
+    /// fingerprints of the answer, and removes the copy if they differ.
+    fn copy(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Copied, CopyError> {
+        let _ = (from, to, expect);
+        Err(CopyError::Io(io::Error::new(
+            ErrorKind::Unsupported,
+            "this storage cannot copy a file",
+        )))
+    }
+
     /// The size of a file in bytes, or `None` when it does not exist.
     fn size(&self, path: &str) -> io::Result<Option<u64>> {
         Ok(self.read(path)?.map(|bytes| bytes.len() as u64))
@@ -256,6 +306,22 @@ impl LocalFolder {
         {
             let _ = dir.sync_all();
         }
+    }
+
+    /// The fingerprint and the size of a file, read in parts.
+    fn print_of(file: &Path) -> io::Result<(String, u64)> {
+        let mut input = File::open(file)?;
+        let mut print = Fingerprinter::default();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = io::Read::read(&mut input, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            print.update(&buf[..n]);
+        }
+        let size = print.size();
+        Ok((print.finish(), size))
     }
 
     fn found(&self, path: &str) -> io::Result<Option<String>> {
@@ -485,6 +551,79 @@ impl Storage for LocalFolder {
             size: bytes.len() as u64,
             rev: None,
         })
+    }
+
+    /// The source goes into a temporary file in the lock folder, with its
+    /// fingerprint made on the way. A hard link then puts it in place: it never
+    /// replaces a file, so a target that appeared meanwhile stays as it is.
+    /// The new file is read back for its fingerprint.
+    fn copy(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Copied, CopyError> {
+        let source = self.full(from);
+        let target = self.full(to);
+        match fs::metadata(&source) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(CopyError::Folder),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
+            Err(e) => return Err(e.into()),
+        }
+        // A first look, so a clear refusal costs no copy of the bytes.
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(CopyError::Exists);
+        }
+        let temp = self.lock_path(&format!(
+            "{}.{}.copy",
+            to.replace('/', "--"),
+            std::process::id()
+        ));
+        let made = (|| -> Result<Copied, CopyError> {
+            let mut input = match File::open(&source) {
+                Ok(file) => file,
+                Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
+                Err(e) => return Err(e.into()),
+            };
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            let mut print = Fingerprinter::default();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = io::Read::read(&mut input, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])?;
+                print.update(&buf[..n]);
+            }
+            file.set_permissions(input.metadata()?.permissions())?;
+            file.sync_all()?;
+            let source_print = print.finish();
+            if let Some(want) = expect
+                && want != source_print
+            {
+                return Err(CopyError::Changed {
+                    found: source_print,
+                });
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::hard_link(&temp, &target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(CopyError::Exists),
+                Err(e) => return Err(e.into()),
+            }
+            Self::sync_parent(&target);
+            let (target_print, size) = Self::print_of(&target)?;
+            Ok(Copied {
+                source: source_print,
+                target: target_print,
+                size,
+                rev: None,
+            })
+        })();
+        let _ = fs::remove_file(&temp);
+        made
     }
 
     fn restore(&self, path: &str, old: Option<&[u8]>) -> io::Result<()> {

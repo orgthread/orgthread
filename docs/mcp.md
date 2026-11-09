@@ -2,14 +2,14 @@
 
 Not ready. Do not use them on real files yet.
 
-MCP is a standard way for a chat to call tools. The program has two MCP servers, for a chat that has no shell. Both offer the same six tools: `read`, `write`, `patch`, `delete`, `list` and `version`. The remote server also offers `download` and `upload`, for files that are not text, through one-time links.
+MCP is a standard way for a chat to call tools. The program has two MCP servers, for a chat that has no shell. Both offer the same seven tools: `read`, `write`, `patch`, `delete`, `copy`, `list` and `version`. The remote server also offers `download` and `upload`, for files that are not text, through one-time links.
 
 | Server | Start it with | For | Login |
 |---|---|---|---|
 | Local | `orgthread serve` | A client on the same machine, such as Claude Code | None |
 | Remote | `orgthread serve --http <address>` | A chat in the cloud, such as claude.ai | One password |
 
-Each tool call starts the command itself: `orgthread read`, `orgthread write`, `orgthread patch`, `orgthread delete`, `orgthread list`, `orgthread download` or `orgthread upload`. So the rules, the log and the refusals are the same as in the shell. Only `version` is answered by the server itself, as it reads no file. A chat never deals with a lock.
+Each tool call starts the command itself: `orgthread read`, `orgthread write`, `orgthread patch`, `orgthread delete`, `orgthread copy` for each pair, `orgthread list`, `orgthread download` or `orgthread upload`. So the rules, the log and the refusals are the same as in the shell. Only `version` is answered by the server itself, as it reads no file. A chat never deals with a lock.
 
 The tools, their refusals and examples are in [mcp-api.md](mcp-api.md).
 

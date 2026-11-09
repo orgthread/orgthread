@@ -41,6 +41,14 @@ struct State {
     metadata_calls: u32,
     /// The `parent_rev` of each `delete_v2` call, or `None` for a call with none.
     deletes: Vec<Option<String>>,
+    /// The argument of each `copy_v2` call.
+    copies: Vec<Value>,
+    /// The next copy hangs up with no answer: after it made the copy, or before.
+    copy_hangs_up: Option<bool>,
+    /// The next copy stores these bytes in place of the source, as a broken copy would.
+    copy_stores: Option<Vec<u8>>,
+    /// The next `delete_v2` fails with a server error.
+    delete_fails: bool,
 }
 
 impl State {
@@ -209,6 +217,44 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
                 Ok(v) => reply(&mut stream, 200, v.to_string().as_bytes()),
                 Err(summary) => error(&mut stream, summary),
             }
+        }
+        "/2/files/get_metadata" if !s.files.contains_key(&path) && s.children(&path).is_ok() => {
+            let v = json!({ ".tag": "folder", "name": path.rsplit('/').next().unwrap_or("") });
+            reply(&mut stream, 200, v.to_string().as_bytes());
+        }
+        "/2/files/copy_v2" => {
+            s.copies.push(arg.clone());
+            assert_eq!(arg["autorename"], false);
+            let from = arg["from_path"].as_str().unwrap_or("").to_string();
+            let to = arg["to_path"].as_str().unwrap_or("").to_string();
+            let folder_at = |p: &str| s.children(p).is_ok() && !s.files.contains_key(p);
+            if s.files.contains_key(&to) || folder_at(&to) {
+                return error(&mut stream, "to/conflict/file/..");
+            }
+            let Some(bytes) = s.files.get(&from).map(|f| f.bytes.clone()) else {
+                return error(&mut stream, "from_lookup/not_found/..");
+            };
+            let hang_up = s.copy_hangs_up.take();
+            if hang_up == Some(false) {
+                return;
+            }
+            let bytes = s.copy_stores.take().unwrap_or(bytes);
+            s.put(&to, &bytes);
+            if hang_up == Some(true) {
+                return;
+            }
+            let file = &s.files[&to];
+            let v = json!({ "metadata": {
+                ".tag": "file",
+                "name": to.rsplit('/').next().unwrap_or(""),
+                "size": file.bytes.len(),
+                "rev": file.rev.to_string(),
+                "content_hash": fingerprint(&file.bytes),
+            }});
+            reply(&mut stream, 200, v.to_string().as_bytes());
+        }
+        "/2/files/delete_v2" if std::mem::take(&mut s.delete_fails) => {
+            reply(&mut stream, 500, b"server error");
         }
         "/2/files/get_metadata" => match s.files.get(&path) {
             Some(file) => {
@@ -1162,4 +1208,246 @@ fn a_delete_works_with_or_without_the_first_slash() {
         .map(|l| l.split('\t').nth(2).unwrap())
         .collect();
     assert_eq!(paths, [bare, bare], "the log names the file one way");
+}
+
+fn copy(f: &Fake, from: &str, to: &str) -> Output {
+    f.run(&["copy", from, to, "--who", "chat"], b"")
+}
+
+fn last_log(f: &Fake) -> Vec<String> {
+    let log = fs::read_to_string(f.dir.join("log")).unwrap_or_default();
+    let line = log.lines().last().expect("no log line").to_string();
+    line.split('\t').map(str::to_string).collect()
+}
+
+#[test]
+fn a_dropbox_copy_is_two_calls_and_no_byte_passes_the_server() {
+    let f = Fake::new();
+    f.put(FILE, "Grüße\n".as_bytes());
+    let o = copy(&f, FILE, "/org/new/deep/b.md");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let print = fingerprint("Grüße\n".as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        format!("copied: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}\n")
+    );
+    assert_eq!(f.get("/org/new/deep/b.md").unwrap(), "Grüße\n".as_bytes());
+    let s = f.state.lock().unwrap();
+    assert_eq!(s.metadata_calls, 1, "one get_metadata, of the source");
+    assert_eq!(s.copies.len(), 1);
+    assert_eq!(s.downloads, 0, "no byte passes this server");
+    assert_eq!(
+        s.copies[0],
+        json!({"from_path": FILE, "to_path": "/org/new/deep/b.md", "autorename": false})
+    );
+    drop(s);
+    assert_eq!(
+        last_log(&f)[1..],
+        [
+            "copied",
+            "org/new/deep/b.md",
+            "chat",
+            "-",
+            print.as_str(),
+            "8",
+            "/org/notes/invented.md"
+        ]
+    );
+    assert!(fs::read_dir(f.dir.join("locks")).unwrap().next().is_none());
+}
+
+#[test]
+fn a_dropbox_target_that_exists_stays_and_gets_exit_5() {
+    let f = Fake::new();
+    f.put(FILE, b"new\n");
+    f.put("/org/notes/b.md", b"old\n");
+    let o = copy(&f, FILE, "org/notes/b.md");
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(f.get("/org/notes/b.md").unwrap(), b"old\n");
+    assert_eq!(last_log(&f)[1], "exists");
+    // A folder at the new name, too.
+    let o = copy(&f, FILE, "/org/notes");
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert!(
+        f.state.lock().unwrap().deletes.is_empty(),
+        "nothing removed"
+    );
+}
+
+#[test]
+fn in_dropbox_no_source_is_6_a_folder_2_and_another_version_4() {
+    let f = Fake::new();
+    let o = copy(&f, "/org/notes/gone.md", "/org/b.md");
+    assert_eq!(code(&o), 6, "{o:?}");
+    f.put(FILE, b"edited\n");
+    let o = copy(&f, "/org/notes", "/org/b.md");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("is a folder"));
+    let seen = fingerprint(b"seen\n");
+    let o = f.run(
+        &[
+            "copy",
+            FILE,
+            "/org/b.md",
+            "--who",
+            "chat",
+            "--fingerprint",
+            &seen,
+        ],
+        b"",
+    );
+    assert_eq!(code(&o), 4, "{o:?}");
+    assert_eq!(
+        f.state.lock().unwrap().copies.len(),
+        0,
+        "no copy_v2 for any of them"
+    );
+    assert_eq!(f.get("/org/b.md"), None);
+    let right = fingerprint(b"edited\n");
+    let o = f.run(
+        &[
+            "copy",
+            FILE,
+            "/org/b.md",
+            "--who",
+            "chat",
+            "--fingerprint",
+            &right,
+        ],
+        b"",
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+}
+
+#[test]
+fn a_dropbox_copy_with_other_bytes_is_removed_by_its_rev_and_gives_7() {
+    let f = Fake::new();
+    f.put(FILE, b"source\n");
+    f.state.lock().unwrap().copy_stores = Some(b"broken".to_vec());
+    let o = copy(&f, FILE, "/org/b.md");
+    assert_eq!(code(&o), 7, "{o:?}");
+    assert_eq!(f.get("/org/b.md"), None, "the broken copy is gone");
+    assert_eq!(f.get(FILE).unwrap(), b"source\n");
+    let s = f.state.lock().unwrap();
+    assert_eq!(s.deletes.len(), 1);
+    assert!(
+        s.deletes[0].is_some(),
+        "the delete names the rev of the copy"
+    );
+    drop(s);
+    let line = last_log(&f);
+    assert_eq!(line[1], "restored");
+    assert_eq!(line[4], fingerprint(b"source\n"));
+    assert_eq!(line[5], fingerprint(b"broken"));
+}
+
+#[test]
+fn a_dropbox_copy_that_cannot_be_removed_gives_9() {
+    let f = Fake::new();
+    f.put(FILE, b"source\n");
+    {
+        let mut s = f.state.lock().unwrap();
+        s.copy_stores = Some(b"broken".to_vec());
+        s.delete_fails = true;
+    }
+    let o = copy(&f, FILE, "/org/b.md");
+    assert_eq!(code(&o), 9, "{o:?}");
+    let said = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(said.contains("DAMAGE POSSIBLE"), "{said}");
+    assert_eq!(f.get("/org/b.md").unwrap(), b"broken");
+    assert_eq!(last_log(&f)[1], "not-restored");
+}
+
+#[test]
+fn with_no_answer_one_look_at_the_target_tells() {
+    // The copy was made: done, exit 0, with one more get_metadata.
+    let f = Fake::new();
+    f.put(FILE, b"source\n");
+    f.state.lock().unwrap().copy_hangs_up = Some(true);
+    let o = copy(&f, FILE, "/org/b.md");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.state.lock().unwrap().metadata_calls, 2);
+    assert_eq!(last_log(&f)[1], "copied");
+    // The copy was not made: exit 1, and the task can try again.
+    f.state.lock().unwrap().copy_hangs_up = Some(false);
+    let o = copy(&f, FILE, "/org/c.md");
+    assert_eq!(code(&o), 1, "{o:?}");
+    let said = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        said.contains("is not there, so nothing was copied. Try again"),
+        "{said}"
+    );
+    assert_eq!(f.get("/org/c.md"), None);
+    assert_eq!(
+        code(&copy(&f, FILE, "/org/c.md")),
+        0,
+        "the second try works"
+    );
+    // Other bytes at the target after no answer are never removed.
+    {
+        let mut s = f.state.lock().unwrap();
+        s.copy_hangs_up = Some(true);
+        s.copy_stores = Some(b"other".to_vec());
+    }
+    let o = copy(&f, FILE, "/org/d.md");
+    assert_eq!(code(&o), 1, "{o:?}");
+    assert_eq!(f.get("/org/d.md").unwrap(), b"other");
+    assert!(f.state.lock().unwrap().deletes.is_empty());
+}
+
+#[test]
+fn on_a_server_the_name_decides_if_a_file_is_not_text() {
+    let f = Fake::new();
+    f.put("/org/notes/photo.jpg", &[0x89, b'P', b'N', b'G', 0]);
+    let o = copy(&f, "/org/notes/photo.jpg", "/org/notes/b.jpg");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert_eq!(last_log(&f)[1], "not-text");
+    let open = [("ORGTHREAD_BINARY_ALLOW", "org/pictures")];
+    let o = f.run_with_env(
+        &[
+            "copy",
+            "/org/notes/photo.jpg",
+            "/org/pictures/b.jpg",
+            "--who",
+            "chat",
+        ],
+        b"",
+        &open,
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    // The limit that the help names: with no extension, the name tells nothing.
+    f.put("/org/notes/photo", &[0x89, b'P', b'N', b'G', 0]);
+    assert_eq!(code(&copy(&f, "/org/notes/photo", "/org/notes/copy")), 0);
+    assert_eq!(f.state.lock().unwrap().downloads, 0);
+}
+
+#[test]
+fn the_limits_hold_for_both_ends_of_a_dropbox_copy() {
+    let f = Fake::new();
+    f.put(FILE, b"text\n");
+    f.put("/org/closed/c.md", b"text\n");
+    let deny = [("ORGTHREAD_DENY", "org/closed")];
+    let o = f.run_with_env(
+        &["copy", "/org/closed/c.md", "/org/b.md", "--who", "x"],
+        b"",
+        &deny,
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    let ro = [("ORGTHREAD_READ_ONLY", "org/closed")];
+    let o = f.run_with_env(&["copy", FILE, "/org/closed/d.md", "--who", "x"], b"", &ro);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert_eq!(f.state.lock().unwrap().copies.len(), 0);
+    assert_eq!(last_log(&f)[1], "not-allowed");
+}
+
+#[test]
+fn a_copy_and_a_write_of_one_target_share_one_lock() {
+    let f = Fake::new();
+    f.put(FILE, b"text\n");
+    let locks = f.dir.join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    fs::write(locks.join("org--b.md.lock"), "a writer\n").unwrap();
+    let o = copy(&f, FILE, "/org/b.md");
+    assert_eq!(code(&o), 3, "{o:?}");
+    assert_eq!(f.state.lock().unwrap().copies.len(), 0);
 }

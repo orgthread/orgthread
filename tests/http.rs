@@ -707,7 +707,7 @@ fn the_version_tool_of_the_remote_door_gives_no_secret() {
     let text = text_of(&r);
     let want = format!(
         "orgthread {}\ndoor: remote\nstorage: local folder\n\
-         tools: read, write, patch, delete, list, download, upload, version\n",
+         tools: read, write, patch, delete, copy, list, download, upload, version\n",
         orgthread::VERSION
     );
     assert_eq!(text, want);

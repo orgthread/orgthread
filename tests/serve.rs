@@ -128,7 +128,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_the_six_tools() {
+fn it_greets_and_offers_the_seven_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -144,9 +144,11 @@ fn it_greets_and_offers_the_six_tools() {
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["read", "write", "patch", "delete", "list", "version"]
+        [
+            "read", "write", "patch", "delete", "copy", "list", "version"
+        ]
     );
-    assert_eq!(tools[5]["inputSchema"]["properties"], json!({}));
+    assert_eq!(tools[6]["inputSchema"]["properties"], json!({}));
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
@@ -154,7 +156,17 @@ fn it_greets_and_offers_the_six_tools() {
     );
     assert_eq!(tools[2]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(tools[3]["inputSchema"]["required"], json!(["file", "who"]));
-    assert_eq!(tools[4]["inputSchema"]["required"], json!(["folders"]));
+    assert_eq!(tools[4]["inputSchema"]["required"], json!(["pairs", "who"]));
+    assert_eq!(
+        tools[4]["inputSchema"]["properties"]["pairs"]["maxItems"],
+        25
+    );
+    let says = tools[4]["description"].as_str().unwrap();
+    assert!(
+        says.contains("Up to 25 pairs in one call. For more, call again with the rest."),
+        "{says}"
+    );
+    assert_eq!(tools[5]["inputSchema"]["required"], json!(["folders"]));
 }
 
 #[test]
@@ -164,7 +176,7 @@ fn the_version_tool_names_the_build_the_door_the_storage_and_the_tools() {
     let (text, refused) = server.tool("version", json!({}));
     assert!(!refused, "{text}");
     let want = format!(
-        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, list, version\n",
+        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, copy, list, version\n",
         orgthread::VERSION
     );
     assert_eq!(text, want);
@@ -554,4 +566,116 @@ fn the_delete_tool_has_the_rules_of_the_command() {
         "{said}"
     );
     assert!(!place.file().exists());
+}
+
+fn pair(from: &str, to: &str) -> Value {
+    json!({"from": from, "to": to})
+}
+
+#[test]
+fn the_copy_tool_copies_each_pair_and_names_each_refusal() {
+    let place = Place::new();
+    fs::write(place.file(), "Grüße\n").unwrap();
+    fs::write(place.root.join("org/notes/taken.md"), "old\n").unwrap();
+    let file = place.f();
+    let new = place.root.join("org/new/deep/b.md");
+    let taken = place.root.join("org/notes/taken.md");
+    let mut server = place.serve();
+    let pairs = json!([
+        pair(&file, new.to_str().unwrap()),
+        pair(&file, taken.to_str().unwrap()),
+        {"from": file, "to": place.root.join("org/c.md").to_str().unwrap(), "fingerprint": fingerprint(b"other")},
+        pair(&file, place.root.join("org/d.md").to_str().unwrap()),
+    ]);
+    let (said, refused) = server.tool("copy", json!({"pairs": pairs, "who": "chat"}));
+    assert!(refused, "{said}");
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines[0], "exit code 5", "{said}");
+    let print = fingerprint("Grüße\n".as_bytes());
+    assert_eq!(
+        lines[1],
+        format!("copied: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}")
+    );
+    assert!(
+        lines[2].starts_with(&format!(
+            "{file} -> {}  refused, exit code 5: refused, nothing copied.",
+            taken.display()
+        )),
+        "{said}"
+    );
+    assert!(lines[3].contains("refused, exit code 4"), "{said}");
+    assert!(
+        lines[4].starts_with("copied: "),
+        "the pairs after a refusal still run: {said}"
+    );
+    assert_eq!(fs::read(&new).unwrap(), "Grüße\n".as_bytes());
+    assert_eq!(fs::read(&taken).unwrap(), b"old\n");
+    assert!(!place.root.join("org/c.md").exists());
+    let log = fs::read_to_string(place.log()).unwrap();
+    assert_eq!(log.lines().filter(|l| l.contains("\tcopied\t")).count(), 2);
+    assert_eq!(log.lines().count(), 4, "one log line per pair: {log}");
+}
+
+#[test]
+fn the_copy_tool_takes_25_pairs_and_refuses_26() {
+    let place = Place::new();
+    fs::write(place.file(), "text\n").unwrap();
+    let file = place.f();
+    let mut server = place.serve();
+    let pairs = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                pair(
+                    &file,
+                    place
+                        .root
+                        .join(format!("org/many/{i}.md"))
+                        .to_str()
+                        .unwrap(),
+                )
+            })
+            .collect()
+    };
+    let answer = server.ask(
+        "tools/call",
+        json!({"name": "copy", "arguments": {"pairs": pairs(26), "who": "chat"}}),
+    );
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    assert!(
+        !place.root.join("org/many").exists(),
+        "26 pairs copy nothing"
+    );
+    let (said, refused) = server.tool("copy", json!({"pairs": pairs(25), "who": "chat"}));
+    assert!(!refused, "{said}");
+    assert_eq!(said.lines().count(), 25);
+    assert_eq!(
+        fs::read_dir(place.root.join("org/many")).unwrap().count(),
+        25
+    );
+    // No pairs, a pair with no to, or no who: wrong use, and nothing copied.
+    for arguments in [
+        json!({"pairs": [], "who": "chat"}),
+        json!({"pairs": [{"from": file}], "who": "chat"}),
+        json!({"pairs": [pair(&file, "x")]}),
+        json!({"pairs": [pair(&file, "x"), {"from": file, "to": 7}], "who": "chat"}),
+    ] {
+        let answer = server.ask(
+            "tools/call",
+            json!({"name": "copy", "arguments": arguments}),
+        );
+        assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    }
+    assert!(!place.root.join("x").exists());
+}
+
+#[test]
+fn a_copy_path_named_like_an_option_stays_a_path() {
+    let place = Place::new();
+    fs::write(place.file(), "text\n").unwrap();
+    let mut server = place.serve();
+    let pairs = json!([pair(&place.f(), "--who")]);
+    let (said, refused) = server.tool("copy", json!({"pairs": pairs, "who": "chat"}));
+    // A plain name, made in the folder of the server, which is outside the root.
+    assert!(refused, "{said}");
+    assert!(said.contains("is outside the folder"), "{said}");
 }

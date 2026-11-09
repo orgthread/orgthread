@@ -10,7 +10,8 @@
 //! Between writers elsewhere, Dropbox's own version check decides.
 
 use crate::storage::{
-    Entry, Expect, Listing, LocalFolder, RemoveError, Removed, Revision, Storage, WriteError,
+    Copied, CopyError, Entry, Expect, Listing, LocalFolder, RemoveError, Removed, Revision,
+    Storage, WriteError,
 };
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -144,6 +145,65 @@ fn removed_of(status: u16, body: &[u8], want: &str) -> Result<Removed, Deleted> 
             }
         }
         _ => Err(Deleted::Error(format!("{status}"))),
+    }
+}
+
+/// What a path holds, from `get_metadata`.
+#[derive(Debug, PartialEq, Eq)]
+enum Look {
+    File {
+        hash: String,
+        size: u64,
+        rev: String,
+    },
+    /// A folder, or anything else that is not a plain file.
+    Folder,
+    Missing,
+}
+
+fn look_of(v: &Value) -> Look {
+    let text = |key: &str| v[key].as_str().unwrap_or_default().to_string();
+    match v[".tag"].as_str() {
+        Some("file") => Look::File {
+            hash: text("content_hash"),
+            size: v["size"].as_u64().unwrap_or_default(),
+            rev: text("rev"),
+        },
+        _ => Look::Folder,
+    }
+}
+
+/// What a 409 of `copy_v2` means, after the Dropbox docs of `RelocationError`:
+/// `to/conflict/...` when something is at the target, `from_lookup/not_found/...`
+/// with no source, and `from_lookup/not_file/...` for a source that is no file.
+/// `None` for any other error, which is a failure.
+fn copy_refusal(summary: &str) -> Option<CopyError> {
+    if summary.starts_with("to/conflict") {
+        Some(CopyError::Exists)
+    } else if summary.starts_with("from_lookup/not_found") {
+        Some(CopyError::Missing)
+    } else if summary.starts_with("from_lookup/not_file") {
+        Some(CopyError::Folder)
+    } else {
+        None
+    }
+}
+
+/// What a 200 of `copy_v2` made: `{"metadata": {...}}`, the file at the target.
+/// `None` for the hash when the answer gives none, and then the caller looks.
+fn made_of(body: &[u8]) -> Result<(Option<String>, u64, Option<String>), String> {
+    let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let meta = &v["metadata"];
+    match meta[".tag"].as_str() {
+        Some("file") => Ok((
+            meta["content_hash"].as_str().map(str::to_string),
+            meta["size"].as_u64().unwrap_or_default(),
+            meta["rev"]
+                .as_str()
+                .filter(|r| !r.is_empty())
+                .map(str::to_string),
+        )),
+        other => Err(other.unwrap_or("nothing").to_string()),
     }
 }
 
@@ -435,6 +495,53 @@ impl Dropbox {
         }
     }
 
+    /// What is at a path, from one `get_metadata` call.
+    fn look(&self, full: &str) -> io::Result<Look> {
+        let reply = self.rpc("get_metadata", &json!({ "path": full }))?;
+        match reply.status {
+            200 => {
+                let v: Value = serde_json::from_slice(&reply.body)?;
+                Ok(look_of(&v))
+            }
+            409 if summary(&reply.body).contains("not_found") => Ok(Look::Missing),
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    /// The copy call got no answer, so Dropbox may have made the copy or not.
+    /// One look at the target tells. Only the bytes of the source count as a copy:
+    /// other bytes may be an older file, so they are never removed here.
+    fn after_no_answer(
+        &self,
+        from: &str,
+        to: &str,
+        source: &str,
+        cause: io::Error,
+    ) -> Result<Copied, CopyError> {
+        let look = match self.look(to) {
+            Ok(look) => look,
+            Err(e) => {
+                return Err(CopyError::Io(failure(format!(
+                    "Dropbox gave no answer to the copy ({cause}), and the look at {to} failed too ({e}). Look at {to} before you try again"
+                ))));
+            }
+        };
+        match look {
+            Look::File { hash, size, rev } if hash == source => Ok(Copied {
+                source: source.to_string(),
+                target: hash,
+                size,
+                rev: (!rev.is_empty()).then_some(rev),
+            }),
+            Look::Missing => Err(CopyError::Io(failure(format!(
+                "Dropbox gave no answer to the copy ({cause}), and {to} is not there, so nothing was copied. Try again"
+            )))),
+            _ => Err(CopyError::Io(failure(format!(
+                "Dropbox gave no answer to the copy ({cause}), and {to} holds something other than {from}. It may be older than this copy, so nothing is removed. Look at {to}"
+            )))),
+        }
+    }
+
     fn delete(&self, full: &str, rev: Option<&str>) -> io::Result<bool> {
         let arg = match rev {
             Some(rev) => json!({ "path": full, "parent_rev": rev }),
@@ -592,6 +699,66 @@ impl Storage for Dropbox {
             }
             Err(Deleted::Unexpected(reason)) => Err(RemoveError::Unexpected { reason }),
             Err(Deleted::Error(_)) => Err(RemoveError::Io(refused(&reply))),
+        }
+    }
+
+    /// Two calls: `get_metadata` of the source, then `copy_v2`, which copies
+    /// inside Dropbox, so no byte passes this server. `autorename: false`: a
+    /// target that exists is a refusal, never a renamed copy. The hash in the
+    /// answer is the check, as Dropbox makes it from the stored file.
+    fn copy(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Copied, CopyError> {
+        let (source, target) = (Self::file(from), Self::file(to));
+        let hash = match self.look(&source)? {
+            Look::File { hash, .. } if !hash.is_empty() => hash,
+            Look::File { .. } => {
+                return Err(CopyError::Io(failure(format!(
+                    "Dropbox gave no hash for {source}"
+                ))));
+            }
+            Look::Folder => return Err(CopyError::Folder),
+            Look::Missing => return Err(CopyError::Missing),
+        };
+        if let Some(want) = expect
+            && want != hash
+        {
+            return Err(CopyError::Changed { found: hash });
+        }
+        let arg = json!({ "from_path": source, "to_path": target, "autorename": false });
+        let reply = match self.rpc("copy_v2", &arg) {
+            Ok(reply) => reply,
+            Err(cause) => return self.after_no_answer(&source, &target, &hash, cause),
+        };
+        match reply.status {
+            200 => match made_of(&reply.body) {
+                Ok((Some(made), size, rev)) => Ok(Copied {
+                    source: hash,
+                    target: made,
+                    size,
+                    rev,
+                }),
+                // No hash in the answer: one look gives it.
+                Ok((None, size, rev)) => match self.look(&target)? {
+                    Look::File { hash: made, .. } => Ok(Copied {
+                        source: hash,
+                        target: made,
+                        size,
+                        rev,
+                    }),
+                    _ => Err(CopyError::Unexpected {
+                        reason: format!(
+                            "Dropbox reported a copy at {target}, but a look finds no file there"
+                        ),
+                    }),
+                },
+                Err(kind) => Err(CopyError::Unexpected {
+                    reason: format!(
+                        "Dropbox copied {source}, but reports {kind} at {target}, not a file"
+                    ),
+                }),
+            },
+            409 => Err(copy_refusal(&summary(&reply.body))
+                .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
+            _ => Err(CopyError::Io(refused(&reply))),
         }
     }
 
@@ -856,6 +1023,38 @@ mod tests {
             Err(Deleted::Error(_))
         ));
         assert!(matches!(removed_of(500, b"", "aa"), Err(Deleted::Error(_))));
+    }
+
+    #[test]
+    fn the_refusals_of_copy_follow_the_dropbox_error_tags() {
+        let is = |text: &str, want: &str| {
+            let got = format!("{:?}", copy_refusal(text));
+            assert!(got.contains(want), "{text}: {got}");
+        };
+        is("to/conflict/file/..", "Exists");
+        is("to/conflict/folder/...", "Exists");
+        is("to/conflict/file_ancestor/..", "Exists");
+        is("from_lookup/not_found/..", "Missing");
+        is("from_lookup/not_file/..", "Folder");
+        // A missing source is not a target conflict, and the other way round.
+        is("to/no_write_permission/..", "None");
+        is("from_write/conflict/..", "None");
+        is("too_many_write_operations/..", "None");
+        is("insufficient_quota/..", "None");
+    }
+
+    #[test]
+    fn a_copy_answer_gives_the_hash_size_and_rev_of_a_file() {
+        let body = br#"{"metadata":{".tag":"file","name":"b.md","size":12,"rev":"015f","content_hash":"aa"}}"#;
+        assert_eq!(
+            made_of(body),
+            Ok((Some("aa".into()), 12, Some("015f".into())))
+        );
+        let no_hash = br#"{"metadata":{".tag":"file","name":"b.md","size":12,"rev":"015f"}}"#;
+        assert_eq!(made_of(no_hash), Ok((None, 12, Some("015f".into()))));
+        let folder = br#"{"metadata":{".tag":"folder","name":"b"}}"#;
+        assert_eq!(made_of(folder), Err("folder".into()));
+        assert_eq!(made_of(b"not json"), Err("nothing".into()));
     }
 
     #[test]

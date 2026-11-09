@@ -9,6 +9,7 @@ pub const VERSION: &str = concat!(
     ")"
 );
 
+pub mod copy;
 pub mod delete;
 pub mod dropbox;
 pub mod fingerprint;

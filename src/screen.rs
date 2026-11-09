@@ -98,7 +98,7 @@ impl Choice {
 }
 
 fn color_of(outcome: &str) -> Color {
-    if watch::is_written(outcome) {
+    if watch::is_written(outcome) || outcome == "copied" {
         BLUE
     } else {
         ORANGE
@@ -163,6 +163,9 @@ fn details(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         ("Before", "After")
     };
     let mut lines = labelled("File", &entry.path, width);
+    if let Some(from) = &entry.copy_from {
+        lines.extend(labelled("From", from, width));
+    }
     lines.extend(labelled("Who", &entry.who, width));
     let time = format!("{} ({} ago)", entry.time, watch::ago(&entry.time));
     lines.extend(labelled("Time", &time, width));

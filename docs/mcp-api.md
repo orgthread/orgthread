@@ -19,6 +19,8 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one as for the read |
 | | `expect` | Optional: the fingerprint of the version to delete, for example from `list` with `fingerprint`. Needed when this name has not read the file |
 | | `check` | Optional: `true` only checks the rules and the version, and deletes nothing. The default is `false` |
+| `copy` | `pairs` | A list of 1 to 25 pairs. Each pair has `from`, the full path of the source, and `to`, the full path of the new file. An optional `fingerprint` is the version the source must have |
+| | `who` | The name of this chat, the same one each time |
 | `list` | `folders` | A list of full paths of folders, at least one |
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
@@ -29,7 +31,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one each time |
 | `version` | | No fields |
 
-The fields of `read` and `write` are all required, and `file` and `who` of `patch` and `delete`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
+The fields of `read` and `write` are all required, `file` and `who` of `patch` and `delete`, and `pairs` and `who` of `copy`, with `from` and `to` in each pair. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
 
 `read` gives the exact text of the file, and notes what this name read.
 
@@ -89,6 +91,25 @@ deleted: notes/old-plan.md, 17 bytes. The last version is kept.
 
 With Dropbox, the answer ends with `Dropbox keeps it in Deleted files, rev <rev>.` in place of the last sentence.
 
+`copy` makes new files with the exact bytes of their sources, one pair at a time, in the order given:
+
+- Up to 25 pairs in one call. For more, call again with the rest. 26 pairs are wrong use: a JSON-RPC error with the code -32602, and nothing is copied. The same holds for a pair with no `from` or `to`.
+- It never replaces a file. If anything is at `to`, a file or a folder, that pair is refused with code 5.
+- It makes the missing folders of `to`.
+- The source must be open to read, and `to` open to write, as for `read` and `write`. A file that is not text may go only to the folders that the owner allowed. On the server, only the names tell this, as for `upload`: a picture whose name has no extension passes. The local door also reads the bytes.
+- With `fingerprint`, a source of another version is refused with code 4. Without it, the copy takes the source as it is.
+- After the copy, the fingerprint of the new file must be the one of the source. If not, the copy is removed again, code 7, or 9 if the removal fails.
+- With Dropbox, the copy is made inside Dropbox, in two web calls per pair: one look at the source, and the copy. No byte passes the server. If Dropbox gives no answer, one more look at `to` tells whether the copy is there. If something other than the source is there, it is never removed, as it may be older than the copy.
+- Each pair gives one line: `copied:`, the source, the new name, the size and the fingerprint, or `refused, exit code N:` and the reason. The pairs that passed stay copied, and the next pairs still run. With a refusal, the text starts with `exit code N` of the first pair that failed.
+
+```
+exit code 5
+copied: notes/plan.md -> archive/2026/plan.md, 17 bytes, 4c79418b76038c58388a702c49afa45be960cf0b6430a2461fd57450b6647f62
+/tmp/claude/example-copy/root/notes/plan.md -> /tmp/claude/example-copy/root/notes/taken.md  refused, exit code 5: refused, nothing copied. notes/taken.md exists, and a copy never replaces a file. Name a new copy.
+```
+
+The log line of a copy has 8 fields: the time, `copied`, the new name, the name of the chat, `-`, the fingerprint, the size, and the source with a `/` at its start, for example `/notes/plan.md`. A refused copy has the same 8th field, so `orgthread watch` names it as a copy, never as a delete.
+
 `download` and `upload` give one line for each file, in the order given. A line that works gives the path, for a download the size, and the link last. A file that is refused gets `refused, exit code N:` and the reason, and the others still get their links. With a refusal, the text starts with `exit code N` of the first file that failed. Use each link at once in the code sandbox, and never show, store or log it:
 
 ```
@@ -106,7 +127,7 @@ curl -sS -T p088-1.jpg '<link>'
 orgthread 0.2.5 (abc1234)
 door: remote
 storage: Dropbox
-tools: read, write, patch, delete, list, download, upload, version
+tools: read, write, patch, delete, copy, list, download, upload, version
 ```
 
 - The first line is the same as `orgthread --version`. A `+` after the commit means that the build had changes not yet committed.

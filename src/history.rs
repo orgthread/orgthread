@@ -542,6 +542,7 @@ pub mod tests {
             after: after.into(),
             size: String::new(),
             delete: false,
+            copy_from: None,
         }
     }
 

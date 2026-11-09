@@ -1,4 +1,5 @@
 use jiff::tz::TimeZone;
+use orgthread::copy;
 use orgthread::delete;
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::{Fingerprinter, fingerprint};
@@ -35,6 +36,7 @@ For an agent:
                                                  any file, also not text, as exact bytes
   orgthread upload <file> --who <name>           < any file, with the rules of write
   orgthread delete <file> --who <name>           one file, only the version this name saw
+  orgthread copy <file> <new> --who <name>       one file to a new name, never over a file
 
 Give the same name each time. To change a file, read it first. A new file needs
 no read. orgthread remembers what each name read, and it refuses a write when
@@ -42,7 +44,7 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read, write, patch, delete and list, as MCP tools,
+  orgthread serve                                the same read, write, patch, delete, copy and list, as MCP tools,
                                                  and version: the build, the door, the storage, the tools
   orgthread serve --http <address>               also download and upload, through one-time links
 
@@ -83,6 +85,18 @@ one this name read, or --expect <fingerprint>, for example from list
 refused as changed, code 4, and deletes nothing. The way back: a local folder keeps the last
 version in ORGTHREAD_VERSIONS, and Dropbox keeps the file in Deleted files, with
 its rev in the log. With --check, it only checks the rules and the version.
+
+copy makes a new file with the exact bytes of one file, in the same storage.
+With Dropbox the copy is made inside Dropbox, and no byte passes this program.
+If anything is at the new name, it is refused, code 5, and nothing is replaced.
+Missing folders of the new name are made. The source must be open to read, the
+new name open to write. A file that is not text may go only to the folders of
+ORGTHREAD_BINARY_ALLOW: with Dropbox only the names tell this, so a picture
+with no extension, such as a name with no dot, passes; a local folder also reads
+the bytes. --fingerprint <hash> refuses a source of any other version, code 4.
+After the copy, the fingerprint of the new file must be the one of the source.
+If not, the copy is removed again, code 7, or 9 if that fails. The log line
+copied has the source as its 8th field.
 
 Settings, from the environment:
   A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
@@ -183,6 +197,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("download") => cmd_download(&args[1..]),
         Some("upload") => cmd_upload(&args[1..]),
         Some("delete") => cmd_delete(&args[1..]),
+        Some("copy") => cmd_copy(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("password-hash") => {
@@ -550,6 +565,45 @@ impl Settings {
             return Err(format!("{file} is not a file"));
         }
         Ok(path)
+    }
+}
+
+impl Settings {
+    /// The new name of a copy, from the root. Its folders may not exist yet, as
+    /// the copy makes them. Locally the part that exists is followed as for any
+    /// path, and each new part must be a plain name, never `..`.
+    fn target_of(&self, file: &str) -> Result<String, String> {
+        if self.dropbox {
+            return self.path_of(file);
+        }
+        let mut base = PathBuf::from(file);
+        let mut new_parts = Vec::new();
+        while fs::symlink_metadata(&base).is_err() {
+            let name = base
+                .file_name()
+                .ok_or_else(|| format!("{file} names no file"))?
+                .to_owned();
+            new_parts.push(name);
+            base = match base.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+        }
+        if new_parts.is_empty() {
+            return path_in_root(file, &self.root);
+        }
+        let mut real =
+            fs::canonicalize(&base).map_err(|e| format!("could not find {file}: {e}"))?;
+        for part in new_parts.iter().rev() {
+            real.push(part);
+        }
+        let inside = real
+            .strip_prefix(&self.root)
+            .map_err(|_| format!("{file} is outside the folder {}", self.root.display()))?;
+        inside
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("the path of {file} is not valid UTF-8"))
     }
 }
 
@@ -1065,6 +1119,121 @@ fn cmd_delete(args: &[String]) -> Result<i32, String> {
         say(format!(
             "the log line failed, {}: {e}. The line: {line}",
             settings.log.display()
+        ));
+    }
+    Ok(report.exit_code(logged.is_ok()))
+}
+
+/// One file to a new name. The steps live in `copy.rs`.
+fn cmd_copy(args: &[String]) -> Result<i32, String> {
+    let mut names = Vec::new();
+    let mut who = None;
+    let mut expect = None;
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--who" => who = Some(words.next().ok_or("--who needs a name")?.clone()),
+            "--fingerprint" => {
+                expect = Some(
+                    words
+                        .next()
+                        .ok_or("--fingerprint needs the fingerprint of the source")?
+                        .clone(),
+                );
+            }
+            // After --, each word is a path, also one that starts with --.
+            "--" => names.extend(words.by_ref().cloned()),
+            other if other.starts_with("--") => return Err(format!("there is no option {other}")),
+            other => names.push(other.to_string()),
+        }
+    }
+    let [from, to] = names.as_slice() else {
+        return Err("copy takes two files: the source, then the new name".into());
+    };
+    let who = checked_who(who)?;
+    let settings = Settings::load()?;
+    let from = settings.path_of(from)?;
+    let to = settings.target_of(to)?;
+    let now = log::utc_now();
+    let refuse = |outcome: copy::Outcome| {
+        say(copy::message(&from, &to, &outcome));
+        let line = copy::log_line(&now, &from, &to, &who, &outcome);
+        if let Err(e) = log::append(&settings.log, &line) {
+            say(format!(
+                "the log line failed, {}: {e}. The line: {line}",
+                settings.log.display()
+            ));
+        }
+        Ok(outcome.code())
+    };
+    // The source must be open for reading, the target for writing.
+    let limits = settings
+        .limits(&from, false)
+        .and_then(|()| settings.limits(&to, true));
+    if let Err(reason) = limits {
+        return refuse(copy::Outcome::NotAllowed { reason });
+    }
+    if !transfer::binary_allowed(&to) {
+        // On a server, only the names count, as for upload --check: no byte of
+        // the source passes this server. A local door also reads the real bytes.
+        let binary = if transfer::named_binary(&to) || transfer::named_binary(&from) {
+            true
+        } else if settings.dropbox {
+            false
+        } else {
+            match fs::read(settings.root.join(&from)) {
+                Ok(bytes) => std::str::from_utf8(&bytes).is_err() || bytes.contains(&0),
+                Err(_) => false,
+            }
+        };
+        if binary {
+            return refuse(copy::Outcome::NotText {
+                reason: format!(
+                    "{from} is not text, or has the name of a file that is not text, and such a file may go only to the folders of {}.",
+                    transfer::BINARY_ALLOW
+                ),
+            });
+        }
+    }
+    let storage = settings.storage()?;
+    let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
+    let Some(stop) = arm_stop() else {
+        return Ok(exit::FAILED);
+    };
+    let report = copy::copy(
+        storage.as_ref(),
+        &from,
+        &to,
+        expect.as_deref(),
+        &lock_line,
+        &stop,
+    );
+    let line = copy::log_line(&now, &from, &to, &who, &report.outcome);
+    let logged = log::append(&settings.log, &line);
+    let text = copy::message(&from, &to, &report.outcome);
+    match report.outcome {
+        copy::Outcome::Copied { .. } => println!("{text}"),
+        _ => say(text),
+    }
+    if let Some(old) = &report.took_over {
+        say(format!(
+            "a writer that stopped over 15 minutes ago was cleared first: {old}"
+        ));
+    }
+    if let Some(other) = &report.lock_lost {
+        say(format!(
+            "another writer may have been at work during this copy. Check {to}. That writer: {other}"
+        ));
+    }
+    if let Err(e) = &logged {
+        say(format!(
+            "the log line failed, {}: {e}. The line: {line}",
+            settings.log.display()
+        ));
+    }
+    if let Some(reason) = &report.lock_left {
+        say(format!(
+            "the copy is made, but orgthread's clean-up did not finish: {reason}. There is nothing to do: {to} is free again within 15 minutes."
         ));
     }
     Ok(report.exit_code(logged.is_ok()))

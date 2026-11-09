@@ -24,6 +24,9 @@ pub struct Entry {
     pub size: String,
     /// The line comes from a delete: a `deleted`, or a refusal with the mark.
     pub delete: bool,
+    /// The line comes from a copy: its 8th field, the source, starts with `/`.
+    /// This is the source, with no `/` at its start.
+    pub copy_from: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,8 +49,9 @@ pub struct Snapshot {
     pub problems: Vec<String>,
 }
 
-/// One log line, or `None` when it does not have the seven fields. An 8th field,
-/// such as the rev of a delete, is not shown here.
+/// One log line, or `None` when it does not have the seven fields. An 8th field
+/// is the rev of a delete, the mark of a refused delete, or the source of a copy,
+/// which starts with `/`.
 pub fn parse_line(line: &str) -> Option<Entry> {
     let f: Vec<&str> = line.split('\t').collect();
     let (eighth, &[time, outcome, path, who, before, after, size, ..]) = (f.get(7), &f[..]) else {
@@ -56,7 +60,11 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     if f.len() > 8 {
         return None;
     }
-    let delete = outcome == "deleted" || eighth == Some(&crate::delete::REFUSED_MARK);
+    let copy_from = eighth
+        .and_then(|field| field.strip_prefix('/'))
+        .map(str::to_string);
+    let delete = copy_from.is_none()
+        && (outcome == "deleted" || eighth == Some(&crate::delete::REFUSED_MARK));
     let clean = |v: &str| {
         if v == "-" {
             String::new()
@@ -73,6 +81,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
         after: clean(after),
         size: clean(size),
         delete,
+        copy_from,
     })
 }
 
@@ -182,9 +191,11 @@ pub fn is_written(outcome: &str) -> bool {
     outcome == "written" || outcome == "patched"
 }
 
-/// The reason in plain words, for this entry: a delete has its own texts.
+/// The reason in plain words, for this entry: a delete and a copy have their own texts.
 pub fn why_of(entry: &Entry) -> &'static str {
-    if entry.delete {
+    if entry.copy_from.is_some() {
+        why_copy(&entry.outcome)
+    } else if entry.delete {
         why_delete(&entry.outcome)
     } else {
         why(&entry.outcome)
@@ -209,6 +220,28 @@ pub fn why_delete(outcome: &str) -> &'static str {
     }
 }
 
+/// The reason of a copy line in plain words.
+pub fn why_copy(outcome: &str) -> &'static str {
+    match outcome {
+        "copied" => why("copied"),
+        "exists" => "A file or folder is at the new name already. Nothing was copied.",
+        "missing" => "There is no such source. Nothing was copied.",
+        "folder" => "The source is a folder, and only a file is copied. Nothing was copied.",
+        "changed" => "The source is not the version that was expected. Nothing was copied.",
+        "not-allowed" => "The source or the new name is closed to this door. Nothing was copied.",
+        "not-text" => {
+            "The source is not text, and the new name is outside the folders open for such files. Nothing was copied."
+        }
+        "locked" => "Another writer held the lock of the new name. Nothing was copied.",
+        "restored" => "The copy differed from the source, and it was removed again.",
+        "not-restored" => {
+            "The copy differed from the source, and it could not be removed. Look at this file now."
+        }
+        "failed" => "The copy failed. Nothing was copied, unless the message says otherwise.",
+        _ => "This outcome is not known to this version.",
+    }
+}
+
 /// The reason in plain words.
 pub fn why(outcome: &str) -> &'static str {
     match outcome {
@@ -227,6 +260,7 @@ pub fn why(outcome: &str) -> &'static str {
         "not-restored" => "The check failed and the old state is NOT back. Look at this file now.",
         "failed" => "The write failed, and the file is unchanged.",
         "downloaded" => "This chat got the exact bytes of the file. Nothing was written.",
+        "copied" => "A new file was made with the exact bytes of the source.",
         "deleted" => {
             "The file was deleted. Dropbox keeps it in Deleted files, or the last version is kept beside the program."
         }
@@ -495,6 +529,54 @@ mod tests {
         for word in ["not-read", "missing", "folder", "locked", "failed"] {
             assert!(why_delete(word).contains("delete"), "{word}");
         }
+    }
+
+    #[test]
+    fn a_copy_line_is_never_a_delete_also_with_a_source_named_delete() {
+        let line = "2026-11-09 11:55:02Z\tcopied\torg/b.md\tchat\t-\taa\t12\t/org/a.md";
+        let e = parse_line(line).unwrap();
+        assert_eq!(e.copy_from.as_deref(), Some("org/a.md"));
+        assert!(!e.delete);
+        assert_eq!(why_of(&e), why("copied"));
+        assert!(!is_written(&e.outcome), "a copy has no diff to show");
+        // A source named delete, refused or copied, stays a copy.
+        for word in [
+            "copied",
+            "exists",
+            "missing",
+            "changed",
+            "not-allowed",
+            "failed",
+        ] {
+            let line = format!("T\t{word}\torg/b.md\tchat\t-\t-\t-\t/delete");
+            let e = parse_line(&line).unwrap();
+            assert!(!e.delete, "{word}");
+            assert_eq!(e.copy_from.as_deref(), Some("delete"));
+            assert!(!why_of(&e).contains("deleted"), "{word}: {}", why_of(&e));
+        }
+        // Every refusal word of a copy has a copy text.
+        for word in [
+            "exists",
+            "missing",
+            "folder",
+            "changed",
+            "not-allowed",
+            "not-text",
+            "locked",
+        ] {
+            assert!(why_copy(word).ends_with("Nothing was copied."), "{word}");
+        }
+        // The delete lines stay delete lines.
+        assert!(
+            parse_line("T\tmissing\torg/a.md\tchat\t-\t-\t-\tdelete")
+                .unwrap()
+                .delete
+        );
+        assert!(
+            parse_line("T\tdeleted\torg/a.md\tchat\taa\t-\t12\t015f")
+                .unwrap()
+                .delete
+        );
     }
 
     #[test]

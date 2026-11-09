@@ -366,6 +366,41 @@ fn tools(remote: bool) -> Value {
             },
         },
         {
+            "name": "copy",
+            "description": "Copies files to new names, with their exact bytes, in the same \
+                storage. Each pair names a source, from, and a new name, to. Up to 25 pairs in \
+                one call. For more, call again with the rest. A copy never replaces a file: if \
+                anything is at the new name, that pair is refused as existing. Missing \
+                folders of the new name are made. The rules of read hold for the source and \
+                the rules of write for the new name. A file that is not text may go only to \
+                the folders that the owner allowed; on a server only the names tell this. With \
+                fingerprint, from list with fingerprint, a source of another version is \
+                refused as changed. Each pair gives one line: copied, with the size and \
+                the fingerprint, or refused with its exit code and the reason. The pairs that \
+                passed stay copied.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pairs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_FILES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string", "description": "The full path of the source. On a server, from the root of the Dropbox: /org/a.md"},
+                                "to": {"type": "string", "description": "The full path of the new file, which must not exist yet"},
+                                "fingerprint": {"type": "string", "description": "Only when the source must be one version: its fingerprint"},
+                            },
+                            "required": ["from", "to"],
+                        },
+                    },
+                    "who": who,
+                },
+                "required": ["pairs", "who"],
+            },
+        },
+        {
             "name": "list",
             "description": "Lists the files and folders in one or more folders: one group per \
                 folder, and per entry its size in bytes, its time and its name. A folder name \
@@ -632,6 +667,7 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
             args.push(text_of("file")?);
             return Ok(result(name, start(exe, &args, None)));
         }
+        Some("copy") => return copy_pairs(params, exe),
         Some("list") => {
             let owned = list_args(params)?;
             let args: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -645,6 +681,73 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
         }
     };
     Ok(result(name, start(exe, &args, text)))
+}
+
+/// One `orgthread copy` for each pair, in order. A pair that is refused gets its
+/// line with the exit code, and the next pairs still run. The answer starts with
+/// the code of the first pair that failed.
+fn copy_pairs(params: &Value, exe: &Path) -> Result<Value, (i32, String)> {
+    let wrong = |what: &str| (INVALID_PARAMS, format!("copy needs {what}"));
+    let arguments = &params["arguments"];
+    let who = arguments["who"]
+        .as_str()
+        .ok_or_else(|| wrong("who, as text"))?;
+    let pairs = arguments["pairs"]
+        .as_array()
+        .filter(|p| (1..=MAX_FILES).contains(&p.len()))
+        .ok_or_else(|| wrong("pairs, as a list of 1 to 25 pairs of from and to"))?;
+    // Every pair is checked before the first copy, so wrong use copies nothing.
+    let mut runs = Vec::new();
+    for pair in pairs {
+        let from = pair["from"]
+            .as_str()
+            .ok_or_else(|| wrong("from in each pair, as text"))?;
+        let to = pair["to"]
+            .as_str()
+            .ok_or_else(|| wrong("to in each pair, as text"))?;
+        let print = match &pair["fingerprint"] {
+            Value::Null => None,
+            Value::String(print) => Some(print.as_str()),
+            _ => return Err(wrong("fingerprint, as text")),
+        };
+        runs.push((from, to, print));
+    }
+    let mut lines = Vec::new();
+    let mut first_failed = None;
+    for (from, to, print) in runs {
+        let mut args = vec!["copy", "--who", who];
+        if let Some(print) = print {
+            args.extend(["--fingerprint", print]);
+        }
+        // The paths come after --, so a path named like an option stays a path.
+        args.extend(["--", from, to]);
+        let line = match start(exe, &args, None) {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+            }
+            Ok(out) => {
+                let code = out.status.code().unwrap_or(exit::FAILED);
+                first_failed.get_or_insert(code);
+                let said = String::from_utf8_lossy(&out.stderr);
+                let reason = said.lines().next().unwrap_or("");
+                let reason = reason.strip_prefix("orgthread: ").unwrap_or(reason);
+                format!("{from} -> {to}  refused, exit code {code}: {reason}")
+            }
+            Err(e) => {
+                first_failed.get_or_insert(exit::FAILED);
+                format!(
+                    "{from} -> {to}  refused, exit code {}: could not start the command: {e}",
+                    exit::FAILED
+                )
+            }
+        };
+        lines.push(line);
+    }
+    let mut text = lines.join("\n") + "\n";
+    if let Some(code) = first_failed {
+        text = format!("exit code {code}\n{text}");
+    }
+    Ok(json!({"content": [{"type": "text", "text": text}], "isError": first_failed.is_some()}))
 }
 
 /// The command line of a list. The folders come after `--`, so a folder named
