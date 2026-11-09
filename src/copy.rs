@@ -11,7 +11,7 @@ use crate::write::{self, Gate, exit};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Copied {
         print: String,
@@ -519,6 +519,13 @@ mod tests {
             log_line("T", "delete", "org/b.md", "chat", &Outcome::Missing),
             "T\tmissing\torg/b.md\tchat\t-\t-\t-\t/delete"
         );
+        // What watch makes of it: a copy, never a delete, copied or refused.
+        for outcome in [copied.clone(), Outcome::Missing, Outcome::Exists] {
+            let line = log_line("2026-11-09 10:00:00Z", "delete", "b", "chat", &outcome);
+            let entry = crate::watch::parse_line(&line).unwrap();
+            assert!(!entry.delete, "{line}");
+            assert_eq!(entry.copy_from.as_deref(), Some("delete"));
+        }
         let changed = Outcome::Changed {
             expected: "aa".into(),
             found: "bb".into(),

@@ -63,8 +63,8 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     let copy_from = eighth
         .and_then(|field| field.strip_prefix('/'))
         .map(str::to_string);
-    let delete = copy_from.is_none()
-        && (outcome == "deleted" || eighth == Some(&crate::delete::REFUSED_MARK));
+    // A copy line has a `/` at the start of its 8th field, so it never matches.
+    let delete = outcome == "deleted" || eighth == Some(&crate::delete::REFUSED_MARK);
     let clean = |v: &str| {
         if v == "-" {
             String::new()
