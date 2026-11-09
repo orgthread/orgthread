@@ -22,6 +22,18 @@ pub fn allowed(path: &str, allow: &str) -> bool {
     allow.split(',').any(|rule| is_under(path, rule.trim()))
 }
 
+/// `None` when `allow` lets this path be deleted, else the refusal.
+pub fn gate(path: &str, allow: &str) -> Option<Outcome> {
+    if allowed(path, allow) {
+        return None;
+    }
+    let empty = allow.split(',').all(|rule| rule.trim().is_empty());
+    Some(Outcome::NotAllowed { empty })
+}
+
+/// The 8th field of a refused delete, so `watch` tells it from a refused write.
+pub const REFUSED_MARK: &str = "delete";
+
 /// Where the fingerprint of a delete comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Known {
@@ -84,6 +96,11 @@ pub enum Outcome {
     },
     /// The path names a folder, which is never deleted.
     Folder,
+    /// The path is outside the folders of `ORGTHREAD_DELETE_ALLOW`. `empty`: the
+    /// setting names no folder at all.
+    NotAllowed {
+        empty: bool,
+    },
     Locked {
         holder: String,
         age: Duration,
@@ -103,7 +120,7 @@ impl Outcome {
             Outcome::Deleted { .. } | Outcome::Checked { .. } => exit::WRITTEN,
             Outcome::NotKnown | Outcome::Changed { .. } => exit::CHANGED,
             Outcome::Missing { .. } => exit::MISSING,
-            Outcome::Folder => exit::USAGE,
+            Outcome::Folder | Outcome::NotAllowed { .. } => exit::USAGE,
             Outcome::Locked { .. } => exit::LOCKED,
             Outcome::Unexpected { .. } => exit::NOT_RESTORED,
             Outcome::Failed { .. } => exit::FAILED,
@@ -119,6 +136,7 @@ impl Outcome {
             Outcome::Changed { .. } => "changed",
             Outcome::Missing { .. } => "missing",
             Outcome::Folder => "folder",
+            Outcome::NotAllowed { .. } => "not-allowed",
             Outcome::Locked { .. } => "locked",
             Outcome::Unexpected { .. } => "not-restored",
             Outcome::Failed { .. } => "failed",
@@ -294,8 +312,8 @@ pub fn delete(
 }
 
 /// The log line: time, word, path, who, fingerprint before, `-` after, size, and
-/// on a delete the rev as the 8th field. A refusal for a changed file logs what
-/// was expected and what was found, as a write does.
+/// an 8th field: on a delete the rev, on a refusal the word `delete`. A refusal
+/// for a changed file logs what was expected and what was found, as a write does.
 pub fn log_line(now: &str, path: &str, who: &str, outcome: &Outcome) -> String {
     let fields: Vec<String> = match outcome {
         Outcome::Deleted { print, size, rev } => vec![
@@ -305,10 +323,25 @@ pub fn log_line(now: &str, path: &str, who: &str, outcome: &Outcome) -> String {
             rev.clone().unwrap_or_default(),
         ],
         Outcome::Changed { expected, found } => {
-            vec![expected.clone(), found.clone(), String::new()]
+            vec![
+                expected.clone(),
+                found.clone(),
+                String::new(),
+                REFUSED_MARK.into(),
+            ]
         }
-        Outcome::Missing { expected } => vec![expected.clone(), String::new(), String::new()],
-        _ => vec![String::new(), String::new(), String::new()],
+        Outcome::Missing { expected } => vec![
+            expected.clone(),
+            String::new(),
+            String::new(),
+            REFUSED_MARK.into(),
+        ],
+        _ => vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            REFUSED_MARK.into(),
+        ],
     };
     let mut all = vec![now, outcome.word(), path, who];
     all.extend(fields.iter().map(String::as_str));
@@ -338,6 +371,12 @@ pub fn message(path: &str, who: &str, outcome: &Outcome) -> String {
         Outcome::Folder => {
             format!("refused, nothing deleted. {path} is a folder, and only a file is deleted.")
         }
+        Outcome::NotAllowed { empty: true } => format!(
+            "refused, nothing deleted. No folder is open for deletes yet: {DELETE_ALLOW} is empty, so every delete is refused. The owner names the folders there, separated by commas. {path} stays."
+        ),
+        Outcome::NotAllowed { empty: false } => format!(
+            "refused, nothing deleted. {path} is outside the folders of {DELETE_ALLOW}. Only the owner can change that setting."
+        ),
         Outcome::Locked { holder, age } => format!(
             "refused, nothing deleted. {path} is busy since {} s with another writer: {holder}. Try again in a moment.",
             age.as_secs()
@@ -376,6 +415,17 @@ mod tests {
         assert!(allowed("org/notes/a.md", "other, /org/notes/"));
         assert!(!allowed("org/notes-old/a.md", "org/notes"));
         assert!(!allowed("org/a.md", "org/notes"));
+        assert_eq!(
+            gate("org/a.md", " , "),
+            Some(Outcome::NotAllowed { empty: true })
+        );
+        assert_eq!(
+            gate("org/a.md", "org/notes"),
+            Some(Outcome::NotAllowed { empty: false })
+        );
+        assert_eq!(gate("org/notes/a.md", "org/notes"), None);
+        let refused = log_line("T", "org/a.md", "x", &Outcome::NotAllowed { empty: true });
+        assert_eq!(refused, "T\tnot-allowed\torg/a.md\tx\t-\t-\t-\tdelete");
     }
 
     #[test]
@@ -537,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn the_log_line_has_the_rev_as_its_eighth_field() {
+    fn the_log_line_has_the_rev_or_the_mark_as_its_eighth_field() {
         let deleted = Outcome::Deleted {
             print: "aa".into(),
             size: 12,
@@ -558,7 +608,7 @@ mod tests {
         );
         assert_eq!(
             log_line("T", "org/a.md", "chat", &Outcome::NotKnown),
-            "T\tnot-read\torg/a.md\tchat\t-\t-\t-"
+            "T\tnot-read\torg/a.md\tchat\t-\t-\t-\tdelete"
         );
     }
 }

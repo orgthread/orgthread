@@ -167,7 +167,7 @@ fn details(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let time = format!("{} ({} ago)", entry.time, watch::ago(&entry.time));
     lines.extend(labelled("Time", &time, width));
     let color = Style::new().fg(color_of(&entry.outcome));
-    lines.extend(plain(watch::why(&entry.outcome), width, color));
+    lines.extend(plain(watch::why_of(entry), width, color));
     if !entry.before.is_empty() {
         lines.extend(labelled(first, &entry.before, width));
     }

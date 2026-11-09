@@ -1004,11 +1004,20 @@ fn cmd_delete(args: &[String]) -> Result<i32, String> {
     let settings = Settings::load()?;
     let path = settings.path_of(&file)?;
     settings.limits(&path, true)?;
-    if !delete::allowed(&path, &env::var(delete::DELETE_ALLOW).unwrap_or_default()) {
-        return Err(format!(
-            "refused, nothing deleted. {path} is outside the folders of {}",
-            delete::DELETE_ALLOW
-        ));
+    let allow = env::var(delete::DELETE_ALLOW).unwrap_or_default();
+    if let Some(refused) = delete::gate(&path, &allow) {
+        say(delete::message(&path, &who, &refused));
+        // A check is a dry run and logs nothing; a real delete logs the refusal.
+        if !check {
+            let line = delete::log_line(&log::utc_now(), &path, &who, &refused);
+            if let Err(e) = log::append(&settings.log, &line) {
+                say(format!(
+                    "the log line failed, {}: {e}. The line: {line}",
+                    settings.log.display()
+                ));
+            }
+        }
+        return Ok(refused.code());
     }
     let reads = Reads::new(&settings.reads);
     let noted = reads

@@ -22,6 +22,8 @@ pub struct Entry {
     pub before: String,
     pub after: String,
     pub size: String,
+    /// The line comes from a delete: a `deleted`, or a refusal with the mark.
+    pub delete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,11 +50,13 @@ pub struct Snapshot {
 /// such as the rev of a delete, is not shown here.
 pub fn parse_line(line: &str) -> Option<Entry> {
     let f: Vec<&str> = line.split('\t').collect();
-    let (&[time, outcome, path, who, before, after, size]
-    | &[time, outcome, path, who, before, after, size, _]) = &f[..]
-    else {
+    let (eighth, &[time, outcome, path, who, before, after, size, ..]) = (f.get(7), &f[..]) else {
         return None;
     };
+    if f.len() > 8 {
+        return None;
+    }
+    let delete = outcome == "deleted" || eighth == Some(&crate::delete::REFUSED_MARK);
     let clean = |v: &str| {
         if v == "-" {
             String::new()
@@ -68,6 +72,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
         before: clean(before),
         after: clean(after),
         size: clean(size),
+        delete,
     })
 }
 
@@ -177,6 +182,33 @@ pub fn is_written(outcome: &str) -> bool {
     outcome == "written" || outcome == "patched"
 }
 
+/// The reason in plain words, for this entry: a delete has its own texts.
+pub fn why_of(entry: &Entry) -> &'static str {
+    if entry.delete {
+        why_delete(&entry.outcome)
+    } else {
+        why(&entry.outcome)
+    }
+}
+
+/// The reason of a delete line in plain words.
+pub fn why_delete(outcome: &str) -> &'static str {
+    match outcome {
+        "deleted" => why("deleted"),
+        "not-allowed" => "The file is outside the folders open for deletes. Nothing was deleted.",
+        "not-read" => {
+            "A delete came from a name that had not read the file, with no fingerprint. Nothing was deleted."
+        }
+        "changed" => "The file changed after this chat saw it. Nothing was deleted.",
+        "missing" => "This chat asked to delete a file that is not there. Nothing was deleted.",
+        "folder" => "A delete named a folder, and only a file is deleted. Nothing was deleted.",
+        "locked" => "Another writer held the lock. Nothing was deleted.",
+        "not-restored" => "The delete ended in an unexpected state. Look at this file now.",
+        "failed" => "The delete failed, and the file is unchanged.",
+        _ => "This outcome is not known to this version.",
+    }
+}
+
 /// The reason in plain words.
 pub fn why(outcome: &str) -> &'static str {
     match outcome {
@@ -254,10 +286,7 @@ pub fn diff_rows(old: &str, new: &str) -> Vec<Row> {
 /// What the diff screen shows for one log entry: rows, or the reason there are none.
 pub fn diff_of(entry: &Entry, versions: &Versions) -> Result<Vec<Row>, String> {
     if !is_written(&entry.outcome) {
-        return Err(format!(
-            "{} There is nothing to compare.",
-            why(&entry.outcome)
-        ));
+        return Err(format!("{} There is nothing to compare.", why_of(entry)));
     }
     if !versions.keeps_copies() {
         return Err(
@@ -440,6 +469,32 @@ mod tests {
         assert_eq!(e.size, "12");
         assert!(!is_written(&e.outcome), "a delete has no diff to show");
         assert!(why("deleted").starts_with("The file was deleted"));
+    }
+
+    #[test]
+    fn a_refused_delete_is_named_as_a_delete() {
+        let line = "2026-11-09 11:55:02Z\tchanged\torg/a.md\tchat\taa\tbb\t-\tdelete";
+        let e = parse_line(line).unwrap();
+        assert!(e.delete);
+        assert_eq!(
+            why_of(&e),
+            "The file changed after this chat saw it. Nothing was deleted."
+        );
+        let e = parse_line(&line.replace("changed", "not-allowed")).unwrap();
+        assert!(
+            why_of(&e).ends_with("Nothing was deleted."),
+            "{}",
+            why_of(&e)
+        );
+        // A refused write keeps its own text.
+        let write = "2026-11-09 11:55:02Z\tchanged\torg/a.md\tchat\taa\tbb\t-";
+        let e = parse_line(write).unwrap();
+        assert!(!e.delete);
+        assert!(why_of(&e).ends_with("Nothing was written."));
+        // Every refusal word of a delete has a delete text.
+        for word in ["not-read", "missing", "folder", "locked", "failed"] {
+            assert!(why_delete(word).contains("delete"), "{word}");
+        }
     }
 
     #[test]

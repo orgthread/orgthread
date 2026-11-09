@@ -224,3 +224,34 @@ fn a_file_gone_since_the_read_gives_exit_6() {
     fs::remove_file(p.file()).unwrap();
     assert_eq!(code(&p.delete("chat")), 6);
 }
+
+#[test]
+fn a_refusal_by_the_setting_is_logged_and_says_why() {
+    let p = Place::new();
+    fs::write(p.file(), "text\n").unwrap();
+    let print = fingerprint(b"text\n");
+    let args = ["delete", &p.f(), "--who", "x", "--expect", &print];
+    // Empty: no folder is open yet, and the text says so.
+    let o = p.run_with(&args, &[("ORGTHREAD_DELETE_ALLOW", "")]);
+    assert_eq!(code(&o), 2, "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("No folder is open for deletes yet"), "{err}");
+    assert!(!err.contains("orgthread --help"), "{err}");
+    let log = p.log();
+    let line = log.lines().last().expect("a log line");
+    let f: Vec<&str> = line.split('\t').collect();
+    assert_eq!(f.len(), 8, "{line}");
+    assert_eq!((f[1], f[3], f[7]), ("not-allowed", "x", "delete"), "{line}");
+    // Outside a named folder: logged too, with the other text.
+    let o = p.run_with(&args, &[("ORGTHREAD_DELETE_ALLOW", "org/keep")]);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("is outside the folders of"));
+    assert_eq!(p.log().lines().count(), 2);
+    // A check is a dry run: it says the same, and logs nothing.
+    let mut check = args.to_vec();
+    check.push("--check");
+    let o = p.run_with(&check, &[("ORGTHREAD_DELETE_ALLOW", "")]);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert_eq!(p.log().lines().count(), 2);
+    assert!(p.file().exists());
+}

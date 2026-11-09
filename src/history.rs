@@ -69,7 +69,7 @@ impl Job {
         if !refused && !watch::is_written(&entry.outcome) {
             return Err(format!(
                 "{} There is nothing to compare.",
-                watch::why(&entry.outcome)
+                watch::why_of(entry)
             ));
         }
         if crate::transfer::named_binary(&entry.path) {
@@ -541,6 +541,7 @@ pub mod tests {
             before: before.into(),
             after: after.into(),
             size: String::new(),
+            delete: false,
         }
     }
 
