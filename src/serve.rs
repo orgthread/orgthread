@@ -496,8 +496,9 @@ fn transfer_tools() -> [Value; 2] {
             "description": format!("Gives a one-time link for each file, to fetch its exact bytes \
                 into your code sandbox: curl -sS -o <name> '<link>'. For any file, also not \
                 text, up to {}. Each line gives the path, the size and the link, or why the file \
-                is refused. A link works once and must start within 5 minutes, so use it soon. \
-                Never show, store or log a link. Notes what this name read, as read does. {}",
+                is refused. Up to 25 files in one call. For more, call again with the rest. A \
+                link works once and must start within 5 minutes, so use it soon. Never show, \
+                store or log a link. Notes what this name read, as read does. {}",
                 mb(transfer::download_limit()), BLOCKED),
             "inputSchema": {
                 "type": "object",
@@ -511,8 +512,9 @@ fn transfer_tools() -> [Value; 2] {
                 code sandbox: curl -sS -T <file> '<link>'. curl then prints the answer: written, \
                 or exit code N and the refusal. The rules of write hold: to replace a file, \
                 download or read it first with the same name. A file that is not text may go \
-                only to the folders that the owner allowed. Up to {}. A link works once and must \
-                start within 5 minutes, so use it soon. Never show, store or log a link. {}",
+                only to the folders that the owner allowed. Up to {}. Up to 25 files in one \
+                call. For more, call again with the rest. A link works once and must start \
+                within 5 minutes, so use it soon. Never show, store or log a link. {}",
                 mb(transfer::upload_limit()), BLOCKED),
             "inputSchema": {
                 "type": "object",
@@ -1045,4 +1047,38 @@ fn send_file(stream: &mut TcpStream, link: &transfer::Link, exe: &Path) -> io::R
         stream.write_all(b"0\r\n\r\n")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_tool_with_a_list_names_its_limit_of_25() {
+        let offered = tools(true);
+        let says = |name: &str| -> String {
+            offered["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for name in ["download", "upload"] {
+            assert!(
+                says(name)
+                    .contains("Up to 25 files in one call. For more, call again with the rest."),
+                "{name}: {}",
+                says(name)
+            );
+        }
+        assert!(
+            says("copy")
+                .contains("Up to 25 pairs in one call. For more, call again with the rest.")
+        );
+        assert_eq!(MAX_FILES, 25);
+    }
 }
