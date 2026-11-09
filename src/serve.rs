@@ -301,7 +301,9 @@ fn tools(remote: bool) -> Value {
             "name": "write",
             "description": "Replaces a whole file with the text. To change a file, read it \
                 first with the same name. A new file needs no read. A write is refused when \
-                the file changed since.",
+                the file changed since. Missing folders of the file are made, and the answer \
+                names them. Where the owner fixed the first level, a new folder there is \
+                refused.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -371,12 +373,13 @@ fn tools(remote: bool) -> Value {
                 storage. Each pair names a source, from, and a new name, to. Up to 25 pairs in \
                 one call. For more, call again with the rest. A copy never replaces a file: if \
                 anything is at the new name, that pair is refused as existing. Missing \
-                folders of the new name are made. The rules of read hold for the source and \
+                folders of the new name are made, and the answer names them. The rules of \
+                read hold for the source and \
                 the rules of write for the new name. A file that is not text may go only to \
                 the folders that the owner allowed; on a server only the names tell this. With \
                 fingerprint, from list with fingerprint, a source of another version is \
-                refused as changed. Each pair gives one line: copied, with the size and \
-                the fingerprint, or refused with its exit code and the reason. The pairs that \
+                refused as changed. Each pair gives one line: copied, with the size, \
+                the fingerprint and any new folders, or refused with its exit code and the reason. The pairs that \
                 passed stay copied.",
             "inputSchema": {
                 "type": "object",
@@ -552,7 +555,8 @@ fn transfer_tools() -> [Value; 2] {
                 download or read it first with the same name. A file that is not text may go \
                 only to the folders that the owner allowed. Up to {}. Up to 25 files in one \
                 call. For more, call again with the rest. A link works once and must start \
-                within 5 minutes, so use it soon. Never show, store or log a link. {}",
+                within 5 minutes, so use it soon. Missing folders of the file are made, as for \
+                write. Never show, store or log a link. {}",
                 mb(transfer::upload_limit()), BLOCKED),
             "inputSchema": {
                 "type": "object",

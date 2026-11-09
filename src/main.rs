@@ -60,6 +60,14 @@ For a person:
 Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
 
+New folders: write, upload, copy and move make every missing folder of the
+path. The answer names them, for example:
+  written: new/deep/a.md, 3 bytes, new folders: new, new/deep
+The log gets one line made-folder per new folder, the outer one first, right
+before the line of the file. With ORGTHREAD_FIXED_FOLDERS set, a new folder
+directly inside one of its folders is refused, code 2, and nothing is made.
+Deeper new folders are fine.
+
 A patch is one JSON object: edits, a list of {old, new}, and append. Each edit
 replaces its exact old text, whole lines with their newlines, which must occur
 once. If it occurs more than once, add a line that differs, or give line, the
@@ -91,7 +99,7 @@ its rev in the log. With --check, it only checks the rules and the version.
 copy makes a new file with the exact bytes of one file, in the same storage.
 With Dropbox the copy is made inside Dropbox, and no byte passes this program.
 If anything is at the new name, it is refused, code 5, and nothing is replaced.
-Missing folders of the new name are made. The source must be open to read, the
+Missing folders of the new name are made, and the answer names them. The source must be open to read, the
 new name open to write. A file that is not text may go only to the folders of
 ORGTHREAD_BINARY_ALLOW: with Dropbox only the names tell this, so a picture
 with no extension, such as a name with no dot, passes; a local folder also reads
@@ -140,6 +148,10 @@ Settings, from the environment:
   ORGTHREAD_MOVE_ALLOW
                       comma-separated folders: when set, move needs both names in them
                       (default: not set, and move has only the limits above)
+  ORGTHREAD_FIXED_FOLDERS
+                      comma-separated folders: no new folder may appear directly inside them,
+                      for write, upload, copy and move. Deeper new folders are fine
+                      (default: not set, and any new folder is made)
   ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
                       the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
   ORGTHREAD_LISTEN_ANYWHERE

@@ -45,6 +45,18 @@ written: notes/a.md, 4 bytes
 
 The path in the answer is the path from the root.
 
+`write`, `upload`, `copy` and `move` make every missing folder of the path, with no limit on the number of levels. There is no separate tool for a new folder. The answer names each new folder, the outer one first:
+
+```
+written: notes/2026/11/a.md, 4 bytes, new folders: notes/2026, notes/2026/11
+```
+
+- The log gets one line per new folder, with the word `made-folder`, the folder, the name of the chat, and `-` for the other three fields. These lines come right before the line of the file. A folder made by hand gets no line.
+- If the file fails after its folders were made, the folders stay, and the log shows them before the line of the failure.
+- When the owner set `ORGTHREAD_FIXED_FOLDERS`, no new folder may appear directly inside one of its folders. With `/org` there, `/org/garden/a.md` is refused with code 2 when `/org/garden` does not exist, and nothing is made. `/org/notes/2026/a.md` is fine when `/org/notes` exists, and so is `/org/a.md`, as it makes no folder.
+- With Dropbox, a new file costs one look at each folder up to the first that exists. A change to a file that exists costs no extra look.
+- On a server, a new folder means one that was missing right before the call. Another writer may make the same folder in between, as the lock is the one of the file.
+
 `patch` changes part of a file, so that a large file need not be sent whole. Each edit replaces its exact `old` text with its `new` text:
 
 - `old` must be whole lines, with their newlines, and it must occur once in the file. A match never starts or ends in the middle of a line.
@@ -97,16 +109,16 @@ With Dropbox, the answer ends with `Dropbox keeps it in Deleted files, rev <rev>
 
 - Up to 25 pairs in one call. For more, call again with the rest. 26 pairs are wrong use: a JSON-RPC error with the code -32602, and nothing is copied. The same holds for a pair with no `from` or `to`.
 - It never replaces a file. If anything is at `to`, a file or a folder, that pair is refused with code 5.
-- It makes the missing folders of `to`.
+- It makes the missing folders of `to`, and the answer names each new folder.
 - The source must be open to read, and `to` open to write, as for `read` and `write`. A file that is not text may go only to the folders that the owner allowed. On the server, only the names tell this, as for `upload`: a picture whose name has no extension passes. The local door also reads the bytes.
 - With `fingerprint`, a source of another version is refused with code 4. Without it, the copy takes the source as it is.
 - After the copy, the fingerprint of the new file must be the one of the source. If not, the copy is removed again, code 7 and the log word `removed`, or 9 and `not-removed` if the removal fails.
-- With Dropbox, the copy is made inside Dropbox, in two web calls per pair: one look at the source, and the copy. No byte passes the server. If Dropbox gives no answer, one more look at `to` tells whether the copy is there. If something other than the source is there, it is never removed, as it may be older than the copy.
-- Each pair gives one line: `copied:`, the source, the new name, the size and the fingerprint, or `refused, exit code N:` and the reason. The pairs that passed stay copied, and the next pairs still run. With a refusal, the text starts with `exit code N` of the first pair that failed.
+- With Dropbox, the copy is made inside Dropbox: one look at the source, one look at each folder of `to` up to the first that exists, and the copy. No byte passes the server. If Dropbox gives no answer, one more look at `to` tells whether the copy is there. If something other than the source is there, it is never removed, as it may be older than the copy.
+- Each pair gives one line: `copied:`, the source, the new name, the size, the fingerprint and any new folders, or `refused, exit code N:` and the reason. The pairs that passed stay copied, and the next pairs still run. With a refusal, the text starts with `exit code N` of the first pair that failed.
 
 ```
 exit code 5
-copied: notes/plan.md -> archive/2026/plan.md, 17 bytes, 4c79418b76038c58388a702c49afa45be960cf0b6430a2461fd57450b6647f62
+copied: notes/plan.md -> archive/2026/plan.md, 17 bytes, 4c79418b76038c58388a702c49afa45be960cf0b6430a2461fd57450b6647f62, new folders: archive, archive/2026
 /tmp/claude/example-copy/root/notes/plan.md -> /tmp/claude/example-copy/root/notes/taken.md  refused, exit code 5: refused, nothing copied. notes/taken.md exists, and a copy never replaces a file. Name a new copy.
 ```
 
@@ -142,7 +154,7 @@ curl -sS -T p088-1.jpg '<link>'
 ```
 
 - A download gives any file, also a text, as exact bytes, up to 250 MB. It notes what this name read, as `read` does.
-- An upload keeps the rules of `write`: a new file needs no read, and a replace needs a download or a read by the same name first. A text file may go wherever `write` may write. A file that is not text may go only to the folders that the owner allowed. It may have up to 20 MB.
+- An upload keeps the rules of `write`, also for new folders: a new file needs no read, and a replace needs a download or a read by the same name first. A text file may go wherever `write` may write. A file that is not text may go only to the folders that the owner allowed. It may have up to 20 MB.
 - The checks run when the tool makes the link, so that a refusal comes early, and again when the bytes arrive.
 
 `version` gives four lines: the version and the commit, the door, the storage and the tools:

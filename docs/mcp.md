@@ -119,6 +119,7 @@ Each setting comes from the environment. A file `.env` beside the program, with 
 | `ORGTHREAD_BINARY_ALLOW` | Comma-separated folders where an upload of a file that is not text may go | None |
 | `ORGTHREAD_DELETE_ALLOW` | Comma-separated folders where `delete` may remove a file | None, so every delete is refused |
 | `ORGTHREAD_MOVE_ALLOW` | Comma-separated folders. When set, `move` needs both the old and the new name in them | Not set, so `move` has only the limits above |
+| `ORGTHREAD_FIXED_FOLDERS` | Comma-separated folders. No new folder may appear directly inside them, for `write`, `upload`, `copy` and `move`, with code 2. Deeper new folders are fine | Not set, so any new folder is made |
 | `ORGTHREAD_DOWNLOAD_MB` | The largest download, in MB of 1,000,000 bytes | 250 |
 | `ORGTHREAD_UPLOAD_MB` | The largest upload, in MB of 1,000,000 bytes | 20 |
 | `ORGTHREAD_LISTEN_ANYWHERE` | `yes` lets the remote server listen on an address that others can reach, with no encryption | Only `127.0.0.1`, `[::1]` and `localhost` |
