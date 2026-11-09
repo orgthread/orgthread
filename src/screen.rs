@@ -1,6 +1,7 @@
 //! The read-only terminal screen: `orgthread watch`. It draws what `watch.rs`
 //! reads, and it has no way to change a file.
 
+use crate::history::{self, Job, Remote, Step};
 use crate::versions::Versions;
 use crate::watch::{self, Entry, Row, Snapshot, snapshot};
 use ratatui::Frame;
@@ -12,16 +13,21 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use std::cell::Cell;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 const BLUE: Color = Color::Rgb(0x22, 0x6D, 0xBD);
 const ORANGE: Color = Color::Rgb(0xE8, 0x74, 0x0C);
 const REFRESH: Duration = Duration::from_secs(1);
+/// How often the wait screen moves its spinner.
+const SPIN: Duration = Duration::from_millis(100);
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// What the screen tells about itself. Each part is fixed at build time, one word
 /// from a short list, or the path of the log, so no address, secret path, token or
 /// login hash can reach the screen through it.
 pub struct Info {
     storage: &'static str,
+    dropbox: bool,
     log: String,
 }
 
@@ -29,9 +35,18 @@ impl Info {
     pub fn new(dropbox: bool, log: &Path) -> Info {
         Info {
             storage: crate::storage::kind(dropbox),
+            dropbox,
             log: log.display().to_string(),
         }
     }
+}
+
+/// Where the diff screen gets the two texts of a write.
+pub enum Diffs {
+    /// The copies that each write keeps on this disk, on the Mac.
+    Kept(Versions),
+    /// The Dropbox history, on a server, in memory only.
+    Dropbox(Remote),
 }
 
 /// The name, the version, the commit of this build and the kind of storage.
@@ -273,22 +288,121 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice, info: &Info) {
     );
 }
 
+/// The steps of a fetch that runs in the background.
+struct Wait {
+    headline: &'static str,
+    started: Instant,
+    /// Each step, and whether it is done.
+    steps: Vec<(bool, String)>,
+    steps_in: Receiver<Step>,
+    refused: bool,
+}
+
+enum Body {
+    Ready(Result<Vec<Row>, String>),
+    Waiting(Wait),
+}
+
+/// The rows of two texts, or why there are none.
+fn rows_of(refused: bool, (old, new): history::Texts) -> Result<Vec<Row>, String> {
+    let rows = watch::diff_rows(&old, &new);
+    if !rows.is_empty() {
+        Ok(rows)
+    } else if refused {
+        Err("The expected and the found version hold the same text.".to_string())
+    } else {
+        Err("The text did not change in this write.".to_string())
+    }
+}
+
 /// The open diff screen.
 pub struct DiffView {
     title: String,
-    body: Result<Vec<Row>, String>,
+    entry: Entry,
+    body: Body,
+    /// True after a wait that ran out of time: Enter tries again.
+    retry: bool,
     scroll: usize,
     /// How far it can scroll, known once it is drawn at the terminal's size.
     max_scroll: Cell<usize>,
 }
 
 impl DiffView {
-    pub fn open(entry: &Entry, versions: &Versions) -> DiffView {
+    fn with(entry: &Entry, body: Body) -> DiffView {
+        let mut title = format!("{}   {} ago", entry.path, watch::ago(&entry.time));
+        if entry.outcome == "changed" {
+            title.push_str("   expected → found");
+        }
         DiffView {
-            title: format!("{}   {} ago", entry.path, watch::ago(&entry.time)),
-            body: watch::diff_of(entry, versions),
+            title,
+            entry: entry.clone(),
+            body,
+            retry: false,
             scroll: 0,
             max_scroll: Cell::new(0),
+        }
+    }
+
+    /// On Dropbox, the fetch starts in the background, and the screen shows its
+    /// steps. A write whose versions are in memory opens at once.
+    pub fn open(entry: &Entry, diffs: &Diffs) -> DiffView {
+        let body = match diffs {
+            Diffs::Kept(versions) => Body::Ready(watch::diff_of(entry, versions)),
+            Diffs::Dropbox(remote) => match Job::of(entry) {
+                Err(reason) => Body::Ready(Err(reason)),
+                Ok(job) => match remote.from_memory(&job) {
+                    Some(texts) => Body::Ready(rows_of(job.refused, texts)),
+                    None => Body::Waiting(Wait {
+                        headline: job.headline(),
+                        started: Instant::now(),
+                        steps: Vec::new(),
+                        refused: job.refused,
+                        steps_in: remote.start(job),
+                    }),
+                },
+            },
+        };
+        DiffView::with(entry, body)
+    }
+
+    /// True while the fetch runs.
+    pub fn waiting(&self) -> bool {
+        matches!(self.body, Body::Waiting(_))
+    }
+
+    /// Takes in what the fetch told so far, and stops waiting after the limit.
+    pub fn tick(&mut self, now: Instant) {
+        let Body::Waiting(wait) = &mut self.body else {
+            return;
+        };
+        let mut done = None;
+        loop {
+            match wait.steps_in.try_recv() {
+                Ok(Step::Doing(text)) => wait.steps.push((false, text)),
+                Ok(Step::Did(text)) => match wait.steps.last_mut() {
+                    Some(last) if !last.0 => *last = (true, text),
+                    _ => wait.steps.push((true, text)),
+                },
+                Ok(Step::Done(result)) => {
+                    done = Some(result.and_then(|texts| rows_of(wait.refused, texts)));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    done = Some(Err(
+                        "The fetch stopped with no answer. Press Esc, then Enter to try again."
+                            .to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if done.is_none() && now.saturating_duration_since(wait.started) >= history::WAIT {
+            done = Some(Err(history::TIMEOUT.to_string()));
+            self.retry = true;
+        }
+        if let Some(result) = done {
+            self.body = Body::Ready(result);
         }
     }
 
@@ -341,8 +455,9 @@ pub fn draw_diff(frame: &mut Frame, view: &DiffView, info: &Info) {
     ])
     .areas(frame.area());
     let lines: Vec<Line> = match &view.body {
-        Ok(rows) => rows.iter().flat_map(|r| diff_lines(r, width)).collect(),
-        Err(reason) => plain(reason, width, Style::new().fg(ORANGE)),
+        Body::Ready(Ok(rows)) => rows.iter().flat_map(|r| diff_lines(r, width)).collect(),
+        Body::Ready(Err(reason)) => plain(reason, width, Style::new().fg(ORANGE)),
+        Body::Waiting(wait) => wait_lines(wait, Instant::now(), width),
     };
     let visible = usize::from(body.height.saturating_sub(2));
     let max = lines.len().saturating_sub(visible);
@@ -358,6 +473,34 @@ pub fn draw_diff(frame: &mut Frame, view: &DiffView, info: &Info) {
         Line::raw("up, down: scroll   Esc: back   ?: help   q: quit"),
         foot,
     );
+}
+
+/// The wait screen: the headline with a spinner and the seconds, then the steps.
+fn wait_lines(wait: &Wait, now: Instant, width: usize) -> Vec<Line<'static>> {
+    let gone = now.saturating_duration_since(wait.started);
+    let spin = SPINNER[(gone.as_millis() / SPIN.as_millis()) as usize % SPINNER.len()];
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{spin} "), Style::new().fg(BLUE)),
+        Span::raw(format!("{}   {} s", wait.headline, gone.as_secs())),
+    ])];
+    for (done, text) in &wait.steps {
+        let (sign, style) = if *done {
+            ("✓", Style::new().fg(BLUE))
+        } else {
+            ("…", Style::new())
+        };
+        for (i, part) in wrap(text, width.saturating_sub(4)).into_iter().enumerate() {
+            let head = if i == 0 {
+                format!("  {sign} ")
+            } else {
+                "    ".to_string()
+            };
+            lines.push(Line::styled(format!("{head}{part}"), style));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("Esc: back to the list"));
+    lines
 }
 
 /// The keys of the screen, as `Watch::key`, `Choice::key` and `DiffView::key`
@@ -395,6 +538,11 @@ fn help_lines(info: &Info, width: usize) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::raw(""));
+    if info.dropbox {
+        let text = "On Dropbox, Enter gets the two versions of a write from the Dropbox history, in the background. Esc goes back at once. The versions stay in memory only, up to 25 MB, and are gone when watch quits.";
+        lines.extend(plain(text, width, Style::new()));
+        lines.push(Line::raw(""));
+    }
     lines.push(Line::raw("The screen only reads. It cannot change a file."));
     lines
 }
@@ -428,7 +576,7 @@ pub struct Watch {
 
 impl Watch {
     /// Applies one key. True means quit.
-    pub fn key(&mut self, code: KeyCode, ctrl: bool, snap: &Snapshot, versions: &Versions) -> bool {
+    pub fn key(&mut self, code: KeyCode, ctrl: bool, snap: &Snapshot, diffs: &Diffs) -> bool {
         if code == KeyCode::Char('q') || (ctrl && code == KeyCode::Char('c')) {
             return true;
         }
@@ -441,18 +589,32 @@ impl Watch {
         if code == KeyCode::Char('?') {
             self.help = true;
         } else if let Some(view) = &mut self.open {
-            if view.key(code) {
+            if code == KeyCode::Enter && view.retry {
+                self.open = Some(DiffView::open(&view.entry.clone(), diffs));
+            } else if view.key(code) {
+                // Back at once, also during a wait: the fetch goes on alone.
                 self.open = None;
             }
         } else if code == KeyCode::Enter {
             let place = self.choice.place(snap.entries.len());
             if let Some(entry) = snap.entries.iter().rev().nth(place) {
-                self.open = Some(DiffView::open(entry, versions));
+                self.open = Some(DiffView::open(entry, diffs));
             }
         } else {
             self.choice.key(code, ctrl, snap.entries.len());
         }
         false
+    }
+
+    /// Takes in what a fetch in the background told. True while one runs.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        match &mut self.open {
+            Some(view) => {
+                view.tick(now);
+                view.waiting()
+            }
+            None => false,
+        }
     }
 
     pub fn draw(&self, frame: &mut Frame, snap: &Snapshot, info: &Info) {
@@ -467,23 +629,33 @@ impl Watch {
 }
 
 /// Runs the screen until a quit key.
-pub fn run(lock_dir: &Path, log: &Path, versions: &Versions, info: &Info) -> io::Result<()> {
+pub fn run(lock_dir: &Path, log: &Path, diffs: &Diffs, info: &Info) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut watch = Watch::default();
+    let mut snap = snapshot(lock_dir, log);
+    let mut taken = Instant::now();
     let result = loop {
-        let snap = snapshot(lock_dir, log);
+        // The log is read once a second, also while the spinner turns faster.
+        if taken.elapsed() >= REFRESH {
+            snap = snapshot(lock_dir, log);
+            taken = Instant::now();
+        }
+        let waiting = watch.tick(Instant::now());
         let drawn = terminal.draw(|frame| watch.draw(frame, &snap, info));
         if let Err(e) = drawn {
             break Err(e);
         }
-        match event::poll(REFRESH) {
+        match event::poll(if waiting { SPIN } else { REFRESH }) {
             Ok(false) => {}
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    if watch.key(key.code, ctrl, &snap, versions) {
+                    if watch.key(key.code, ctrl, &snap, diffs) {
                         break Ok(());
                     }
+                    // A key shows the newest log at once, as before.
+                    snap = snapshot(lock_dir, log);
+                    taken = Instant::now();
                 }
                 Ok(_) => {}
                 Err(e) => break Err(e),
@@ -541,6 +713,10 @@ mod tests {
         Info::new(false, Path::new("state/writes.log"))
     }
 
+    fn diff_entry() -> Entry {
+        entry("written", "a")
+    }
+
     fn screen(snap: &Snapshot, choice: &Choice) -> String {
         let mut t = Terminal::new(TestBackend::new(100, 28)).unwrap();
         t.draw(|f| draw(f, snap, choice, &local())).unwrap();
@@ -585,7 +761,7 @@ mod tests {
         let text = once(none, none, &local(), 100, 28).unwrap();
         assert!(text.lines().next().unwrap().contains(&want), "{text}");
 
-        let view = DiffView::open(&entry("written", "a"), &Versions::none());
+        let view = DiffView::open(&entry("written", "a"), &Diffs::Kept(Versions::none()));
         let mut t = Terminal::new(TestBackend::new(100, 28)).unwrap();
         t.draw(|f| draw_diff(f, &view, &local())).unwrap();
         let text = text_of(&t);
@@ -603,7 +779,7 @@ mod tests {
             entries: vec![entry("written", "a")],
             ..Snapshot::default()
         };
-        let none = Versions::none();
+        let none = Diffs::Kept(Versions::none());
         let info = local();
         let mut w = Watch::default();
         assert!(!watch_screen(&w, &snap, &info).contains("Keys"));
@@ -659,7 +835,12 @@ mod tests {
         for dropbox in [false, true] {
             let info = Info::new(dropbox, Path::new("state/writes.log"));
             let mut w = Watch::default();
-            w.key(KeyCode::Char('?'), false, &snap, &Versions::none());
+            w.key(
+                KeyCode::Char('?'),
+                false,
+                &snap,
+                &Diffs::Kept(Versions::none()),
+            );
             let text = watch_screen(&w, &snap, &info);
             assert!(text.contains("Keys"), "{text}");
             for secret in ["example.com", "invented-secret-path", HASH, "token"] {
@@ -679,7 +860,7 @@ mod tests {
             KeyCode::Char('?'),
             false,
             &Snapshot::default(),
-            &Versions::none(),
+            &Diffs::Kept(Versions::none()),
         );
         let mut t = Terminal::new(TestBackend::new(20, 5)).unwrap();
         t.draw(|f| w.draw(f, &Snapshot::default(), &local()))
@@ -789,12 +970,7 @@ mod tests {
     }
 
     fn diff_view(rows: Vec<Row>) -> DiffView {
-        DiffView {
-            title: "org/notes/a.md".to_string(),
-            body: Ok(rows),
-            scroll: 0,
-            max_scroll: Cell::new(0),
-        }
+        DiffView::with(&diff_entry(), Body::Ready(Ok(rows)))
     }
 
     fn diff_screen(view: &DiffView, width: u16, height: u16) -> String {
@@ -829,12 +1005,10 @@ mod tests {
 
     #[test]
     fn a_diff_with_no_copy_says_why() {
-        let view = DiffView {
-            title: "org/notes/a.md".to_string(),
-            body: Err("No copy of this version.".to_string()),
-            scroll: 0,
-            max_scroll: Cell::new(0),
-        };
+        let view = DiffView::with(
+            &diff_entry(),
+            Body::Ready(Err("No copy of this version.".to_string())),
+        );
         assert!(diff_screen(&view, 80, 8).contains("No copy of this version."));
     }
 
@@ -880,5 +1054,192 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(20, 5)).unwrap();
         t.draw(|f| draw(f, &snap, &Choice::default(), &local()))
             .unwrap();
+    }
+
+    mod dropbox {
+        use super::*;
+        use crate::fingerprint::fingerprint;
+        use crate::history::tests::Fake;
+        use crate::history::{History, Remote};
+        use std::sync::{Arc, Mutex};
+
+        const OLD: &str = "- buy apples\n- call Ana\n";
+        const NEW: &str = "- buy apples\n- call Ana\n- water the plants\n";
+
+        fn remote(fake: Fake) -> Diffs {
+            let fake: Arc<dyn History> = Arc::new(fake);
+            Diffs::Dropbox(Remote::new(Arc::new(move || Ok(Arc::clone(&fake)))))
+        }
+
+        fn written() -> Snapshot {
+            let line = format!(
+                "2026-11-09 08:00:00Z\twritten\torg/notes/plan.md\tinvented chat\t{}\t{}\t40",
+                fingerprint(OLD.as_bytes()),
+                fingerprint(NEW.as_bytes())
+            );
+            Snapshot {
+                entries: vec![parse_line(&line).unwrap()],
+                ..Snapshot::default()
+            }
+        }
+
+        /// Ticks until the fetch is done, as the loop of `run` does.
+        fn settle(w: &mut Watch) {
+            for _ in 0..500 {
+                if !w.tick(Instant::now()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the fetch never ended");
+        }
+
+        fn text(w: &Watch, snap: &Snapshot) -> String {
+            let mut t = Terminal::new(TestBackend::new(90, 16)).unwrap();
+            t.draw(|f| w.draw(f, snap, &Info::new(true, Path::new("state/writes.log"))))
+                .unwrap();
+            text_of(&t)
+        }
+
+        #[test]
+        fn enter_on_dropbox_shows_the_diff_from_the_history() {
+            let diffs = remote(Fake::with(&[OLD, NEW]));
+            let snap = written();
+            let mut w = Watch::default();
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            settle(&mut w);
+            let screen = text(&w, &snap);
+            assert!(screen.contains("+    3  - water the plants"), "{screen}");
+            // Back, and Enter again: from memory, at once.
+            w.key(KeyCode::Esc, false, &snap, &diffs);
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            assert!(
+                !w.open.as_ref().unwrap().waiting(),
+                "the second Enter is instant"
+            );
+        }
+
+        #[test]
+        fn esc_during_the_wait_goes_back_at_once() {
+            let (open_gate, gate) = std::sync::mpsc::channel();
+            let mut fake = Fake::with(&[OLD, NEW]);
+            fake.gate = Some(Mutex::new(gate));
+            let diffs = remote(fake);
+            let snap = written();
+            let mut w = Watch::default();
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            assert!(w.tick(Instant::now()), "the fetch waits at its gate");
+            let screen = text(&w, &snap);
+            assert!(
+                screen.contains("Getting both versions from the Dropbox history"),
+                "{screen}"
+            );
+            assert!(screen.contains("Esc: back to the list"), "{screen}");
+            assert!(!w.key(KeyCode::Esc, false, &snap, &diffs));
+            assert!(w.open.is_none(), "Esc is never blocked");
+            open_gate.send(()).unwrap();
+            open_gate.send(()).unwrap();
+            // The late answer lands in the cache, so a new Enter opens at once.
+            let Diffs::Dropbox(r) = &diffs else {
+                unreachable!()
+            };
+            let job = Job::of(&snap.entries[0]).unwrap();
+            for _ in 0..500 {
+                if r.from_memory(&job).is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            assert!(!w.open.as_ref().unwrap().waiting());
+        }
+
+        #[test]
+        fn the_wait_shows_its_steps_and_stops_after_20_seconds() {
+            let (_open_gate, gate) = std::sync::mpsc::channel::<()>();
+            let mut fake = Fake::with(&[OLD, NEW]);
+            fake.gate = Some(Mutex::new(gate));
+            let diffs = remote(fake);
+            let snap = written();
+            let mut w = Watch::default();
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            for _ in 0..500 {
+                w.tick(Instant::now());
+                if text(&w, &snap).contains("Downloading before and after") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let screen = text(&w, &snap);
+            assert!(
+                screen.contains("✓ Found 2 versions in the list of revisions"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("… Downloading before and after, at the same time"),
+                "{screen}"
+            );
+            w.tick(Instant::now() + history::WAIT);
+            let screen = text(&w, &snap);
+            assert!(
+                screen.contains("Dropbox did not answer in 20 seconds"),
+                "{screen}"
+            );
+            // Enter tries again, and the screen waits once more.
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            assert!(w.open.as_ref().unwrap().waiting());
+        }
+
+        #[test]
+        fn a_gone_version_is_named_on_the_screen() {
+            let diffs = remote(Fake::with(&[NEW]));
+            let snap = written();
+            let mut w = Watch::default();
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            settle(&mut w);
+            let screen = text(&w, &snap);
+            assert!(
+                screen.contains("The version before this write is gone"),
+                "{screen}"
+            );
+            assert!(!screen.contains("buy apples"), "{screen}");
+        }
+
+        #[test]
+        fn a_refused_line_shows_expected_against_found() {
+            let diffs = remote(Fake::with(&[OLD, NEW]));
+            let mut snap = written();
+            snap.entries[0].outcome = "changed".into();
+            snap.entries[0].size = String::new();
+            let mut w = Watch::default();
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            settle(&mut w);
+            let screen = text(&w, &snap);
+            assert!(screen.contains("expected → found"), "{screen}");
+            assert!(screen.contains("+    3  - water the plants"), "{screen}");
+        }
+
+        #[test]
+        fn the_help_on_dropbox_says_what_enter_does() {
+            let mut w = Watch::default();
+            w.key(
+                KeyCode::Char('?'),
+                false,
+                &Snapshot::default(),
+                &remote(Fake::default()),
+            );
+            let mut t = Terminal::new(TestBackend::new(80, 40)).unwrap();
+            t.draw(|f| {
+                w.draw(
+                    f,
+                    &Snapshot::default(),
+                    &Info::new(true, Path::new("state/writes.log")),
+                )
+            })
+            .unwrap();
+            let screen = text_of(&t);
+            assert!(screen.contains("from the Dropbox"), "{screen}");
+            assert!(screen.contains("25 MB"), "{screen}");
+        }
     }
 }

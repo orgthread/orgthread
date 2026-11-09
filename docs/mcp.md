@@ -124,7 +124,7 @@ Each setting comes from the environment. A file `.env` beside the program, with 
 | `ORGTHREAD_LOG` | The log file | `state/writes.log` beside the program |
 | `ORGTHREAD_READS` | The notes of what each name read | `state/reads` beside the program |
 | `ORGTHREAD_VERSIONS` | A copy of each version written, for 30 days, for the diff screen | `state/versions` beside the program |
-| `ORGTHREAD_STORAGE` | `dropbox` uses the Dropbox API in place of a folder. It keeps no copies | A local folder |
+| `ORGTHREAD_STORAGE` | `dropbox` uses the Dropbox API in place of a folder. It keeps no copies on the disk: `orgthread watch` gets each diff from the Dropbox history | A local folder |
 | `ORGTHREAD_DROPBOX_TOKEN` | The Dropbox token | None |
 | `ORGTHREAD_DROPBOX_REFRESH`, `ORGTHREAD_DROPBOX_APP_KEY`, `ORGTHREAD_DROPBOX_APP_SECRET` | In place of a token: these three get a fresh short-lived token for each command | None |
 

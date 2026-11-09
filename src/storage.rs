@@ -62,6 +62,23 @@ pub enum Listing {
     Missing,
 }
 
+/// One old or current version of a file, as the history of the storage lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    /// The name of this version in the storage. It never changes.
+    pub rev: String,
+    /// The fingerprint of its bytes.
+    pub hash: String,
+    pub size: u64,
+    /// Seconds since 1970-01-01 UTC, when the storage gives it.
+    pub modified: Option<i64>,
+}
+
+/// The error of a storage that keeps no history of a file.
+pub fn not_kept() -> io::Error {
+    io::Error::new(ErrorKind::Unsupported, "this storage keeps no old versions")
+}
+
 /// The kind of storage in plain words, for the screen and the tool `version`. It is
 /// fixed text, so no path, address or key can reach a screen or a chat through it.
 pub fn kind(dropbox: bool) -> &'static str {
@@ -105,6 +122,20 @@ pub trait Storage {
     /// The size of a file in bytes, or `None` when it does not exist.
     fn size(&self, path: &str) -> io::Result<Option<u64>> {
         Ok(self.read(path)?.map(|bytes| bytes.len() as u64))
+    }
+
+    /// The versions of a file that the storage still keeps, newest first, at
+    /// most `limit`. An empty list for a file with no history. A storage with no
+    /// history at all, such as a local folder, answers "not kept".
+    fn revisions(&self, path: &str, limit: usize) -> io::Result<Vec<Revision>> {
+        let _ = (path, limit);
+        Err(not_kept())
+    }
+
+    /// The bytes of one version, by its `rev`. `None` when it is gone.
+    fn read_revision(&self, rev: &str) -> io::Result<Option<Vec<u8>>> {
+        let _ = rev;
+        Err(not_kept())
     }
 
     /// Copies the bytes of a file to `out`, in parts where the storage can, so

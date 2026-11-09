@@ -631,11 +631,12 @@ impl Settings {
 fn cmd_watch(args: &[String]) -> Result<i32, String> {
     let settings = Settings::load()?;
     let locks = &settings.locks;
-    // In Dropbox mode no text stays on the disk, so there are no copies to compare.
-    let versions = if settings.dropbox {
-        Versions::none()
+    // In Dropbox mode no text stays on the disk: the diff comes from the Dropbox
+    // history, into memory only.
+    let diffs = if settings.dropbox {
+        screen::Diffs::Dropbox(orgthread::history::Remote::dropbox(locks.clone()))
     } else {
-        Versions::new(&settings.versions)
+        screen::Diffs::Kept(Versions::new(&settings.versions))
     };
     let info = screen::Info::new(settings.dropbox, &settings.log);
     let result = match args {
@@ -643,7 +644,7 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
             if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Err("watch needs a terminal. For plain text, use watch --once".into());
             }
-            screen::run(locks, &settings.log, &versions, &info)
+            screen::run(locks, &settings.log, &diffs, &info)
         }
         [flag] if flag == "--once" => {
             screen::once(locks, &settings.log, &info, 110, 30).map(|text| {

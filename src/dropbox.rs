@@ -9,7 +9,7 @@
 //! The locks are small local files beside the program: a lock costs no web call.
 //! Between writers elsewhere, Dropbox's own version check decides.
 
-use crate::storage::{Entry, Expect, Listing, LocalFolder, Storage, WriteError};
+use crate::storage::{Entry, Expect, Listing, LocalFolder, Revision, Storage, WriteError};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::Path;
@@ -99,6 +99,28 @@ fn page_of(body: &[u8]) -> io::Result<(Vec<Entry>, String, bool)> {
         .collect();
     let cursor = v["cursor"].as_str().unwrap_or_default().to_string();
     Ok((entries, cursor, v["has_more"].as_bool().unwrap_or(false)))
+}
+
+/// The versions in a `list_revisions` answer, newest first, as Dropbox gives them.
+fn revisions_of(body: &[u8]) -> io::Result<Vec<Revision>> {
+    let v: Value = serde_json::from_slice(body)?;
+    let entries = v["entries"]
+        .as_array()
+        .ok_or_else(|| failure("Dropbox gave no revisions".to_string()))?;
+    Ok(entries
+        .iter()
+        .filter_map(|e| {
+            Some(Revision {
+                rev: e["rev"].as_str()?.to_string(),
+                hash: e["content_hash"].as_str()?.to_string(),
+                size: e["size"].as_u64()?,
+                modified: e["server_modified"]
+                    .as_str()
+                    .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+                    .map(|t| t.as_second()),
+            })
+        })
+        .collect())
 }
 
 fn summary(body: &[u8]) -> String {
@@ -370,6 +392,27 @@ impl Storage for Dropbox {
         self.download(&Self::file(path))
     }
 
+    /// One call: Dropbox lists at most 100 versions of a file, newest first.
+    fn revisions(&self, path: &str, limit: usize) -> io::Result<Vec<Revision>> {
+        let arg = json!({ "path": Self::file(path), "mode": "path", "limit": limit.clamp(1, 100) });
+        let reply = self.rpc("list_revisions", &arg)?;
+        match reply.status {
+            200 => revisions_of(&reply.body),
+            409 if summary(&reply.body).contains("not_found") => Ok(Vec::new()),
+            _ => Err(refused(&reply)),
+        }
+    }
+
+    /// Dropbox takes `rev:` and the rev in place of a path, one version per call.
+    fn read_revision(&self, rev: &str) -> io::Result<Option<Vec<u8>>> {
+        if rev.is_empty() || !rev.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(failure(
+                "this is not the name of a Dropbox version".to_string(),
+            ));
+        }
+        self.download(&format!("rev:{rev}"))
+    }
+
     fn size(&self, path: &str) -> io::Result<Option<u64>> {
         let full = Self::file(path);
         let reply = self.rpc("get_metadata", &json!({ "path": full }))?;
@@ -542,6 +585,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn an_answer_of_list_revisions_becomes_versions() {
+        let body = br#"{"is_deleted":false,"entries":[
+            {".tag":"file","name":"plan.md","rev":"a1b2c3","size":40,"server_modified":"2026-11-07T10:00:00Z","content_hash":"new1"},
+            {".tag":"file","name":"plan.md","rev":"a1b2c2","size":31,"content_hash":"old1"},
+            {".tag":"file","name":"plan.md","size":5,"content_hash":"no-rev"}
+        ]}"#;
+        assert_eq!(
+            revisions_of(body).unwrap(),
+            [
+                Revision {
+                    rev: "a1b2c3".into(),
+                    hash: "new1".into(),
+                    size: 40,
+                    modified: Some(1_794_045_600),
+                },
+                Revision {
+                    rev: "a1b2c2".into(),
+                    hash: "old1".into(),
+                    size: 31,
+                    modified: None,
+                },
+            ]
+        );
+        assert!(revisions_of(b"{}").is_err());
     }
 
     #[test]
