@@ -96,6 +96,44 @@ pub enum CopyError {
         reason: String,
     },
     Io(io::Error),
+    /// The copy or the move failed after the step that makes the new folders.
+    /// `folders` were missing before that step, the outer one first. Some or
+    /// all of them may exist now, and they stay.
+    After {
+        error: Box<CopyError>,
+        folders: Vec<String>,
+    },
+}
+
+impl CopyError {
+    /// This error, with the folders that were missing before the step that
+    /// makes them. With no folders, the error stays as it is.
+    pub fn after(self, folders: &[String]) -> CopyError {
+        if folders.is_empty() || matches!(self, CopyError::After { .. }) {
+            return self;
+        }
+        CopyError::After {
+            error: Box::new(self),
+            folders: folders.to_vec(),
+        }
+    }
+
+    /// The folders of an `After`, or none.
+    pub fn folders(&self) -> Vec<String> {
+        match self {
+            CopyError::After { folders, .. } => folders.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The folders of `folders` that exist now. After a failure, these are the new
+/// folders that stay, and each gets its log line.
+pub fn still_there(storage: &dyn Storage, folders: Vec<String>) -> Vec<String> {
+    folders
+        .into_iter()
+        .filter(|folder| storage.exists(folder).unwrap_or(false))
+        .collect()
 }
 
 impl From<io::Error> for CopyError {
@@ -648,6 +686,7 @@ impl Storage for LocalFolder {
             to.replace('/', "--"),
             std::process::id()
         ));
+        let mut folders = Vec::new();
         let made = (|| -> Result<Copied, CopyError> {
             let mut input = match File::open(&source) {
                 Ok(file) => file,
@@ -678,7 +717,7 @@ impl Storage for LocalFolder {
                     found: source_print,
                 });
             }
-            let folders = new_folders(to, |folder| self.exists(folder))?;
+            folders = new_folders(to, |folder| self.exists(folder))?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -694,11 +733,11 @@ impl Storage for LocalFolder {
                 target: target_print,
                 size,
                 rev: None,
-                folders,
+                folders: folders.clone(),
             })
         })();
         let _ = fs::remove_file(&temp);
-        made
+        made.map_err(|e| e.after(&folders))
     }
 
     /// A hard link puts the file at the new name, and then the old name goes.
@@ -729,45 +768,48 @@ impl Storage for LocalFolder {
             return Err(CopyError::Changed { found: print });
         }
         let folders = new_folders(to, |folder| self.exists(folder))?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::hard_link(&source, &target) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(CopyError::Exists),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
-            Err(e) => return Err(e.into()),
-        }
-        Self::sync_parent(&target);
-        if let Err(e) = fs::remove_file(&source) {
-            return match fs::remove_file(&target) {
-                Ok(()) => {
-                    Self::sync_parent(&target);
-                    Err(CopyError::Io(io::Error::other(format!(
-                        "the old name could not go ({e}), so the new name is removed again, and nothing moved"
-                    ))))
-                }
-                Err(again) => Err(CopyError::Unexpected {
+        let moved = (|| -> Result<Moved, CopyError> {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::hard_link(&source, &target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(CopyError::Exists),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
+                Err(e) => return Err(e.into()),
+            }
+            Self::sync_parent(&target);
+            if let Err(e) = fs::remove_file(&source) {
+                return match fs::remove_file(&target) {
+                    Ok(()) => {
+                        Self::sync_parent(&target);
+                        Err(CopyError::Io(io::Error::other(format!(
+                            "the old name could not go ({e}), so the new name is removed again, and nothing moved"
+                        ))))
+                    }
+                    Err(again) => Err(CopyError::Unexpected {
+                        reason: format!(
+                            "the file is at both names now: the old name could not go ({e}), and the new name could not go again ({again})"
+                        ),
+                    }),
+                };
+            }
+            Self::sync_parent(&source);
+            match Self::print_of(&target) {
+                Ok((after, size)) => Ok(Moved {
+                    source: print,
+                    target: after,
+                    size,
+                    folders: folders.clone(),
+                }),
+                Err(e) => Err(CopyError::Unexpected {
                     reason: format!(
-                        "the file is at both names now: the old name could not go ({e}), and the new name could not go again ({again})"
+                        "the file moved, but it could not be read back at the new name: {e}"
                     ),
                 }),
-            };
-        }
-        Self::sync_parent(&source);
-        match Self::print_of(&target) {
-            Ok((after, size)) => Ok(Moved {
-                source: print,
-                target: after,
-                size,
-                folders,
-            }),
-            Err(e) => Err(CopyError::Unexpected {
-                reason: format!(
-                    "the file moved, but it could not be read back at the new name: {e}"
-                ),
-            }),
-        }
+            }
+        })();
+        moved.map_err(|e| e.after(&folders))
     }
 
     fn restore(&self, path: &str, old: Option<&[u8]>) -> io::Result<()> {

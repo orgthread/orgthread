@@ -757,45 +757,54 @@ impl Storage for Dropbox {
             return Err(CopyError::Changed { found: hash });
         }
         let folders = new_folders(to, |folder| self.exists(folder))?;
-        let arg = json!({ "from_path": source, "to_path": target, "autorename": false });
-        let reply = match self.rpc("copy_v2", &arg) {
-            Ok(reply) => reply,
-            Err(cause) => return self.after_no_answer(&source, &target, &hash, folders, cause),
-        };
-        match reply.status {
-            200 => match made_of(&reply.body) {
-                Ok((Some(made), size, rev)) => Ok(Copied {
-                    source: hash,
-                    target: made,
-                    size,
-                    rev,
-                    folders,
-                }),
-                // No hash in the answer: one look gives it.
-                Ok((None, size, rev)) => match self.look(&target)? {
-                    Look::File { hash: made, .. } => Ok(Copied {
+        let result = (|| -> Result<Copied, CopyError> {
+            let arg = json!({ "from_path": source, "to_path": target, "autorename": false });
+            let reply = match self.rpc("copy_v2", &arg) {
+                Ok(reply) => reply,
+                Err(cause) => {
+                    return self.after_no_answer(&source, &target, &hash, folders.clone(), cause);
+                }
+            };
+            match reply.status {
+                200 => match made_of(&reply.body) {
+                    Ok((Some(made), size, rev)) => Ok(Copied {
                         source: hash,
                         target: made,
                         size,
                         rev,
-                        folders,
+                        folders: folders.clone(),
                     }),
-                    _ => Err(CopyError::Unexpected {
+                    // No hash in the answer: one look gives it.
+                    Ok((None, size, rev)) => match self.look(&target)? {
+                        Look::File { hash: made, .. } => Ok(Copied {
+                            source: hash,
+                            target: made,
+                            size,
+                            rev,
+                            folders: folders.clone(),
+                        }),
+                        _ => Err(CopyError::Unexpected {
+                            reason: format!(
+                                "Dropbox reported a copy at {target}, but a look finds no file there"
+                            ),
+                        }),
+                    },
+                    Err(kind) => Err(CopyError::Unexpected {
                         reason: format!(
-                            "Dropbox reported a copy at {target}, but a look finds no file there"
+                            "Dropbox copied {source}, but reports {kind} at {target}, not a file"
                         ),
                     }),
                 },
-                Err(kind) => Err(CopyError::Unexpected {
-                    reason: format!(
-                        "Dropbox copied {source}, but reports {kind} at {target}, not a file"
-                    ),
-                }),
-            },
-            409 => Err(copy_refusal(&summary(&reply.body))
-                .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
-            _ => Err(CopyError::Io(refused(&reply))),
-        }
+                409 => Err(copy_refusal(&summary(&reply.body))
+                    .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
+                _ => Err(CopyError::Io(refused(&reply))),
+            }
+        })();
+        // Dropbox makes nothing on a refusal, so only a failure may leave folders.
+        result.map_err(|e| match e {
+            CopyError::Io(_) | CopyError::Unexpected { .. } => e.after(&folders),
+            e => e,
+        })
     }
 
     /// `get_metadata` of the source, a look at the folders of the new name, then
@@ -820,50 +829,63 @@ impl Storage for Dropbox {
             return Err(CopyError::Changed { found: hash });
         }
         let folders = new_folders(to, |folder| self.exists(folder))?;
-        let arg = json!({
-            "from_path": source,
-            "to_path": target,
-            "autorename": false,
-            "allow_ownership_transfer": false,
-        });
-        let reply = match self.rpc("move_v2", &arg) {
-            Ok(reply) => reply,
-            Err(cause) => {
-                return self.after_no_move_answer(&source, &target, &hash, folders, cause);
-            }
-        };
-        match reply.status {
-            200 => match made_of(&reply.body) {
-                Ok((Some(made), size, _)) => Ok(Moved {
-                    source: hash,
-                    target: made,
-                    size,
-                    folders,
-                }),
-                // No hash in the answer: one look gives it.
-                Ok((None, size, _)) => match self.look(&target)? {
-                    Look::File { hash: made, .. } => Ok(Moved {
+        let result = (|| -> Result<Moved, CopyError> {
+            let arg = json!({
+                "from_path": source,
+                "to_path": target,
+                "autorename": false,
+                "allow_ownership_transfer": false,
+            });
+            let reply = match self.rpc("move_v2", &arg) {
+                Ok(reply) => reply,
+                Err(cause) => {
+                    return self.after_no_move_answer(
+                        &source,
+                        &target,
+                        &hash,
+                        folders.clone(),
+                        cause,
+                    );
+                }
+            };
+            match reply.status {
+                200 => match made_of(&reply.body) {
+                    Ok((Some(made), size, _)) => Ok(Moved {
                         source: hash,
                         target: made,
                         size,
-                        folders,
+                        folders: folders.clone(),
                     }),
-                    _ => Err(CopyError::Unexpected {
+                    // No hash in the answer: one look gives it.
+                    Ok((None, size, _)) => match self.look(&target)? {
+                        Look::File { hash: made, .. } => Ok(Moved {
+                            source: hash,
+                            target: made,
+                            size,
+                            folders: folders.clone(),
+                        }),
+                        _ => Err(CopyError::Unexpected {
+                            reason: format!(
+                                "Dropbox reported a move to {target}, but a look finds no file there. Look at {source} and {target}"
+                            ),
+                        }),
+                    },
+                    Err(kind) => Err(CopyError::Unexpected {
                         reason: format!(
-                            "Dropbox reported a move to {target}, but a look finds no file there. Look at {source} and {target}"
+                            "Dropbox moved {source}, but reports {kind} at {target}, not a file"
                         ),
                     }),
                 },
-                Err(kind) => Err(CopyError::Unexpected {
-                    reason: format!(
-                        "Dropbox moved {source}, but reports {kind} at {target}, not a file"
-                    ),
-                }),
-            },
-            409 => Err(copy_refusal(&summary(&reply.body))
-                .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
-            _ => Err(CopyError::Io(refused(&reply))),
-        }
+                409 => Err(copy_refusal(&summary(&reply.body))
+                    .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
+                _ => Err(CopyError::Io(refused(&reply))),
+            }
+        })();
+        // Dropbox makes nothing on a refusal, so only a failure may leave folders.
+        result.map_err(|e| match e {
+            CopyError::Io(_) | CopyError::Unexpected { .. } => e.after(&folders),
+            e => e,
+        })
     }
 
     fn exists(&self, path: &str) -> io::Result<bool> {

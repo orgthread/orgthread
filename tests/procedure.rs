@@ -659,13 +659,34 @@ impl Door {
         self.folder.0.join(path)
     }
     fn run(&self, args: &[&str], stdin: &[u8], fixed: Option<&str>) -> std::process::Output {
+        self.run_as(args, stdin, fixed, None, &self.state.join("writes.log"))
+    }
+    /// The same, with a umask for the program, and a log of its own.
+    fn run_as(
+        &self,
+        args: &[&str],
+        stdin: &[u8],
+        fixed: Option<&str>,
+        umask: Option<&str>,
+        log: &Path,
+    ) -> std::process::Output {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+        let program = env!("CARGO_BIN_EXE_orgthread");
+        let mut c = match umask {
+            None => Command::new(program),
+            Some(mask) => {
+                let mut c = Command::new("/bin/sh");
+                c.arg("-c")
+                    .arg(format!("umask {mask}; exec \"$0\" \"$@\""))
+                    .arg(program);
+                c
+            }
+        };
         c.args(args)
             .env("ORGTHREAD_ROOT", &self.folder.0)
             .env("ORGTHREAD_LOCK_DIR", self.at("org/.locks"))
-            .env("ORGTHREAD_LOG", self.state.join("writes.log"))
+            .env("ORGTHREAD_LOG", log)
             .env("ORGTHREAD_READS", self.state.join("reads"))
             .env("ORGTHREAD_VERSIONS", self.state.join("versions"))
             .env_remove("ORGTHREAD_STORAGE")
@@ -907,5 +928,122 @@ fn a_copy_names_its_new_folders_and_logs_them_first() {
             ("made-folder", "org/new/deep"),
             ("copied", "org/new/deep/c.md"),
         ])
+    );
+}
+
+/// Gives the owner the right to write again, so that the test folder can go.
+fn writable_again(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::process::Command::new("chflags")
+        .args(["-R", "nouchg"])
+        .arg(path)
+        .status();
+    for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o755));
+            writable_again(&p);
+        }
+    }
+}
+
+#[test]
+fn a_write_that_fails_after_its_folders_logs_them_then_failed_and_they_stay() {
+    let d = Door::new();
+    // With umask 222 the first new folder comes without the right to write in
+    // it, so the folder is made, and the file in it fails.
+    fs::write(d.state.join("writes.log"), "").unwrap();
+    let o = d.run_as(
+        &["write", &d.p("org/new/a.md"), "--who", "chat"],
+        b"abc",
+        None,
+        Some("222"),
+        &d.state.join("writes.log"),
+    );
+    let made = d.at("org/new").is_dir();
+    let file = d.at("org/new/a.md").exists();
+    writable_again(&d.folder.0);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(made, "the folder stays");
+    assert!(!file, "no file");
+    assert_eq!(
+        d.words(),
+        pairs(&[("made-folder", "org/new"), ("failed", "org/new/a.md")]),
+        "the made-folder line first, then failed"
+    );
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        said.contains("these new folders were made, and they stay: org/new"),
+        "{said}"
+    );
+    d.folder.assert_locks_empty();
+}
+
+#[test]
+fn a_move_that_fails_after_its_folders_logs_them_before_its_refusal() {
+    let d = Door::new();
+    d.folder.put(FILE, b"old\n");
+    // An immutable file cannot get a second name, so the link fails after the
+    // folders of the new name are made.
+    let locked = std::process::Command::new("chflags")
+        .arg("uchg")
+        .arg(d.at(FILE))
+        .status()
+        .unwrap();
+    assert!(locked.success());
+    let o = d.run(
+        &[
+            "move",
+            &d.p(FILE),
+            &d.p("org/new/deep/a.md"),
+            "--who",
+            "chat",
+        ],
+        b"",
+        None,
+    );
+    writable_again(&d.folder.0);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(d.at("org/new/deep").is_dir(), "the folders stay");
+    assert_eq!(
+        d.folder.get(FILE),
+        b"old\n",
+        "the file stays at its old name"
+    );
+    assert_eq!(
+        d.words(),
+        pairs(&[
+            ("made-folder", "org/new"),
+            ("made-folder", "org/new/deep"),
+            ("move-failed", "org/new/deep/a.md"),
+        ])
+    );
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        said.contains("these new folders were made, and they stay: org/new, org/new/deep"),
+        "{said}"
+    );
+    d.folder.assert_locks_empty();
+}
+
+#[test]
+fn a_made_folder_line_that_fails_gives_exit_8_and_says_so() {
+    let d = Door::new();
+    // A folder in place of the log file: no line can go in.
+    let log = d.state.join("log-is-a-folder");
+    fs::create_dir_all(&log).unwrap();
+    let o = d.run_as(
+        &["write", &d.p("org/new/a.md"), "--who", "chat"],
+        b"abc",
+        None,
+        None,
+        &log,
+    );
+    assert_eq!(o.status.code(), Some(8), "{o:?}");
+    assert_eq!(fs::read(d.at("org/new/a.md")).unwrap(), b"abc", "written");
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        said.contains("the log line failed") && said.contains("\tmade-folder\torg/new\tchat"),
+        "the failed made-folder line is named: {said}"
     );
 }

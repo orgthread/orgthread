@@ -1814,3 +1814,36 @@ fn a_change_to_a_dropbox_file_that_exists_makes_no_extra_look() {
     assert_eq!(code(&o), 0, "{o:?}");
     assert_eq!(f.state.lock().unwrap().metadata_calls - before, 1);
 }
+
+#[test]
+fn a_dropbox_copy_that_fails_after_its_folders_logs_them_before_its_refusal() {
+    let f = Fake::new();
+    f.put(FILE, b"source\n");
+    // Dropbox makes the folders and stores other bytes, then gives no answer.
+    {
+        let mut s = f.state.lock().unwrap();
+        s.copy_hangs_up = Some(true);
+        s.copy_stores = Some(b"other".to_vec());
+    }
+    let o = copy(&f, FILE, "/org/new/deep/d.md");
+    assert_eq!(code(&o), 1, "{o:?}");
+    assert_eq!(
+        f.get("/org/new/deep/d.md").unwrap(),
+        b"other",
+        "never removed"
+    );
+    let want: Vec<(String, String)> = [
+        ("made-folder", "org/new"),
+        ("made-folder", "org/new/deep"),
+        ("failed", "org/new/deep/d.md"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(log_words(&f), want);
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        said.contains("these new folders were made, and they stay: org/new, org/new/deep"),
+        "{said}"
+    );
+}

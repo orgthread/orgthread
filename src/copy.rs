@@ -6,7 +6,7 @@
 //! the log line, release. A copy replaces nothing, so it needs no backup. Its undo
 //! is a delete of that exact copy.
 
-use crate::storage::{CopyError, Expect, RemoveError, Storage};
+use crate::storage::{CopyError, Expect, RemoveError, Storage, still_there};
 use crate::write::{self, Gate, exit};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -137,6 +137,26 @@ fn failed(step: &str, e: impl std::fmt::Display) -> Outcome {
     }
 }
 
+/// The outcome of a copy that the storage refused or that failed.
+fn refusal(e: CopyError, expect: Option<&str>) -> Outcome {
+    match e {
+        CopyError::Exists => Outcome::Exists,
+        CopyError::Missing => Outcome::Missing,
+        CopyError::Folder => Outcome::Folder,
+        CopyError::Changed { found } => Outcome::Changed {
+            expected: expect.unwrap_or_default().to_string(),
+            found,
+        },
+        CopyError::Unexpected { reason } => Outcome::NotRemoved {
+            source: String::new(),
+            target: String::new(),
+            reason,
+        },
+        CopyError::Io(e) => failed("could not copy the file", e),
+        CopyError::After { error, .. } => refusal(*error, expect),
+    }
+}
+
 /// One copy. `expect` is the fingerprint the source must have, from
 /// `--fingerprint`. `line` is the text of the lock: who and when. The lock is the
 /// one of the target, so a copy and a write of the same name never meet.
@@ -164,25 +184,11 @@ pub fn copy(
         }
         let made = match storage.copy(from, to, expect) {
             Ok(made) => made,
-            Err(CopyError::Exists) => return (Outcome::Exists, none()),
-            Err(CopyError::Missing) => return (Outcome::Missing, none()),
-            Err(CopyError::Folder) => return (Outcome::Folder, none()),
-            Err(CopyError::Changed { found }) => {
-                let outcome = Outcome::Changed {
-                    expected: expect.unwrap_or_default().to_string(),
-                    found,
-                };
-                return (outcome, none());
+            // New folders made before the error stay, and the log names them.
+            Err(e) => {
+                let folders = still_there(storage, e.folders());
+                return (refusal(e, expect), folders);
             }
-            Err(CopyError::Unexpected { reason }) => {
-                let outcome = Outcome::NotRemoved {
-                    source: String::new(),
-                    target: String::new(),
-                    reason,
-                };
-                return (outcome, none());
-            }
-            Err(CopyError::Io(e)) => return (failed("could not copy the file", e), none()),
         };
         let folders = made.folders.clone();
         if made.source == made.target {

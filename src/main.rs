@@ -12,7 +12,7 @@ use orgthread::reads::Reads;
 use orgthread::screen;
 use orgthread::serve;
 use orgthread::stop;
-use orgthread::storage::{Expect, LocalFolder, Storage, new_folders};
+use orgthread::storage::{Expect, LocalFolder, Storage, new_folders, still_there};
 use orgthread::transfer;
 use orgthread::versions::Versions;
 use orgthread::write::{self, Outcome, Refusal, exit};
@@ -978,10 +978,9 @@ fn write_whole(
     // after its folders were made leaves them, and the log says so.
     let made: Vec<String> = match &report.outcome {
         Outcome::Written { folders, .. } => folders.clone(),
-        Outcome::Failed { .. } | Outcome::Restored { .. } | Outcome::NotRestored { .. } => folders
-            .into_iter()
-            .filter(|folder| storage.exists(folder).unwrap_or(false))
-            .collect(),
+        Outcome::Failed { .. } | Outcome::Restored { .. } | Outcome::NotRestored { .. } => {
+            still_there(storage.as_ref(), folders)
+        }
         _ => Vec::new(),
     };
     Ok(finish(
@@ -1394,6 +1393,12 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
             "another writer may have been at work during this copy. Check {to}. That writer: {other}"
         ));
     }
+    if !report.folders.is_empty() && !matches!(report.outcome, copy::Outcome::Copied { .. }) {
+        say(format!(
+            "these new folders were made, and they stay: {}",
+            report.folders.join(", ")
+        ));
+    }
     for failure in &failures {
         say(failure.clone());
     }
@@ -1507,6 +1512,12 @@ fn cmd_move(args: &[String]) -> Result<i32, String> {
     if let Some(other) = &report.lock_lost {
         say(format!(
             "another writer may have been at work during this move. Check {from} and {to}. That writer: {other}"
+        ));
+    }
+    if !report.folders.is_empty() && !matches!(report.outcome, mv::Outcome::Moved { .. }) {
+        say(format!(
+            "these new folders were made, and they stay: {}",
+            report.folders.join(", ")
         ));
     }
     for failure in &failures {

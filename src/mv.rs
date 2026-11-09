@@ -8,7 +8,7 @@
 //! release. The way back is a second move, from the new name to the old one.
 
 use crate::copy::source_field;
-use crate::storage::{CopyError, Moved, Storage};
+use crate::storage::{CopyError, Moved, Storage, still_there};
 use crate::write::{self, Gate, exit, is_under};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -264,6 +264,35 @@ pub fn move_file(
     }
 }
 
+/// The outcome of a move that the storage refused or that failed.
+fn refusal(e: CopyError, expect: Option<&str>) -> Outcome {
+    match e {
+        CopyError::Exists => Outcome::Exists,
+        CopyError::Missing => Outcome::Missing,
+        CopyError::Folder => Outcome::Folder,
+        CopyError::Changed { found } => Outcome::Changed {
+            expected: expect.unwrap_or_default().to_string(),
+            found,
+        },
+        CopyError::Unexpected { reason } => Outcome::Unexpected { reason },
+        CopyError::Io(e) => failed("could not move the file", e),
+        CopyError::After { error, .. } => refusal(*error, expect),
+    }
+}
+
+/// Why a move back to the old name failed, in plain words.
+fn why_back(e: CopyError, from: &str, to: &str) -> String {
+    match e {
+        CopyError::Exists => format!("a file is at {from} again"),
+        CopyError::Missing => format!("{to} is gone already"),
+        CopyError::Changed { found } => format!("it changed again, to fingerprint {found}"),
+        CopyError::Folder => format!("{to} is a folder now"),
+        CopyError::Unexpected { reason } => reason,
+        CopyError::Io(e) => e.to_string(),
+        CopyError::After { error, .. } => why_back(*error, from, to),
+    }
+}
+
 /// The steps under both locks: the move, and the check of `--fingerprint` at
 /// the new name.
 fn steps(
@@ -274,19 +303,10 @@ fn steps(
 ) -> (Outcome, Vec<String>) {
     let moved = match storage.move_file(from, to, expect) {
         Ok(moved) => moved,
+        // New folders made before the error stay, and the log names them.
         Err(e) => {
-            let outcome = match e {
-                CopyError::Exists => Outcome::Exists,
-                CopyError::Missing => Outcome::Missing,
-                CopyError::Folder => Outcome::Folder,
-                CopyError::Changed { found } => Outcome::Changed {
-                    expected: expect.unwrap_or_default().to_string(),
-                    found,
-                },
-                CopyError::Unexpected { reason } => Outcome::Unexpected { reason },
-                CopyError::Io(e) => failed("could not move the file", e),
-            };
-            return (outcome, Vec::new());
+            let folders = still_there(storage, e.folders());
+            return (refusal(e, expect), folders);
         }
     };
     let Moved {
@@ -306,16 +326,7 @@ fn steps(
                 found: target,
             },
             Err(e) => {
-                let why = match e {
-                    CopyError::Exists => format!("a file is at {from} again"),
-                    CopyError::Missing => format!("{to} is gone already"),
-                    CopyError::Changed { found } => {
-                        format!("it changed again, to fingerprint {found}")
-                    }
-                    CopyError::Folder => format!("{to} is a folder now"),
-                    CopyError::Unexpected { reason } => reason,
-                    CopyError::Io(e) => e.to_string(),
-                };
+                let why = why_back(e, from, to);
                 Outcome::Unexpected {
                     reason: format!(
                         "{from} changed during the move, to fingerprint {target}, not {want}, and moving it back failed: {why}. It is at {to} now"
