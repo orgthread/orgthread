@@ -49,6 +49,12 @@ struct State {
     copy_stores: Option<Vec<u8>>,
     /// The next `delete_v2` fails with a server error.
     delete_fails: bool,
+    /// The argument of each `move_v2` call.
+    moves: Vec<Value>,
+    /// The next move hangs up with no answer: after it moved the file, or before.
+    move_hangs_up: Option<bool>,
+    /// The next move finds these bytes in the file, as if a write landed in between.
+    move_finds: Option<Vec<u8>>,
 }
 
 impl State {
@@ -239,6 +245,44 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
                 return;
             }
             let bytes = s.copy_stores.take().unwrap_or(bytes);
+            s.put(&to, &bytes);
+            if hang_up == Some(true) {
+                return;
+            }
+            let file = &s.files[&to];
+            let v = json!({ "metadata": {
+                ".tag": "file",
+                "name": to.rsplit('/').next().unwrap_or(""),
+                "size": file.bytes.len(),
+                "rev": file.rev.to_string(),
+                "content_hash": fingerprint(&file.bytes),
+            }});
+            reply(&mut stream, 200, v.to_string().as_bytes());
+        }
+        "/2/files/move_v2" => {
+            s.moves.push(arg.clone());
+            assert_eq!(arg["autorename"], false);
+            assert_eq!(arg["allow_ownership_transfer"], false);
+            let from = arg["from_path"].as_str().unwrap_or("").to_string();
+            let to = arg["to_path"].as_str().unwrap_or("").to_string();
+            let folder_at = |p: &str| s.children(p).is_ok() && !s.files.contains_key(p);
+            if s.files.contains_key(&to) || folder_at(&to) {
+                return error(&mut stream, "to/conflict/file/..");
+            }
+            if folder_at(&from) {
+                return error(&mut stream, "from_lookup/not_file/..");
+            }
+            let Some(mut bytes) = s.files.get(&from).map(|f| f.bytes.clone()) else {
+                return error(&mut stream, "from_lookup/not_found/..");
+            };
+            let hang_up = s.move_hangs_up.take();
+            if hang_up == Some(false) {
+                return;
+            }
+            if let Some(found) = s.move_finds.take() {
+                bytes = found;
+            }
+            s.files.remove(&from);
             s.put(&to, &bytes);
             if hang_up == Some(true) {
                 return;
@@ -1450,4 +1494,197 @@ fn a_copy_and_a_write_of_one_target_share_one_lock() {
     let o = copy(&f, FILE, "/org/b.md");
     assert_eq!(code(&o), 3, "{o:?}");
     assert_eq!(f.state.lock().unwrap().copies.len(), 0);
+}
+
+fn mv(f: &Fake, from: &str, to: &str) -> Output {
+    f.run(&["move", from, to, "--who", "chat"], b"")
+}
+
+fn mv_print(f: &Fake, from: &str, to: &str, print: &str) -> Output {
+    f.run(
+        &["move", from, to, "--who", "chat", "--fingerprint", print],
+        b"",
+    )
+}
+
+#[test]
+fn a_dropbox_move_is_one_move_call_that_never_renames_and_names_the_new_folders() {
+    let f = Fake::new();
+    f.put(FILE, "Grüße\n".as_bytes());
+    let o = mv(&f, FILE, "/org/new/deep/b.md");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let print = fingerprint("Grüße\n".as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        format!(
+            "moved: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}, new folders: org/new, org/new/deep\nnote: the file name changed, so wikilinks to [[invented]] break. Fix them to the new name.\n"
+        )
+    );
+    assert_eq!(f.get("/org/new/deep/b.md").unwrap(), "Grüße\n".as_bytes());
+    assert_eq!(f.get(FILE), None, "the old name is gone");
+    let s = f.state.lock().unwrap();
+    assert_eq!(
+        s.metadata_calls, 4,
+        "one look at the file, and one at each folder up to the first that exists"
+    );
+    assert_eq!(s.downloads, 0, "no byte passes this server");
+    assert_eq!(
+        s.moves,
+        [json!({
+            "from_path": FILE,
+            "to_path": "/org/new/deep/b.md",
+            "autorename": false,
+            "allow_ownership_transfer": false,
+        })]
+    );
+    drop(s);
+    assert_eq!(
+        last_log(&f)[1..],
+        [
+            "moved",
+            "org/new/deep/b.md",
+            "chat",
+            "-",
+            print.as_str(),
+            "8",
+            "/org/notes/invented.md"
+        ]
+    );
+    assert!(fs::read_dir(f.dir.join("locks")).unwrap().next().is_none());
+    // The way back is a move back, with or without the first slash.
+    assert_eq!(code(&mv(&f, "org/new/deep/b.md", FILE)), 0);
+    assert_eq!(f.get(FILE).unwrap(), "Grüße\n".as_bytes());
+}
+
+#[test]
+fn a_dropbox_new_name_that_exists_stays_and_gets_exit_5() {
+    let f = Fake::new();
+    f.put(FILE, b"new\n");
+    f.put("/org/notes/b.md", b"old\n");
+    let o = mv(&f, FILE, "org/notes/b.md");
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(f.get("/org/notes/b.md").unwrap(), b"old\n");
+    assert_eq!(f.get(FILE).unwrap(), b"new\n");
+    assert_eq!(last_log(&f)[1], "move-exists");
+    let o = mv(&f, FILE, "/org/notes");
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(f.get(FILE).unwrap(), b"new\n");
+}
+
+#[test]
+fn in_dropbox_no_file_is_6_a_folder_2_and_another_version_4_with_no_move_call() {
+    let f = Fake::new();
+    let o = mv(&f, "/org/notes/gone.md", "/org/b.md");
+    assert_eq!(code(&o), 6, "{o:?}");
+    assert_eq!(last_log(&f)[1], "move-missing");
+    f.put(FILE, b"edited\n");
+    let o = mv(&f, "/org/notes", "/org/b.md");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert_eq!(last_log(&f)[1], "move-folder");
+    let o = mv_print(&f, FILE, "/org/b.md", &fingerprint(b"seen\n"));
+    assert_eq!(code(&o), 4, "{o:?}");
+    assert_eq!(last_log(&f)[1], "move-changed");
+    assert!(
+        f.state.lock().unwrap().moves.is_empty(),
+        "no move_v2 for any of them"
+    );
+    assert_eq!(f.get(FILE).unwrap(), b"edited\n");
+    let o = mv_print(&f, FILE, "/org/b.md", &fingerprint(b"edited\n"));
+    assert_eq!(code(&o), 0, "{o:?}");
+}
+
+#[test]
+fn a_file_that_changed_during_a_dropbox_move_goes_back_with_exit_7() {
+    let f = Fake::new();
+    f.put(FILE, b"seen\n");
+    f.state.lock().unwrap().move_finds = Some(b"a later edit\n".to_vec());
+    let o = mv_print(&f, FILE, "/org/b.md", &fingerprint(b"seen\n"));
+    assert_eq!(code(&o), 7, "{o:?}");
+    assert_eq!(f.get(FILE).unwrap(), b"a later edit\n", "moved back");
+    assert_eq!(f.get("/org/b.md"), None);
+    let line = last_log(&f);
+    assert_eq!(line[1], "moved-back");
+    assert_eq!(line[5], fingerprint(b"a later edit\n"));
+    let moves = f.state.lock().unwrap().moves.clone();
+    assert_eq!(moves.len(), 2);
+    assert_eq!(moves[1]["from_path"], "/org/b.md");
+    assert_eq!(moves[1]["to_path"], FILE);
+}
+
+#[test]
+fn with_no_answer_to_a_move_one_look_at_each_name_tells() {
+    let f = Fake::new();
+    f.put(FILE, b"text\n");
+    // The file moved: done, exit 0.
+    f.state.lock().unwrap().move_hangs_up = Some(true);
+    let o = mv(&f, FILE, "/org/b.md");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(last_log(&f)[1], "moved");
+    // The file did not move: exit 1, and the task can try again.
+    f.state.lock().unwrap().move_hangs_up = Some(false);
+    let o = mv(&f, "/org/b.md", "/org/c.md");
+    assert_eq!(code(&o), 1, "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("nothing moved. Try again"),
+        "{o:?}"
+    );
+    assert_eq!(code(&mv(&f, "/org/b.md", "/org/c.md")), 0);
+}
+
+#[test]
+fn the_setting_of_moves_holds_for_both_dropbox_names() {
+    let f = Fake::new();
+    f.put("/org/health/diet/d.md", b"diet\n");
+    f.put("/org/notes/n.md", b"note\n");
+    let allow = [(
+        "ORGTHREAD_MOVE_ALLOW",
+        "/org/health/diet,/org/health/log,/org/proposals",
+    )];
+    let run = |from: &str, to: &str| f.run_with_env(&["move", from, to, "--who", "x"], b"", &allow);
+    assert_eq!(
+        code(&run("/org/health/diet/d.md", "org/health/log/2026-11/d.md")),
+        0
+    );
+    let o = run("/org/notes/n.md", "/org/proposals/n.md");
+    assert_eq!(code(&o), 2, "{o:?}");
+    let o = run("org/health/log/2026-11/d.md", "/org/notes/d.md");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert_eq!(last_log(&f)[1], "move-not-allowed");
+    assert_eq!(
+        f.state.lock().unwrap().moves.len(),
+        1,
+        "no call for a refusal"
+    );
+    // The limits of the door hold for both names too.
+    let ro = [("ORGTHREAD_READ_ONLY", "/org/notes")];
+    let o = f.run_with_env(
+        &["move", "/org/notes/n.md", "/org/n.md", "--who", "x"],
+        b"",
+        &ro,
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(f.get("/org/notes/n.md").is_some());
+}
+
+#[test]
+fn on_a_server_the_name_decides_if_a_moved_file_is_not_text() {
+    let f = Fake::new();
+    f.put("/org/notes/photo.jpg", b"\x89PNG\x00");
+    let o = mv(&f, "/org/notes/photo.jpg", "/org/notes/b.jpg");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert_eq!(last_log(&f)[1], "move-not-text");
+    let open = [("ORGTHREAD_BINARY_ALLOW", "/org/pictures")];
+    let o = f.run_with_env(
+        &[
+            "move",
+            "/org/notes/photo.jpg",
+            "/org/pictures/b.jpg",
+            "--who",
+            "x",
+        ],
+        b"",
+        &open,
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(f.get("/org/pictures/b.jpg").is_some());
 }

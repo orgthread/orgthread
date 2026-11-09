@@ -13,6 +13,7 @@ orgthread download <file> --who <name> --to <copy>
 orgthread upload <file> --who <name>  < any file
 orgthread delete <file> --who <name>
 orgthread copy <file> <new> --who <name>
+orgthread move <file> <new> --who <name>
 orgthread watch
 ```
 
@@ -37,6 +38,8 @@ For a file that is not text, such as a picture or a PDF, `download` gives the ex
 
 `copy` makes a new file with the exact bytes of one file. It never replaces a file: if anything is at the new name, it gives exit code 5 and copies nothing. It makes the missing folders of the new name. The source must be open to read, and the new name open to write. A file that is not text may go only to the folders of `ORGTHREAD_BINARY_ALLOW`. `--fingerprint <hash>`, for example from `list --fingerprint`, refuses a source of another version with exit code 4. After the copy, the fingerprint of the new file must be the one of the source. If not, the copy is removed again: exit code 7, or 9 if that fails. With Dropbox, the copy is made inside Dropbox, so no byte passes the server, and there only the names tell whether a file is not text. The log line `copied` has the source as its 8th field.
 
+`move` moves one file to a new name, and a rename is a move in the same folder. It never replaces a file: if anything is at the new name, it gives exit code 5 and moves nothing. It makes the missing folders of the new name, and names them in the answer. Only a file moves: a folder gives exit code 2. Both names must be open to write. When `ORGTHREAD_MOVE_ALLOW` names folders, both names must lie in them, else exit code 2. A file that is not text may go only to the folders of `ORGTHREAD_BINARY_ALLOW`. `--fingerprint <hash>` refuses a file of another version with exit code 4. With it, a file that changed during the move goes back to its old name: exit code 7, or 9 if that fails. When the name of a `.md` file changes, the answer adds a line that wikilinks to the old name break. The log line `moved` has the old name as its 8th field. The way back is a move from the new name to the old one.
+
 The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists the codes, and [docs/exit-codes.md](docs/exit-codes.md) says which command gives each one and what to do.
 
 The fingerprint is the content hash that Dropbox reports. Today the tool writes to a local folder, behind one small storage interface.
@@ -51,7 +54,7 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## MCP
 
-Two MCP servers give the same read, write, patch, delete, copy and list to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
+Two MCP servers give the same read, write, patch, delete, copy, move and list to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 To set up the local door on a Mac with a plain folder, such as `~/notes`, with no Dropbox and no server, follow [docs/local-folder.md](docs/local-folder.md).
 

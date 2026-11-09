@@ -17,6 +17,7 @@ pub mod history;
 pub mod list;
 pub mod log;
 pub mod login;
+pub mod mv;
 pub mod patch;
 pub mod reads;
 pub mod screen;

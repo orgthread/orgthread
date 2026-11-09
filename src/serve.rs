@@ -401,6 +401,44 @@ fn tools(remote: bool) -> Value {
             },
         },
         {
+            "name": "move",
+            "description": "Moves files to new names in the same storage. A rename is a move \
+                in the same folder. Each pair names a file, from, and its new name, to. Up to \
+                100 pairs in one call. For more, call again with the rest. The pairs run one by \
+                one, in order. A move never replaces a file: if anything is at the new name, \
+                that pair is refused as existing. Missing folders of the new name are made, \
+                and the answer names them. Only files move, never a folder. The rules of write \
+                hold for both names, and where the owner named the folders open for moves, \
+                both names must lie in them. A file that is not text may go only to the \
+                folders that the owner allowed. With fingerprint, from list with fingerprint, \
+                a file of another version is refused as changed. Each pair gives one line: \
+                moved, with the size, the fingerprint and any new folders, or refused with its \
+                exit code and the reason. A renamed Markdown file adds a line that wikilinks to \
+                its old name break. The pairs that passed stay moved. The way back is a move \
+                from the new name to the old one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pairs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_MOVES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string", "description": "The full path of the file. On a server, from the root of the Dropbox: /org/a.md"},
+                                "to": {"type": "string", "description": "The full path of its new name, which must not exist yet"},
+                                "fingerprint": {"type": "string", "description": "Only when the file must be one version: its fingerprint"},
+                            },
+                            "required": ["from", "to"],
+                        },
+                    },
+                    "who": who,
+                },
+                "required": ["pairs", "who"],
+            },
+        },
+        {
             "name": "list",
             "description": "Lists the files and folders in one or more folders: one group per \
                 folder, and per entry its size in bytes, its time and its name. A folder name \
@@ -533,8 +571,12 @@ const BLOCKED: &str = "If curl says CONNECT tunnel failed, response 403, the req
     Capabilities, Allowed websites. An empty answer with HTTP 404 means that the link \
     was used already: ask the tool for a new one.";
 
-/// At most this many files in one call of download or upload.
+/// At most this many files in one call of download or upload, and pairs of copy.
 const MAX_FILES: usize = 25;
+
+/// At most this many pairs in one call of move. A move carries two names and
+/// no bytes, so it needs no link that must start in time, as a download does.
+const MAX_MOVES: usize = 100;
 
 /// One link for each file, after the same checks as the command makes. A file
 /// that is refused gets its reason, and the others still get their links.
@@ -669,7 +711,8 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
             args.push(text_of("file")?);
             return Ok(result(name, start(exe, &args, None)));
         }
-        Some("copy") => return copy_pairs(params, exe),
+        Some("copy") => return run_pairs(params, exe, "copy", MAX_FILES),
+        Some("move") => return run_pairs(params, exe, "move", MAX_MOVES),
         Some("list") => {
             let owned = list_args(params)?;
             let args: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -685,20 +728,24 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
     Ok(result(name, start(exe, &args, text)))
 }
 
-/// One `orgthread copy` for each pair, in order. A pair that is refused gets its
-/// line with the exit code, and the next pairs still run. The answer starts with
-/// the code of the first pair that failed.
-fn copy_pairs(params: &Value, exe: &Path) -> Result<Value, (i32, String)> {
-    let wrong = |what: &str| (INVALID_PARAMS, format!("copy needs {what}"));
+/// One `orgthread copy` or `orgthread move` for each pair, in order. A pair that
+/// is refused gets its line with the exit code, and the next pairs still run. The
+/// answer starts with the code of the first pair that failed.
+fn run_pairs(params: &Value, exe: &Path, tool: &str, most: usize) -> Result<Value, (i32, String)> {
+    let wrong = |what: &str| (INVALID_PARAMS, format!("{tool} needs {what}"));
     let arguments = &params["arguments"];
     let who = arguments["who"]
         .as_str()
         .ok_or_else(|| wrong("who, as text"))?;
     let pairs = arguments["pairs"]
         .as_array()
-        .filter(|p| (1..=MAX_FILES).contains(&p.len()))
-        .ok_or_else(|| wrong("pairs, as a list of 1 to 25 pairs of from and to"))?;
-    // Every pair is checked before the first copy, so wrong use copies nothing.
+        .filter(|p| (1..=most).contains(&p.len()))
+        .ok_or_else(|| {
+            wrong(&format!(
+                "pairs, as a list of 1 to {most} pairs of from and to"
+            ))
+        })?;
+    // Every pair is checked before the first one runs, so wrong use changes nothing.
     let mut runs = Vec::new();
     for pair in pairs {
         let from = pair["from"]
@@ -717,7 +764,7 @@ fn copy_pairs(params: &Value, exe: &Path) -> Result<Value, (i32, String)> {
     let mut lines = Vec::new();
     let mut first_failed = None;
     for (from, to, print) in runs {
-        let mut args = vec!["copy", "--who", who];
+        let mut args = vec![tool, "--who", who];
         if let Some(print) = print {
             args.extend(["--fingerprint", print]);
         }
@@ -1080,5 +1127,10 @@ mod tests {
                 .contains("Up to 25 pairs in one call. For more, call again with the rest.")
         );
         assert_eq!(MAX_FILES, 25);
+        assert!(
+            says("move")
+                .contains("Up to 100 pairs in one call. For more, call again with the rest.")
+        );
+        assert_eq!(MAX_MOVES, 100);
     }
 }

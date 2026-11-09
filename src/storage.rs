@@ -101,6 +101,42 @@ impl From<io::Error> for CopyError {
     }
 }
 
+/// What a move did. A move gives the same refusals as a copy, so it shares
+/// `CopyError`: `Unexpected` then says where the file may be now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Moved {
+    /// The fingerprint of the file before the move, as the check found it.
+    pub source: String,
+    /// The fingerprint of the file at the new name, after the move.
+    pub target: String,
+    /// The size in bytes of the file at the new name.
+    pub size: u64,
+    /// The folders the move made for the new name, from the root, the outer one
+    /// first. Empty when the folder of the new name existed.
+    pub folders: Vec<String>,
+}
+
+/// The folders of `path` that do not exist yet, the outer one first. `exists`
+/// looks at one folder, named from the root. The look stops at the first folder
+/// that exists, so a path in a known folder costs one look.
+pub fn new_folders(
+    path: &str,
+    mut exists: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<Vec<String>> {
+    let path = path.trim_start_matches('/');
+    let mut missing = Vec::new();
+    let mut folder = path;
+    while let Some((parent, _)) = folder.rsplit_once('/') {
+        if parent.is_empty() || exists(parent)? {
+            break;
+        }
+        missing.push(parent.to_string());
+        folder = parent;
+    }
+    missing.reverse();
+    Ok(missing)
+}
+
 /// One entry of a folder, as a list shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -218,6 +254,18 @@ pub trait Storage {
         Err(CopyError::Io(io::Error::new(
             ErrorKind::Unsupported,
             "this storage cannot copy a file",
+        )))
+    }
+
+    /// Moves one file to a new name, also a new name in the same folder. It never
+    /// replaces anything at `to`, and it makes the missing parent folders of `to`.
+    /// With `expect`, the source must have that fingerprint, or nothing moves.
+    /// A folder is never moved.
+    fn move_file(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Moved, CopyError> {
+        let _ = (from, to, expect);
+        Err(CopyError::Io(io::Error::new(
+            ErrorKind::Unsupported,
+            "this storage cannot move a file",
         )))
     }
 
@@ -624,6 +672,77 @@ impl Storage for LocalFolder {
         })();
         let _ = fs::remove_file(&temp);
         made
+    }
+
+    /// A hard link puts the file at the new name, and then the old name goes.
+    /// The link never replaces a file, so a file that appeared at the new name
+    /// meanwhile stays as it is. Only std is used: there is no rename that
+    /// refuses a target in std. If the old name cannot go, the new link goes
+    /// again, so the file is never left at two names without a word.
+    fn move_file(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Moved, CopyError> {
+        let source = self.full(from);
+        let target = self.full(to);
+        match fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(CopyError::Folder),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
+            Err(e) => return Err(e.into()),
+        }
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(CopyError::Exists);
+        }
+        let (print, _) = match Self::print_of(&source) {
+            Ok(found) => found,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(want) = expect
+            && want != print
+        {
+            return Err(CopyError::Changed { found: print });
+        }
+        let folders = new_folders(to, |folder| {
+            Ok(fs::symlink_metadata(self.full(folder)).is_ok())
+        })?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::hard_link(&source, &target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(CopyError::Exists),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(CopyError::Missing),
+            Err(e) => return Err(e.into()),
+        }
+        Self::sync_parent(&target);
+        if let Err(e) = fs::remove_file(&source) {
+            return match fs::remove_file(&target) {
+                Ok(()) => {
+                    Self::sync_parent(&target);
+                    Err(CopyError::Io(io::Error::other(format!(
+                        "the old name could not go ({e}), so the new name is removed again, and nothing moved"
+                    ))))
+                }
+                Err(again) => Err(CopyError::Unexpected {
+                    reason: format!(
+                        "the file is at both names now: the old name could not go ({e}), and the new name could not go again ({again})"
+                    ),
+                }),
+            };
+        }
+        Self::sync_parent(&source);
+        match Self::print_of(&target) {
+            Ok((after, size)) => Ok(Moved {
+                source: print,
+                target: after,
+                size,
+                folders,
+            }),
+            Err(e) => Err(CopyError::Unexpected {
+                reason: format!(
+                    "the file moved, but it could not be read back at the new name: {e}"
+                ),
+            }),
+        }
     }
 
     fn restore(&self, path: &str, old: Option<&[u8]>) -> io::Result<()> {

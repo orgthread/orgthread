@@ -21,6 +21,8 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `check` | Optional: `true` only checks the rules and the version, and deletes nothing. The default is `false` |
 | `copy` | `pairs` | A list of 1 to 25 pairs. Each pair has `from`, the full path of the source, and `to`, the full path of the new file. An optional `fingerprint` is the version the source must have |
 | | `who` | The name of this chat, the same one each time |
+| `move` | `pairs` | A list of 1 to 100 pairs. Each pair has `from`, the full path of the file, and `to`, the full path of its new name. An optional `fingerprint` is the version the file must have |
+| | `who` | The name of this chat, the same one each time |
 | `list` | `folders` | A list of full paths of folders, at least one |
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
@@ -31,7 +33,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one each time |
 | `version` | | No fields |
 
-The fields of `read` and `write` are all required, `file` and `who` of `patch` and `delete`, and `pairs` and `who` of `copy`, with `from` and `to` in each pair. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
+The fields of `read` and `write` are all required, `file` and `who` of `patch` and `delete`, and `pairs` and `who` of `copy` and `move`, with `from` and `to` in each pair. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
 
 `read` gives the exact text of the file, and notes what this name read.
 
@@ -110,6 +112,28 @@ copied: notes/plan.md -> archive/2026/plan.md, 17 bytes, 4c79418b76038c58388a702
 
 The log line of a copy has 8 fields: the time, `copied`, the new name, the name of the chat, `-`, the fingerprint, the size, and the source with a `/` at its start, for example `/notes/plan.md`. A refused copy has the same 8th field, so `orgthread watch` names it as a copy, never as a delete.
 
+`move` moves files to new names, one pair at a time, in the order given. A rename is a move in the same folder:
+
+- Up to 100 pairs in one call. For more, call again with the rest. 101 pairs are wrong use: a JSON-RPC error with the code -32602, and nothing moves. The same holds for a pair with no `from` or `to`.
+- It never replaces a file. If anything is at `to`, a file or a folder, that pair is refused with code 5.
+- It makes the missing folders of `to`, and the answer names each new folder.
+- Only a file moves. A folder as `from` is refused with code 2.
+- Both names must be open to write, as for `write`: the old name goes, and the new one comes. When the owner set `ORGTHREAD_MOVE_ALLOW`, both names must lie in its folders, else the pair is refused with code 2. A file that is not text may go only to the folders that the owner allowed, as for `copy`.
+- With `fingerprint`, a file of another version is refused with code 4. Without it, the file moves as it is. With it, a file that changed during the move goes back to its old name, code 7 and the log word `moved-back`, or 9 and `move-unexpected` if that fails.
+- When the name of a `.md` file changes, the answer adds a line that wikilinks to the old name break.
+- With Dropbox, the move is made inside Dropbox: one look at the file, one look at each folder of `to` up to the first that exists, and the move. No byte passes the server. If Dropbox gives no answer, one look at each name tells whether the file moved.
+- The local door puts a hard link at the new name and then removes the old name. If the old name cannot go, the new link goes again, and nothing moved.
+- Each pair gives one line: `moved:`, the old name, the new name, the size, the fingerprint and any new folders, or `refused, exit code N:` and the reason. The pairs that passed stay moved, and the next pairs still run. With a refusal, the text starts with `exit code N` of the first pair that failed.
+
+```
+exit code 5
+moved: notes/plan.md -> archive/2026/goal.md, 7 bytes, 87afb3039633ba948c38379fa4492c55e2643bec006a343599b34b66ddd6c2fe, new folders: archive, archive/2026
+note: the file name changed, so wikilinks to [[plan]] break. Fix them to the new name.
+/tmp/claude/example-move/root/notes/taken.md -> /tmp/claude/example-move/root/archive/2026/goal.md  refused, exit code 5: refused, nothing moved. archive/2026/goal.md exists, and a move never replaces a file. Choose another new name.
+```
+
+The log line of a move has 8 fields: the time, `moved`, the new name, the name of the chat, `-`, the fingerprint, the size, and the old name with a `/` at its start, for example `/notes/plan.md`. Every word of a move line starts with `move`, such as `move-exists` for a refusal, so `orgthread watch` names it as a move, never as a copy or a delete. The way back is a move from the new name to the old one.
+
 `download` and `upload` give one line for each file, in the order given. A line that works gives the path, for a download the size, and the link last. A file that is refused gets `refused, exit code N:` and the reason, and the others still get their links. With a refusal, the text starts with `exit code N` of the first file that failed. Use each link at once in the code sandbox, and never show, store or log it:
 
 ```
@@ -127,7 +151,7 @@ curl -sS -T p088-1.jpg '<link>'
 orgthread 0.2.5 (abc1234)
 door: remote
 storage: Dropbox
-tools: read, write, patch, delete, copy, list, download, upload, version
+tools: read, write, patch, delete, copy, move, list, download, upload, version
 ```
 
 - The first line is the same as `orgthread --version`. A `+` after the commit means that the build had changes not yet committed.

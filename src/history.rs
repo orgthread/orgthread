@@ -543,6 +543,7 @@ pub mod tests {
             size: String::new(),
             delete: false,
             copy_from: None,
+            move_from: None,
         }
     }
 

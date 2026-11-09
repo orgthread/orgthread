@@ -27,6 +27,10 @@ pub struct Entry {
     /// The line comes from a copy: its 8th field, the source, starts with `/`.
     /// This is the source, with no `/` at its start.
     pub copy_from: Option<String>,
+    /// The line comes from a move: its 8th field, the old name, starts with `/`,
+    /// and its word starts with `move`. This is the old name, with no `/` at its
+    /// start. A move line has no `copy_from`.
+    pub move_from: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,8 +54,9 @@ pub struct Snapshot {
 }
 
 /// One log line, or `None` when it does not have the seven fields. An 8th field
-/// is the rev of a delete, the mark of a refused delete, or the source of a copy,
-/// which starts with `/`.
+/// is the rev of a delete, the mark of a refused delete, or the source of a copy
+/// or the old name of a move, which start with `/`. The word of a move starts
+/// with `move`.
 pub fn parse_line(line: &str) -> Option<Entry> {
     let f: Vec<&str> = line.split('\t').collect();
     let (eighth, &[time, outcome, path, who, before, after, size, ..]) = (f.get(7), &f[..]) else {
@@ -60,10 +65,10 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     if f.len() > 8 {
         return None;
     }
-    let copy_from = eighth
+    let from = eighth
         .and_then(|field| field.strip_prefix('/'))
         .map(str::to_string);
-    // A copy line has a `/` at the start of its 8th field, so it never matches.
+    // A copy or move line has a `/` at the start of its 8th field, so it never matches.
     let delete = outcome == "deleted" || eighth == Some(&crate::delete::REFUSED_MARK);
     let clean = |v: &str| {
         if v == "-" {
@@ -81,7 +86,8 @@ pub fn parse_line(line: &str) -> Option<Entry> {
         after: clean(after),
         size: clean(size),
         delete,
-        copy_from,
+        copy_from: from.clone().filter(|_| !crate::mv::is_move_word(outcome)),
+        move_from: from.filter(|_| crate::mv::is_move_word(outcome)),
     })
 }
 
@@ -191,9 +197,12 @@ pub fn is_written(outcome: &str) -> bool {
     outcome == "written" || outcome == "patched"
 }
 
-/// The reason in plain words, for this entry: a delete and a copy have their own texts.
+/// The reason in plain words, for this entry: a delete, a copy and a move have
+/// their own texts.
 pub fn why_of(entry: &Entry) -> &'static str {
-    if entry.copy_from.is_some() {
+    if entry.move_from.is_some() {
+        why_move(&entry.outcome)
+    } else if entry.copy_from.is_some() {
         why_copy(&entry.outcome)
     } else if entry.delete {
         why_delete(&entry.outcome)
@@ -238,6 +247,32 @@ pub fn why_copy(outcome: &str) -> &'static str {
             "The copy differed from the source, and it could not be removed. Look at this file now."
         }
         "failed" => "The copy failed. Nothing was copied, unless the message says otherwise.",
+        _ => "This outcome is not known to this version.",
+    }
+}
+
+/// The reason of a move line in plain words.
+pub fn why_move(outcome: &str) -> &'static str {
+    match outcome {
+        "moved" => {
+            "The file was moved to this new name, and checked there. The way back is a move to its old name."
+        }
+        "move-exists" => "A file or folder is at the new name already. Nothing was moved.",
+        "move-missing" => "There is no file at the old name. Nothing was moved.",
+        "move-folder" => "The old name is a folder, and only a file is moved. Nothing was moved.",
+        "move-changed" => "The file is not the version that was expected. Nothing was moved.",
+        "move-not-allowed" => {
+            "The old or the new name is closed to this door, or outside the folders open for moves. Nothing was moved."
+        }
+        "move-not-text" => {
+            "The file is not text, and the new name is outside the folders open for such files. Nothing was moved."
+        }
+        "move-locked" => "Another writer held the lock of one of the two names. Nothing was moved.",
+        "moved-back" => "The file changed during the move, so it was moved back to its old name.",
+        "move-unexpected" => {
+            "The move ended in an unexpected state. Look at the old and the new name now."
+        }
+        "move-failed" => "The move failed. Nothing was moved, unless the message says otherwise.",
         _ => "This outcome is not known to this version.",
     }
 }

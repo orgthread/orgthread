@@ -10,8 +10,8 @@
 //! Between writers elsewhere, Dropbox's own version check decides.
 
 use crate::storage::{
-    Copied, CopyError, Entry, Expect, Listing, LocalFolder, RemoveError, Removed, Revision,
-    Storage, WriteError,
+    Copied, CopyError, Entry, Expect, Listing, LocalFolder, Moved, RemoveError, Removed, Revision,
+    Storage, WriteError, new_folders,
 };
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -542,6 +542,35 @@ impl Dropbox {
         }
     }
 
+    /// The move call got no answer, so Dropbox may have moved the file or not.
+    /// One look at each name tells: the file at the new name and none at the old
+    /// one is a move; the reverse is no move. Anything else is for a person.
+    fn after_no_move_answer(
+        &self,
+        from: &str,
+        to: &str,
+        source: &str,
+        folders: Vec<String>,
+        cause: io::Error,
+    ) -> Result<Moved, CopyError> {
+        match (self.look(to), self.look(from)) {
+            (Ok(Look::File { hash, size, .. }), Ok(Look::Missing)) => Ok(Moved {
+                source: source.to_string(),
+                target: hash,
+                size,
+                folders,
+            }),
+            (Ok(Look::Missing), Ok(Look::File { .. })) => Err(CopyError::Io(failure(format!(
+                "Dropbox gave no answer to the move ({cause}), and {from} is still there, so nothing moved. Try again"
+            )))),
+            _ => Err(CopyError::Unexpected {
+                reason: format!(
+                    "Dropbox gave no answer to the move ({cause}), and a look could not tell where the file is. Look at {from} and {to}"
+                ),
+            }),
+        }
+    }
+
     fn delete(&self, full: &str, rev: Option<&str>) -> io::Result<bool> {
         let arg = match rev {
             Some(rev) => json!({ "path": full, "parent_rev": rev }),
@@ -753,6 +782,76 @@ impl Storage for Dropbox {
                 Err(kind) => Err(CopyError::Unexpected {
                     reason: format!(
                         "Dropbox copied {source}, but reports {kind} at {target}, not a file"
+                    ),
+                }),
+            },
+            409 => Err(copy_refusal(&summary(&reply.body))
+                .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
+            _ => Err(CopyError::Io(refused(&reply))),
+        }
+    }
+
+    /// `get_metadata` of the source, a look at the folders of the new name, then
+    /// `move_v2`, which moves inside Dropbox. `autorename: false`: a new name
+    /// that exists is a refusal, never a renamed file. Dropbox makes the missing
+    /// folders itself; the look before only names them for the answer.
+    fn move_file(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Moved, CopyError> {
+        let (source, target) = (Self::file(from), Self::file(to));
+        let hash = match self.look(&source)? {
+            Look::File { hash, .. } if !hash.is_empty() => hash,
+            Look::File { .. } => {
+                return Err(CopyError::Io(failure(format!(
+                    "Dropbox gave no hash for {source}"
+                ))));
+            }
+            Look::Folder => return Err(CopyError::Folder),
+            Look::Missing => return Err(CopyError::Missing),
+        };
+        if let Some(want) = expect
+            && want != hash
+        {
+            return Err(CopyError::Changed { found: hash });
+        }
+        let folders = new_folders(to, |folder| {
+            Ok(self.look(&Self::file(folder))? != Look::Missing)
+        })?;
+        let arg = json!({
+            "from_path": source,
+            "to_path": target,
+            "autorename": false,
+            "allow_ownership_transfer": false,
+        });
+        let reply = match self.rpc("move_v2", &arg) {
+            Ok(reply) => reply,
+            Err(cause) => {
+                return self.after_no_move_answer(&source, &target, &hash, folders, cause);
+            }
+        };
+        match reply.status {
+            200 => match made_of(&reply.body) {
+                Ok((Some(made), size, _)) => Ok(Moved {
+                    source: hash,
+                    target: made,
+                    size,
+                    folders,
+                }),
+                // No hash in the answer: one look gives it.
+                Ok((None, size, _)) => match self.look(&target)? {
+                    Look::File { hash: made, .. } => Ok(Moved {
+                        source: hash,
+                        target: made,
+                        size,
+                        folders,
+                    }),
+                    _ => Err(CopyError::Unexpected {
+                        reason: format!(
+                            "Dropbox reported a move to {target}, but a look finds no file there. Look at {source} and {target}"
+                        ),
+                    }),
+                },
+                Err(kind) => Err(CopyError::Unexpected {
+                    reason: format!(
+                        "Dropbox moved {source}, but reports {kind} at {target}, not a file"
                     ),
                 }),
             },

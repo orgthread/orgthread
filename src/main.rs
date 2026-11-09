@@ -6,6 +6,7 @@ use orgthread::fingerprint::{Fingerprinter, fingerprint};
 use orgthread::list::{self, Options, Target};
 use orgthread::log;
 use orgthread::login::Login;
+use orgthread::mv;
 use orgthread::patch::{self, Patch};
 use orgthread::reads::Reads;
 use orgthread::screen;
@@ -37,6 +38,7 @@ For an agent:
   orgthread upload <file> --who <name>           < any file, with the rules of write
   orgthread delete <file> --who <name>           one file, only the version this name saw
   orgthread copy <file> <new> --who <name>       one file to a new name, never over a file
+  orgthread move <file> <new> --who <name>       one file to a new name, also a rename, never over a file
 
 Give the same name each time. To change a file, read it first. A new file needs
 no read. orgthread remembers what each name read, and it refuses a write when
@@ -44,7 +46,7 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read, write, patch, delete, copy and list, as MCP tools,
+  orgthread serve                                the same read, write, patch, delete, copy, move and list, as MCP tools,
                                                  and version: the build, the door, the storage, the tools
   orgthread serve --http <address>               also download and upload, through one-time links
 
@@ -99,6 +101,19 @@ If not, the copy is removed again, code 7 and the log word removed, or 9 and
 not-removed if that fails. The log line of a copy has the source as its 8th
 field.
 
+move moves one file to a new name in the same storage. A rename is a move in
+the same folder. If anything is at the new name, it is refused, code 5, and
+nothing is replaced. Missing folders of the new name are made, and the answer
+names them. Only a file moves: a folder is refused, code 2. Both names must be
+open to write. If ORGTHREAD_MOVE_ALLOW names folders, both names must lie in
+them, else it is refused, code 2. A file that is not text may go only to the
+folders of ORGTHREAD_BINARY_ALLOW, as for copy. --fingerprint <hash> refuses a
+file of any other version, code 4. With it, a file that changed during the
+move is moved back, code 7, or 9 if that fails. When the name of a .md file
+changes, the answer adds a line that wikilinks to the old name break. The log
+word is moved, with the old name as the 8th field, and every word of a move
+line starts with move. The way back is a move from the new name to the old one.
+
 Settings, from the environment:
   A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
   setting of this list that the environment does not hold.
@@ -122,6 +137,9 @@ Settings, from the environment:
                       (default: none)
   ORGTHREAD_DELETE_ALLOW
                       comma-separated folders where delete may remove a file (default: none)
+  ORGTHREAD_MOVE_ALLOW
+                      comma-separated folders: when set, move needs both names in them
+                      (default: not set, and move has only the limits above)
   ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
                       the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
   ORGTHREAD_LISTEN_ANYWHERE
@@ -199,6 +217,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("upload") => cmd_upload(&args[1..]),
         Some("delete") => cmd_delete(&args[1..]),
         Some("copy") => cmd_copy(&args[1..]),
+        Some("move") => cmd_move(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("password-hash") => {
@@ -605,6 +624,35 @@ impl Settings {
             .to_str()
             .map(str::to_string)
             .ok_or_else(|| format!("the path of {file} is not valid UTF-8"))
+    }
+}
+
+impl Settings {
+    /// `Some` with the reason when a file that is not text would go from `from`
+    /// to `to`, outside the folders of `ORGTHREAD_BINARY_ALLOW`. Copy and move
+    /// share it.
+    fn not_text_to(&self, from: &str, to: &str) -> Option<String> {
+        if transfer::binary_allowed(to) {
+            return None;
+        }
+        // On a server, only the names count, as for upload --check: no byte of
+        // the source passes this server. A local door also reads the real bytes.
+        let binary = if transfer::named_binary(to) || transfer::named_binary(from) {
+            true
+        } else if self.dropbox {
+            false
+        } else {
+            match fs::read(self.root.join(from)) {
+                Ok(bytes) => std::str::from_utf8(&bytes).is_err() || bytes.contains(&0),
+                Err(_) => false,
+            }
+        };
+        binary.then(|| {
+            format!(
+                "{from} is not text, or has the name of a file that is not text, and such a file may go only to the folders of {}.",
+                transfer::BINARY_ALLOW
+            )
+        })
     }
 }
 
@@ -1188,27 +1236,8 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
     if let Err(reason) = limits {
         return refuse(copy::Outcome::NotAllowed { reason });
     }
-    if !transfer::binary_allowed(&to) {
-        // On a server, only the names count, as for upload --check: no byte of
-        // the source passes this server. A local door also reads the real bytes.
-        let binary = if transfer::named_binary(&to) || transfer::named_binary(&from) {
-            true
-        } else if settings.dropbox {
-            false
-        } else {
-            match fs::read(settings.root.join(&from)) {
-                Ok(bytes) => std::str::from_utf8(&bytes).is_err() || bytes.contains(&0),
-                Err(_) => false,
-            }
-        };
-        if binary {
-            return refuse(copy::Outcome::NotText {
-                reason: format!(
-                    "{from} is not text, or has the name of a file that is not text, and such a file may go only to the folders of {}.",
-                    transfer::BINARY_ALLOW
-                ),
-            });
-        }
+    if let Some(reason) = settings.not_text_to(&from, &to) {
+        return refuse(copy::Outcome::NotText { reason });
     }
     let storage = settings.storage()?;
     let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
@@ -1249,6 +1278,118 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
     if let Some(reason) = &report.lock_left {
         say(format!(
             "the copy is made, but orgthread's clean-up did not finish: {reason}. There is nothing to do: {to} is free again within 15 minutes."
+        ));
+    }
+    Ok(report.exit_code(logged.is_ok()))
+}
+
+/// One file to a new name, or a rename. The steps live in `mv.rs`.
+fn cmd_move(args: &[String]) -> Result<i32, String> {
+    let mut names = Vec::new();
+    let mut who = None;
+    let mut expect = None;
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--who" => who = Some(words.next().ok_or("--who needs a name")?.clone()),
+            "--fingerprint" => {
+                expect = Some(
+                    words
+                        .next()
+                        .ok_or("--fingerprint needs the fingerprint of the file")?
+                        .clone(),
+                );
+            }
+            // After --, each word is a path, also one that starts with --.
+            "--" => names.extend(words.by_ref().cloned()),
+            other if other.starts_with("--") => return Err(format!("there is no option {other}")),
+            other => names.push(other.to_string()),
+        }
+    }
+    let [from, to] = names.as_slice() else {
+        return Err("move takes two files: the file, then its new name".into());
+    };
+    let who = checked_who(who)?;
+    // An empty value is wrong use, never a version: refused before any lock or log.
+    if expect
+        .as_deref()
+        .is_some_and(|print| print.trim().is_empty())
+    {
+        return Err("--fingerprint needs the fingerprint of the file, and it is empty".into());
+    }
+    let settings = Settings::load()?;
+    // Locally a folder is no wrong path here: the move refuses it, and logs it.
+    let from = if settings.dropbox {
+        settings.path_of(from)?
+    } else {
+        path_in_root(from, &settings.root)?
+    };
+    let to = settings.target_of(to)?;
+    let now = log::utc_now();
+    let refuse = |outcome: mv::Outcome| {
+        say(mv::message(&from, &to, &outcome));
+        let line = mv::log_line(&now, &from, &to, &who, &outcome);
+        if let Err(e) = log::append(&settings.log, &line) {
+            say(format!(
+                "the log line failed, {}: {e}. The line: {line}",
+                settings.log.display()
+            ));
+        }
+        Ok(outcome.code())
+    };
+    // The old name disappears and the new one appears: both are writes.
+    let limits = settings
+        .limits(&from, true)
+        .and_then(|()| settings.limits(&to, true));
+    if let Err(reason) = limits {
+        return refuse(mv::Outcome::NotAllowed { reason });
+    }
+    let allow = env::var(mv::MOVE_ALLOW).unwrap_or_default();
+    if let Some(refused) = mv::gate(&from, &to, &allow) {
+        return refuse(refused);
+    }
+    if let Some(reason) = settings.not_text_to(&from, &to) {
+        return refuse(mv::Outcome::NotText { reason });
+    }
+    let storage = settings.storage()?;
+    let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
+    let Some(stop) = arm_stop() else {
+        return Ok(exit::FAILED);
+    };
+    let report = mv::move_file(
+        storage.as_ref(),
+        &from,
+        &to,
+        expect.as_deref(),
+        &lock_line,
+        &stop,
+    );
+    let line = mv::log_line(&now, &from, &to, &who, &report.outcome);
+    let logged = log::append(&settings.log, &line);
+    let text = mv::message(&from, &to, &report.outcome);
+    match report.outcome {
+        mv::Outcome::Moved { .. } => println!("{text}"),
+        _ => say(text),
+    }
+    if let Some(old) = &report.took_over {
+        say(format!(
+            "a writer that stopped over 15 minutes ago was cleared first: {old}"
+        ));
+    }
+    if let Some(other) = &report.lock_lost {
+        say(format!(
+            "another writer may have been at work during this move. Check {from} and {to}. That writer: {other}"
+        ));
+    }
+    if let Err(e) = &logged {
+        say(format!(
+            "the log line failed, {}: {e}. The line: {line}",
+            settings.log.display()
+        ));
+    }
+    if let Some(reason) = &report.lock_left {
+        say(format!(
+            "the move is done, but orgthread's clean-up did not finish: {reason}. There is nothing to do: both names are free again within 15 minutes."
         ));
     }
     Ok(report.exit_code(logged.is_ok()))

@@ -128,7 +128,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_the_seven_tools() {
+fn it_greets_and_offers_the_eight_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -145,10 +145,10 @@ fn it_greets_and_offers_the_seven_tools() {
     assert_eq!(
         names,
         [
-            "read", "write", "patch", "delete", "copy", "list", "version"
+            "read", "write", "patch", "delete", "copy", "move", "list", "version"
         ]
     );
-    assert_eq!(tools[6]["inputSchema"]["properties"], json!({}));
+    assert_eq!(tools[7]["inputSchema"]["properties"], json!({}));
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
@@ -166,7 +166,17 @@ fn it_greets_and_offers_the_seven_tools() {
         says.contains("Up to 25 pairs in one call. For more, call again with the rest."),
         "{says}"
     );
-    assert_eq!(tools[5]["inputSchema"]["required"], json!(["folders"]));
+    assert_eq!(tools[5]["inputSchema"]["required"], json!(["pairs", "who"]));
+    assert_eq!(
+        tools[5]["inputSchema"]["properties"]["pairs"]["maxItems"],
+        100
+    );
+    let says = tools[5]["description"].as_str().unwrap();
+    assert!(
+        says.contains("Up to 100 pairs in one call. For more, call again with the rest."),
+        "{says}"
+    );
+    assert_eq!(tools[6]["inputSchema"]["required"], json!(["folders"]));
 }
 
 #[test]
@@ -176,7 +186,7 @@ fn the_version_tool_names_the_build_the_door_the_storage_and_the_tools() {
     let (text, refused) = server.tool("version", json!({}));
     assert!(!refused, "{text}");
     let want = format!(
-        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, copy, list, version\n",
+        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, copy, move, list, version\n",
         orgthread::VERSION
     );
     assert_eq!(text, want);
@@ -731,4 +741,111 @@ fn the_delete_tool_refuses_an_empty_expect_as_wrong_use() {
             .unwrap_or_default()
             .contains("delete")
     );
+}
+
+#[test]
+fn the_move_tool_moves_each_pair_and_names_each_refusal() {
+    let place = Place::new();
+    fs::write(place.file(), "Grüße\n").unwrap();
+    fs::write(place.root.join("org/notes/second.md"), "two\n").unwrap();
+    fs::write(place.root.join("org/notes/taken.md"), "old\n").unwrap();
+    let file = place.f();
+    let second = place.root.join("org/notes/second.md");
+    let new = place.root.join("org/new/deep/plan.md");
+    let taken = place.root.join("org/notes/taken.md");
+    let mut server = place.serve();
+    let pairs = json!([
+        pair(&file, new.to_str().unwrap()),
+        pair(second.to_str().unwrap(), taken.to_str().unwrap()),
+        {"from": second, "to": place.root.join("org/c.md").to_str().unwrap(), "fingerprint": fingerprint(b"other")},
+        pair(second.to_str().unwrap(), place.root.join("org/notes/second-b.md").to_str().unwrap()),
+    ]);
+    let (said, refused) = server.tool("move", json!({"pairs": pairs, "who": "chat"}));
+    assert!(refused, "{said}");
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines[0], "exit code 5", "{said}");
+    let print = fingerprint("Grüße\n".as_bytes());
+    assert_eq!(
+        lines[1],
+        format!(
+            "moved: org/notes/invented.md -> org/new/deep/plan.md, 8 bytes, {print}, new folders: org/new, org/new/deep"
+        )
+    );
+    assert_eq!(
+        lines[2],
+        "note: the file name changed, so wikilinks to [[invented]] break. Fix them to the new name."
+    );
+    assert!(
+        lines[3].starts_with(&format!(
+            "{} -> {}  refused, exit code 5: refused, nothing moved.",
+            second.display(),
+            taken.display()
+        )),
+        "{said}"
+    );
+    assert!(lines[4].contains("refused, exit code 4"), "{said}");
+    assert!(
+        lines[5].starts_with("moved: org/notes/second.md -> org/notes/second-b.md"),
+        "the pairs after a refusal still run: {said}"
+    );
+    assert_eq!(fs::read(&new).unwrap(), "Grüße\n".as_bytes());
+    assert!(!place.file().exists());
+    assert_eq!(fs::read(&taken).unwrap(), b"old\n");
+    assert!(!second.exists());
+    assert!(!place.root.join("org/c.md").exists());
+    let log = fs::read_to_string(place.log()).unwrap();
+    assert_eq!(log.lines().filter(|l| l.contains("\tmoved\t")).count(), 2);
+    assert_eq!(log.lines().count(), 4, "one log line per pair: {log}");
+}
+
+#[test]
+fn the_move_tool_takes_100_pairs_and_refuses_101() {
+    let place = Place::new();
+    let mut server = place.serve();
+    let pairs = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                let from = place.root.join(format!("org/notes/{i}.md"));
+                let to = place.root.join(format!("org/many/{i}.md"));
+                pair(from.to_str().unwrap(), to.to_str().unwrap())
+            })
+            .collect()
+    };
+    for i in 0..101 {
+        fs::write(place.root.join(format!("org/notes/{i}.md")), "text\n").unwrap();
+    }
+    let answer = server.ask(
+        "tools/call",
+        json!({"name": "move", "arguments": {"pairs": pairs(101), "who": "chat"}}),
+    );
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    assert!(
+        !place.root.join("org/many").exists(),
+        "101 pairs move nothing"
+    );
+    let (said, refused) = server.tool("move", json!({"pairs": pairs(100), "who": "chat"}));
+    assert!(!refused, "{said}");
+    assert_eq!(said.lines().count(), 100);
+    assert_eq!(
+        fs::read_dir(place.root.join("org/many")).unwrap().count(),
+        100
+    );
+    // No pairs, a pair with no from or no to, or no who: wrong use, and nothing moved.
+    let left = place.root.join("org/notes/100.md");
+    let left = left.to_str().unwrap();
+    for arguments in [
+        json!({"pairs": [], "who": "chat"}),
+        json!({"pairs": [{"from": left}], "who": "chat"}),
+        json!({"pairs": [{"to": "x"}], "who": "chat"}),
+        json!({"pairs": [pair(left, "x")]}),
+        json!({"pairs": [pair(left, "x"), {"from": left, "to": 7}], "who": "chat"}),
+    ] {
+        let answer = server.ask(
+            "tools/call",
+            json!({"name": "move", "arguments": arguments}),
+        );
+        assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    }
+    assert!(place.root.join("org/notes/100.md").exists());
+    assert!(!place.root.join("x").exists());
 }
