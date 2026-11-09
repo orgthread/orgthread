@@ -342,6 +342,21 @@ impl Dropbox {
     }
 }
 
+impl Dropbox {
+    /// For the live check only: one `list_revisions` call with any limit, and
+    /// its status with the error summary or the number of versions. It reads.
+    #[doc(hidden)]
+    pub fn probe_revisions(&self, path: &str, limit: u64) -> io::Result<(u16, String)> {
+        let arg = json!({ "path": Self::file(path), "mode": "path", "limit": limit });
+        let reply = self.rpc("list_revisions", &arg)?;
+        let text = match reply.status {
+            200 => format!("{} versions", revisions_of(&reply.body)?.len()),
+            _ => summary(&reply.body),
+        };
+        Ok((reply.status, text))
+    }
+}
+
 impl Storage for Dropbox {
     fn list(&self, path: &str, max: usize) -> io::Result<Listing> {
         // Dropbox names its root with an empty path.

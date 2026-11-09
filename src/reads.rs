@@ -80,7 +80,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = place("mode");
         let _ = fs::remove_dir_all(&dir);
-        Reads::new(&dir).remember("agent", "/a.md", "print").unwrap();
+        Reads::new(&dir)
+            .remember("agent", "/a.md", "print")
+            .unwrap();
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         fs::remove_dir_all(&dir).unwrap();
