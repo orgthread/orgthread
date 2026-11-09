@@ -34,6 +34,35 @@ impl From<io::Error> for WriteError {
     }
 }
 
+/// What a remove did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Removed {
+    /// The size in bytes of the file that went.
+    pub size: u64,
+    /// The version that went, where the storage names one, for a restore.
+    pub rev: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum RemoveError {
+    /// The file is not what the caller expected, or is gone. Nothing was removed.
+    Changed {
+        found: Option<String>,
+    },
+    /// The file went, but the storage reports other bytes than expected.
+    /// `reason` says what is known, and where the way back is.
+    Unexpected {
+        reason: String,
+    },
+    Io(io::Error),
+}
+
+impl From<io::Error> for RemoveError {
+    fn from(e: io::Error) -> Self {
+        RemoveError::Io(e)
+    }
+}
+
 /// One entry of a folder, as a list shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -117,6 +146,29 @@ pub trait Storage {
             ErrorKind::Unsupported,
             "this storage cannot list a folder",
         ))
+    }
+
+    /// The bytes of a file and the version the storage gives them, where it
+    /// names one. Dropbox does, in the same reply, so a delete can later name it.
+    fn read_rev(&self, path: &str) -> io::Result<Option<(Vec<u8>, Option<String>)>> {
+        Ok(self.read(path)?.map(|bytes| (bytes, None)))
+    }
+
+    /// Removes one file, only if it still has the fingerprint of `expect`.
+    /// `rev` is the version noted with that fingerprint, when the storage gives
+    /// one: then the storage itself checks it at the moment it removes.
+    /// A folder is never removed. `Expect::Absent` is wrong use.
+    fn remove_if(
+        &self,
+        path: &str,
+        expect: &Expect,
+        rev: Option<&str>,
+    ) -> Result<Removed, RemoveError> {
+        let _ = (path, expect, rev);
+        Err(RemoveError::Io(io::Error::new(
+            ErrorKind::Unsupported,
+            "this storage cannot remove a file",
+        )))
     }
 
     /// The size of a file in bytes, or `None` when it does not exist.
@@ -352,6 +404,87 @@ impl Storage for LocalFolder {
         }
         Self::sync_parent(&target);
         Ok(())
+    }
+
+    /// The file first moves into the lock folder, in one step. From there no
+    /// editor can change it, so the check that follows is the final one. If it
+    /// differs, it goes back, unless a new file took its place meanwhile.
+    fn remove_if(
+        &self,
+        path: &str,
+        expect: &Expect,
+        _rev: Option<&str>,
+    ) -> Result<Removed, RemoveError> {
+        let Expect::Fingerprint(want) = expect else {
+            return Err(RemoveError::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "a remove needs the fingerprint of the file",
+            )));
+        };
+        let target = self.full(path);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                return Err(RemoveError::Io(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("{path} is not a file, and only a file is removed"),
+                )));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(RemoveError::Changed { found: None });
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let aside = self.lock_path(&format!(
+            "{}.{}.removing",
+            path.replace('/', "--"),
+            std::process::id()
+        ));
+        match fs::rename(&target, &aside) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(RemoveError::Changed { found: None });
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let bytes = match fs::read(&aside) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let back = fs::hard_link(&aside, &target).and_then(|()| fs::remove_file(&aside));
+                return Err(match back {
+                    Ok(()) => e.into(),
+                    Err(_) => RemoveError::Unexpected {
+                        reason: format!(
+                            "the file could not be read after it was moved aside, and it is kept at {}",
+                            aside.display()
+                        ),
+                    },
+                });
+            }
+        };
+        let found = fingerprint(&bytes);
+        if found != *want {
+            // A hard link never replaces a file that appeared meanwhile.
+            return match fs::hard_link(&aside, &target) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&aside);
+                    Self::sync_parent(&target);
+                    Err(RemoveError::Changed { found: Some(found) })
+                }
+                Err(_) => Err(RemoveError::Unexpected {
+                    reason: format!(
+                        "the file changed, and a new file took its place before it could go back. The changed one is kept at {}",
+                        aside.display()
+                    ),
+                }),
+            };
+        }
+        fs::remove_file(&aside)?;
+        Self::sync_parent(&target);
+        Ok(Removed {
+            size: bytes.len() as u64,
+            rev: None,
+        })
     }
 
     fn restore(&self, path: &str, old: Option<&[u8]>) -> io::Result<()> {

@@ -44,10 +44,13 @@ pub struct Snapshot {
     pub problems: Vec<String>,
 }
 
-/// One log line, or `None` when it does not have the seven fields.
+/// One log line, or `None` when it does not have the seven fields. An 8th field,
+/// such as the rev of a delete, is not shown here.
 pub fn parse_line(line: &str) -> Option<Entry> {
     let f: Vec<&str> = line.split('\t').collect();
-    let [time, outcome, path, who, before, after, size] = f[..] else {
+    let (&[time, outcome, path, who, before, after, size]
+    | &[time, outcome, path, who, before, after, size, _]) = &f[..]
+    else {
         return None;
     };
     let clean = |v: &str| {

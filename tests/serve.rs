@@ -128,7 +128,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_the_five_tools() {
+fn it_greets_and_offers_the_six_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -142,15 +142,19 @@ fn it_greets_and_offers_the_five_tools() {
     let list = server.ask("tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read", "write", "patch", "list", "version"]);
-    assert_eq!(tools[4]["inputSchema"]["properties"], json!({}));
+    assert_eq!(
+        names,
+        ["read", "write", "patch", "delete", "list", "version"]
+    );
+    assert_eq!(tools[5]["inputSchema"]["properties"], json!({}));
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
         json!(["file", "who", "text"])
     );
     assert_eq!(tools[2]["inputSchema"]["required"], json!(["file", "who"]));
-    assert_eq!(tools[3]["inputSchema"]["required"], json!(["folders"]));
+    assert_eq!(tools[3]["inputSchema"]["required"], json!(["file", "who"]));
+    assert_eq!(tools[4]["inputSchema"]["required"], json!(["folders"]));
 }
 
 #[test]
@@ -160,7 +164,7 @@ fn the_version_tool_names_the_build_the_door_the_storage_and_the_tools() {
     let (text, refused) = server.tool("version", json!({}));
     assert!(!refused, "{text}");
     let want = format!(
-        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, list, version\n",
+        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, list, version\n",
         orgthread::VERSION
     );
     assert_eq!(text, want);
@@ -515,4 +519,39 @@ fn a_patch_of_an_unread_file_is_refused_with_exit_5() {
     assert!(refused);
     assert!(said.starts_with("exit code 5\n"), "{said}");
     assert_eq!(fs::read(place.file()).unwrap(), b"a\n");
+}
+
+#[test]
+fn the_delete_tool_has_the_rules_of_the_command() {
+    let place = Place::new();
+    fs::write(place.file(), "old\n").unwrap();
+    let file = place.f();
+
+    // With the setting empty, every delete is refused.
+    let mut server = place.serve();
+    server.read(&file, "chat a");
+    let (said, refused) = server.tool("delete", json!({"file": file, "who": "chat a"}));
+    assert!(refused && said.starts_with("exit code 2"), "{said}");
+    assert!(place.file().exists());
+    drop(server);
+
+    let mut server = place.serve_with(&[("ORGTHREAD_DELETE_ALLOW", "org/notes")]);
+    // Another name read nothing: refused, exit code 4.
+    let (said, refused) = server.tool("delete", json!({"file": file, "who": "chat b"}));
+    assert!(refused && said.starts_with("exit code 4"), "{said}");
+    // A check deletes nothing.
+    server.read(&file, "chat a");
+    let args = json!({"file": file, "who": "chat a", "check": true});
+    let (said, refused) = server.tool("delete", args);
+    assert!(!refused, "{said}");
+    assert!(place.file().exists());
+    // The fingerprint from a list works for any name.
+    let args = json!({"file": file, "who": "chat b", "expect": fingerprint(b"old\n")});
+    let (said, refused) = server.tool("delete", args);
+    assert!(!refused, "{said}");
+    assert!(
+        said.starts_with("deleted: org/notes/invented.md, 4 bytes"),
+        "{said}"
+    );
+    assert!(!place.file().exists());
 }

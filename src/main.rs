@@ -1,4 +1,5 @@
 use jiff::tz::TimeZone;
+use orgthread::delete;
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::{Fingerprinter, fingerprint};
 use orgthread::list::{self, Options, Target};
@@ -33,6 +34,7 @@ For an agent:
   orgthread download <file> --who <name> --to <copy>
                                                  any file, also not text, as exact bytes
   orgthread upload <file> --who <name>           < any file, with the rules of write
+  orgthread delete <file> --who <name>           one file, only the version this name saw
 
 Give the same name each time. To change a file, read it first. A new file needs
 no read. orgthread remembers what each name read, and it refuses a write when
@@ -40,7 +42,7 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read, write, patch and list, as MCP tools,
+  orgthread serve                                the same read, write, patch, delete and list, as MCP tools,
                                                  and version: the build, the door, the storage, the tools
   orgthread serve --http <address>               also download and upload, through one-time links
 
@@ -74,6 +76,14 @@ may go wherever write may write. A file that is not text may go only to the
 folders of ORGTHREAD_BINARY_ALLOW. With --check, either one only checks the
 rules and the size, and moves nothing.
 
+delete removes one file, never a folder, and only in the folders of
+ORGTHREAD_DELETE_ALLOW. It needs the fingerprint of the version to delete: the
+one this name read, or --expect <fingerprint>, for example from list
+--fingerprint. If the file changed since, or no fingerprint is known, it is
+refused as changed, code 4, and deletes nothing. The way back: a local folder keeps the last
+version in ORGTHREAD_VERSIONS, and Dropbox keeps the file in Deleted files, with
+its rev in the log. With --check, it only checks the rules and the version.
+
 Settings, from the environment:
   A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
   setting of this list that the environment does not hold.
@@ -95,6 +105,8 @@ Settings, from the environment:
   ORGTHREAD_BINARY_ALLOW
                       comma-separated folders where an upload of a file that is not text may go
                       (default: none)
+  ORGTHREAD_DELETE_ALLOW
+                      comma-separated folders where delete may remove a file (default: none)
   ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
                       the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
   ORGTHREAD_LISTEN_ANYWHERE
@@ -170,6 +182,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("list" | "ls") => cmd_list(&args[1..]),
         Some("download") => cmd_download(&args[1..]),
         Some("upload") => cmd_upload(&args[1..]),
+        Some("delete") => cmd_delete(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("password-hash") => {
@@ -407,8 +420,9 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
     let path = settings.path_of(file)?;
     settings.limits(&path, false)?;
     let storage = settings.storage()?;
-    let bytes = match storage.read(&path) {
-        Ok(Some(bytes)) => bytes,
+    // Dropbox gives the rev in the same reply, so that a delete can name it.
+    let (bytes, rev) = match storage.read_rev(&path) {
+        Ok(Some(read)) => read,
         Ok(None) => {
             say(format!("there is no file {path}"));
             return Ok(exit::MISSING);
@@ -418,6 +432,7 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
             return Ok(exit::FAILED);
         }
     };
+    let rev = rev.as_deref();
     if !bytes.is_empty()
         && let Err(reason) = write::check_text(&bytes)
     {
@@ -428,7 +443,7 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
     let mut out = io::stdout();
     let sent = match to {
         None => {
-            if let Err(e) = reads.remember(&who, &path, &fingerprint(&bytes)) {
+            if let Err(e) = reads.remember_rev(&who, &path, &fingerprint(&bytes), rev) {
                 say(format!("could not note this read: {e}"));
                 return Ok(exit::FAILED);
             }
@@ -442,7 +457,7 @@ fn cmd_read(args: &[String]) -> Result<i32, String> {
             // The note comes last: a failed copy must not count as read.
             made.write_all(&bytes)
                 .and_then(|()| made.sync_all())
-                .and_then(|()| reads.remember(&who, &path, &fingerprint(&bytes)))
+                .and_then(|()| reads.remember_rev(&who, &path, &fingerprint(&bytes), rev))
         }
     };
     match sent.and_then(|()| out.flush()) {
@@ -967,6 +982,83 @@ fn cmd_upload(args: &[String]) -> Result<i32, String> {
         &bytes,
         Kind::Upload { binary },
     )
+}
+
+/// One file, only the version this name saw. The steps live in `delete.rs`.
+fn cmd_delete(args: &[String]) -> Result<i32, String> {
+    let (args, check) = without_check(args);
+    let mut expect = None;
+    let mut rest = Vec::new();
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        if arg == "--expect" {
+            expect = Some(words.next().ok_or("--expect needs a fingerprint")?.clone());
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let ReadArgs { file, who, to } = parse_read(&rest, "delete")?;
+    if to.is_some() {
+        return Err("there is no option --to for delete".into());
+    }
+    let settings = Settings::load()?;
+    let path = settings.path_of(&file)?;
+    settings.limits(&path, true)?;
+    if !delete::allowed(&path, &env::var(delete::DELETE_ALLOW).unwrap_or_default()) {
+        return Err(format!(
+            "refused, nothing deleted. {path} is outside the folders of {}",
+            delete::DELETE_ALLOW
+        ));
+    }
+    let reads = Reads::new(&settings.reads);
+    let noted = reads
+        .recall_rev(&who, &path)
+        .map_err(|e| format!("could not look up what {who} read: {e}"))?;
+    let known = delete::known(noted, expect.as_deref());
+    let storage = settings.storage()?;
+    if check {
+        let outcome = delete::check(storage.as_ref(), &path, &known);
+        let text = delete::message(&path, &who, &outcome);
+        match outcome.code() {
+            0 => println!("{text}"),
+            _ => say(text),
+        }
+        return Ok(outcome.code());
+    }
+    let now = log::utc_now();
+    let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
+    let Some(stop) = arm_stop() else {
+        return Ok(exit::FAILED);
+    };
+    // In Dropbox mode, on a server, no text may stay on the disk.
+    let versions = Versions::new(&settings.versions);
+    let keep = |bytes: &[u8]| versions.save(bytes);
+    let keep: delete::Keep = (!settings.dropbox).then_some(&keep);
+    let report = delete::delete(storage.as_ref(), &path, &known, keep, &lock_line, &stop);
+    let line = delete::log_line(&now, &path, &who, &report.outcome);
+    let logged = log::append(&settings.log, &line);
+    let text = delete::message(&path, &who, &report.outcome);
+    match report.outcome {
+        delete::Outcome::Deleted { .. } => println!("{text}"),
+        _ => say(text),
+    }
+    if let Some(old) = &report.took_over {
+        say(format!(
+            "a writer that stopped over 15 minutes ago was cleared first: {old}"
+        ));
+    }
+    if let Some(other) = &report.lock_lost {
+        say(format!(
+            "another writer may have been at work during this delete. Check {path}. That writer: {other}"
+        ));
+    }
+    if let Err(e) = &logged {
+        say(format!(
+            "the log line failed, {}: {e}. The line: {line}",
+            settings.log.display()
+        ));
+    }
+    Ok(report.exit_code(logged.is_ok()))
 }
 
 fn cmd_patch(args: &[String]) -> Result<i32, String> {

@@ -150,6 +150,6 @@ Commit again at the end of each day. To see what changed since the last commit, 
 
 ## What is different from the server
 
-- The local door has no `download` and `upload`. It gives `read`, `write`, `patch`, `list` and `version`. These tools work on text only.
+- The local door has no `download` and `upload`. It gives `read`, `write`, `patch`, `delete`, `list` and `version`. `delete` works only in the folders of `ORGTHREAD_DELETE_ALLOW`, and keeps the last version in `state/versions` first. These tools work on text only.
 - `orgthread watch` shows the diff of each write. For this, each write keeps a copy of the old and the new text for 30 days in `state/versions`, beside the program. That folder is not in your notes and not in git. Delete it if the copies must not stay on the Mac.
 - The log is `state/writes.log`, beside the program.

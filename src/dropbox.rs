@@ -9,7 +9,9 @@
 //! The locks are small local files beside the program: a lock costs no web call.
 //! Between writers elsewhere, Dropbox's own version check decides.
 
-use crate::storage::{Entry, Expect, Listing, LocalFolder, Revision, Storage, WriteError};
+use crate::storage::{
+    Entry, Expect, Listing, LocalFolder, RemoveError, Removed, Revision, Storage, WriteError,
+};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::Path;
@@ -35,6 +37,8 @@ pub struct Dropbox {
 struct Reply {
     status: u16,
     body: Vec<u8>,
+    /// The header `Dropbox-API-Result`, when the call asked for it.
+    result: Option<String>,
 }
 
 struct Meta {
@@ -60,6 +64,96 @@ fn ascii_json(value: &Value) -> String {
         }
     }
     out
+}
+
+/// The body, the header line if asked for, and the status, from curl's output.
+fn split_reply(mut out: Vec<u8>, result: bool) -> io::Result<Reply> {
+    let no_status = || failure("curl gave no status".to_string());
+    let split = out
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .ok_or_else(no_status)?;
+    let status = String::from_utf8_lossy(&out[split + 1..])
+        .parse()
+        .map_err(|_| no_status())?;
+    out.truncate(split);
+    let mut header = None;
+    if result {
+        let split = out
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .ok_or_else(no_status)?;
+        let text = String::from_utf8_lossy(&out[split + 1..])
+            .trim()
+            .to_string();
+        header = (!text.is_empty()).then_some(text);
+        out.truncate(split);
+    }
+    Ok(Reply {
+        status,
+        body: out,
+        result: header,
+    })
+}
+
+/// The rev of a download, from its header `Dropbox-API-Result`, only when the
+/// hash in the same header is the fingerprint of the bytes that came.
+fn rev_of_download(header: Option<&str>, print: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(header?).ok()?;
+    if v["content_hash"].as_str()? != print {
+        return None;
+    }
+    v["rev"]
+        .as_str()
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+}
+
+/// What a `delete_v2` reply means for a remove of the file with fingerprint `want`.
+fn removed_of(status: u16, body: &[u8], want: &str) -> Result<Removed, Deleted> {
+    match status {
+        200 => {
+            let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let meta = &v["metadata"];
+            let rev = meta["rev"].as_str().map(str::to_string);
+            let size = meta["size"].as_u64();
+            let hash = meta["content_hash"].as_str();
+            let kind = meta[".tag"].as_str();
+            let way_back = match &rev {
+                Some(rev) => format!("Dropbox keeps it in Deleted files, rev {rev}"),
+                None => "Dropbox keeps it in Deleted files".to_string(),
+            };
+            if kind != Some("file") || hash != Some(want) {
+                return Err(Deleted::Unexpected(format!(
+                    "Dropbox deleted the path, but reports {} with hash {}, not the file with {want}. {way_back}",
+                    kind.unwrap_or("no kind"),
+                    hash.unwrap_or("none")
+                )));
+            }
+            Ok(Removed {
+                size: size.unwrap_or_default(),
+                rev,
+            })
+        }
+        409 => {
+            let text = summary(body);
+            if text.contains("not_found") || text.contains("conflict") {
+                Err(Deleted::Refused)
+            } else {
+                Err(Deleted::Error(text))
+            }
+        }
+        _ => Err(Deleted::Error(format!("{status}"))),
+    }
+}
+
+/// Why a `delete_v2` deleted nothing, or deleted something else.
+#[derive(Debug, PartialEq, Eq)]
+enum Deleted {
+    /// Gone, or another version: nothing was deleted.
+    Refused,
+    Unexpected(String),
+    Error(String),
 }
 
 /// One entry of a `list_folder` answer. `None` for a deleted entry or an odd one.
@@ -205,9 +299,26 @@ impl Dropbox {
     }
 
     fn call(&self, url: &str, headers: &[String], body: Option<&[u8]>) -> io::Result<Reply> {
+        self.call_full(url, headers, body, false)
+    }
+
+    /// With `result`, the reply also gives the header `Dropbox-API-Result`, on a
+    /// line of its own before the status. That header never holds a newline.
+    fn call_full(
+        &self,
+        url: &str,
+        headers: &[String],
+        body: Option<&[u8]>,
+        result: bool,
+    ) -> io::Result<Reply> {
         let mut curl = Command::new("curl");
+        let format = if result {
+            "\n%header{dropbox-api-result}\n%{http_code}"
+        } else {
+            "\n%{http_code}"
+        };
         curl.args(["-sS", "-X", "POST", "--max-time", "120"])
-            .args(["-w", "\n%{http_code}"]);
+            .args(["-w", format]);
         // Only the request for a fresh token goes without one.
         if !self.token.is_empty() {
             curl.args(["--variable", &format!("%{TOKEN}")]).args([
@@ -246,18 +357,7 @@ impl Dropbox {
             let text = String::from_utf8_lossy(&output.stderr);
             return Err(failure(format!("curl failed: {}", text.trim())));
         }
-        let split = output
-            .stdout
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .ok_or_else(|| failure("curl gave no status".to_string()))?;
-        let status = String::from_utf8_lossy(&output.stdout[split + 1..])
-            .parse()
-            .map_err(|_| failure("curl gave no status".to_string()))?;
-        Ok(Reply {
-            status,
-            body: output.stdout[..split].to_vec(),
-        })
+        split_reply(output.stdout, result)
     }
 
     fn rpc(&self, endpoint: &str, arg: &Value) -> io::Result<Reply> {
@@ -276,9 +376,23 @@ impl Dropbox {
     }
 
     fn download(&self, full: &str) -> io::Result<Option<Vec<u8>>> {
-        let reply = self.content("download", &json!({ "path": full }), None)?;
+        Ok(self.download_rev(full)?.map(|(bytes, _)| bytes))
+    }
+
+    /// The bytes, and the rev that Dropbox gives in the same reply.
+    fn download_rev(&self, full: &str) -> io::Result<Option<(Vec<u8>, Option<String>)>> {
+        let url = format!("{}/2/files/download", self.content);
+        let headers = [format!(
+            "Dropbox-API-Arg: {}",
+            ascii_json(&json!({ "path": full }))
+        )];
+        let reply = self.call_full(&url, &headers, None, true)?;
         match reply.status {
-            200 => Ok(Some(reply.body)),
+            200 => {
+                let print = crate::fingerprint::fingerprint(&reply.body);
+                let rev = rev_of_download(reply.result.as_deref(), &print);
+                Ok(Some((reply.body, rev)))
+            }
             409 if summary(&reply.body).contains("not_found") => Ok(None),
             _ => Err(refused(&reply)),
         }
@@ -426,6 +540,59 @@ impl Storage for Dropbox {
             ));
         }
         self.download(&format!("rev:{rev}"))
+    }
+
+    fn read_rev(&self, path: &str) -> io::Result<Option<(Vec<u8>, Option<String>)>> {
+        self.download_rev(&Self::file(path))
+    }
+
+    /// One trip with a noted rev: Dropbox checks the version as it deletes.
+    /// With no rev, `get_metadata` first gives it, and its hash is checked.
+    fn remove_if(
+        &self,
+        path: &str,
+        expect: &Expect,
+        rev: Option<&str>,
+    ) -> Result<Removed, RemoveError> {
+        let Expect::Fingerprint(want) = expect else {
+            return Err(RemoveError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a remove needs the fingerprint of the file",
+            )));
+        };
+        let full = Self::file(path);
+        let rev = match rev {
+            Some(rev) => rev.to_string(),
+            None => {
+                let Some(meta) = self.meta(&full)? else {
+                    return Err(RemoveError::Changed { found: None });
+                };
+                if meta.hash != *want {
+                    return Err(RemoveError::Changed {
+                        found: Some(meta.hash),
+                    });
+                }
+                meta.rev
+            }
+        };
+        // Without a rev, Dropbox would delete whatever is there, also a folder.
+        if rev.is_empty() {
+            return Err(RemoveError::Io(failure(format!(
+                "Dropbox gave no rev for {full}"
+            ))));
+        }
+        let arg = json!({ "path": full, "parent_rev": rev });
+        let reply = self.rpc("delete_v2", &arg)?;
+        match removed_of(reply.status, &reply.body, want) {
+            Ok(removed) => Ok(removed),
+            Err(Deleted::Refused) => {
+                // Only on a refusal: what is there now, for the answer and the log.
+                let found = self.meta(&full).ok().flatten().map(|meta| meta.hash);
+                Err(RemoveError::Changed { found })
+            }
+            Err(Deleted::Unexpected(reason)) => Err(RemoveError::Unexpected { reason }),
+            Err(Deleted::Error(_)) => Err(RemoveError::Io(refused(&reply))),
+        }
     }
 
     fn size(&self, path: &str) -> io::Result<Option<u64>> {
@@ -627,6 +794,68 @@ mod tests {
             ]
         );
         assert!(revisions_of(b"{}").is_err());
+    }
+
+    #[test]
+    fn curl_output_splits_into_body_header_and_status() {
+        let out = b"line one\nline two\n\n{\"rev\":\"a1\"}\n200".to_vec();
+        let reply = split_reply(out, true).unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, b"line one\nline two\n");
+        assert_eq!(reply.result.as_deref(), Some("{\"rev\":\"a1\"}"));
+        let reply = split_reply(b"body\n\n409".to_vec(), true).unwrap();
+        assert_eq!((reply.status, reply.result), (409, None));
+        let reply = split_reply(b"a\nb\n200".to_vec(), false).unwrap();
+        assert_eq!(reply.body, b"a\nb");
+    }
+
+    #[test]
+    fn a_download_rev_counts_only_with_the_hash_of_its_bytes() {
+        let header = r#"{"rev":"015f","content_hash":"aa"}"#;
+        assert_eq!(rev_of_download(Some(header), "aa").as_deref(), Some("015f"));
+        assert_eq!(rev_of_download(Some(header), "bb"), None);
+        assert_eq!(rev_of_download(Some("not json"), "aa"), None);
+        assert_eq!(rev_of_download(None, "aa"), None);
+    }
+
+    #[test]
+    fn a_delete_reply_of_200_gives_the_size_and_rev() {
+        let body = br#"{"metadata":{".tag":"file","name":"a.md","size":12,"rev":"015f","content_hash":"aa"}}"#;
+        assert_eq!(
+            removed_of(200, body, "aa"),
+            Ok(Removed {
+                size: 12,
+                rev: Some("015f".into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_delete_reply_of_200_with_another_hash_or_a_folder_is_damage() {
+        let body = br#"{"metadata":{".tag":"file","size":12,"rev":"015f","content_hash":"bb"}}"#;
+        let Err(Deleted::Unexpected(reason)) = removed_of(200, body, "aa") else {
+            panic!("another hash must not pass");
+        };
+        assert!(reason.contains("rev 015f"), "{reason}");
+        let body = br#"{"metadata":{".tag":"folder","name":"notes"}}"#;
+        assert!(matches!(
+            removed_of(200, body, "aa"),
+            Err(Deleted::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn a_delete_reply_of_409_conflict_or_not_found_deletes_nothing() {
+        let conflict = br#"{"error_summary":"path_write/conflict/file/.."}"#;
+        assert_eq!(removed_of(409, conflict, "aa"), Err(Deleted::Refused));
+        let gone = br#"{"error_summary":"path_lookup/not_found/.."}"#;
+        assert_eq!(removed_of(409, gone, "aa"), Err(Deleted::Refused));
+        let other = br#"{"error_summary":"too_many_write_operations/.."}"#;
+        assert!(matches!(
+            removed_of(409, other, "aa"),
+            Err(Deleted::Error(_))
+        ));
+        assert!(matches!(removed_of(500, b"", "aa"), Err(Deleted::Error(_))));
     }
 
     #[test]

@@ -11,6 +11,7 @@ orgthread patch <file> --who <name>   < only the changes, as JSON
 orgthread list <folder>...
 orgthread download <file> --who <name> --to <copy>
 orgthread upload <file> --who <name>  < any file
+orgthread delete <file> --who <name>
 orgthread watch
 ```
 
@@ -31,6 +32,8 @@ The old text must occur once, or the patch is refused with exit code 11, and not
 
 For a file that is not text, such as a picture or a PDF, `download` gives the exact bytes, and `upload` writes them with the rules of `write`. A download notes what this name read, so the same name may then replace the file. A file that is not text may go only to the folders named in `ORGTHREAD_BINARY_ALLOW`, and with that setting empty, to none. A download may have up to 250 MB and passes through in parts, and an upload up to 20 MB. `--check` checks the rules and the size, and moves nothing.
 
+`delete` removes one file, and only the version that this name saw: the one it read, or the one given with `--expect <fingerprint>`, for example from `list --fingerprint`. If the file changed since, or no fingerprint is known, it gives exit code 4 and deletes nothing. It never removes a folder. It works only in the folders named in `ORGTHREAD_DELETE_ALLOW`, and with that setting empty, in none. There is a way back: a local folder keeps the last version beside the program, as for every write, and Dropbox keeps the file in Deleted files, with its rev in the log line. `--check` checks the rules and the version, and deletes nothing.
+
 The steps of a write: take the lock with an exclusive create, compare the fingerprint, write a temporary file and move it into place, read it back and compare, release the lock. Every refusal has its own exit code, and every attempt leaves one log line. `orgthread --help` lists the codes, and [docs/exit-codes.md](docs/exit-codes.md) says which command gives each one and what to do.
 
 The fingerprint is the content hash that Dropbox reports. Today the tool writes to a local folder, behind one small storage interface.
@@ -45,7 +48,7 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## MCP
 
-Two MCP servers give the same read, write, patch and list to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
+Two MCP servers give the same read, write, patch, delete and list to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 To set up the local door on a Mac with a plain folder, such as `~/notes`, with no Dropbox and no server, follow [docs/local-folder.md](docs/local-folder.md).
 

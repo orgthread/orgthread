@@ -15,6 +15,10 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one as for the read |
 | | `edits` | Optional: a list of changes, each with `old` and `new`, and an optional `line` |
 | | `append` | Optional: lines to add at the end. A patch needs an edit, an append or both |
+| `delete` | `file` | The full path of the file |
+| | `who` | The name of this chat, the same one as for the read |
+| | `expect` | Optional: the fingerprint of the version to delete, for example from `list` with `fingerprint`. Needed when this name has not read the file |
+| | `check` | Optional: `true` only checks the rules and the version, and deletes nothing. The default is `false` |
 | `list` | `folders` | A list of full paths of folders, at least one |
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
@@ -25,7 +29,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one each time |
 | `version` | | No fields |
 
-The fields of `read` and `write` are all required, and `file` and `who` of `patch`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
+The fields of `read` and `write` are all required, and `file` and `who` of `patch` and `delete`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
 
 `read` gives the exact text of the file, and notes what this name read.
 
@@ -69,6 +73,22 @@ A task that may send the same patch twice, for example after a lost answer, puts
 
 A list notes nothing, so it needs no `who`.
 
+`delete` removes one file, and only the version that this name saw:
+
+- The version is the one this name read, or the one given as `expect`. If the file changed since, or this name has not read it and no `expect` is given, it is refused with code 4, and nothing is deleted.
+- It never removes a folder. One file per call.
+- It works only in the folders that the owner opened for deletes, with `ORGTHREAD_DELETE_ALLOW`. With that setting empty, the default, every delete is refused with code 2. The other limits still count: a closed or read-only path is refused too.
+- There is a way back. The local door keeps the last version beside the program, as for every write. With Dropbox, the file stays in its Deleted files, and the answer and the log line give its rev.
+- With Dropbox, a read notes the rev of the file next to its fingerprint. The delete is then one web call, and Dropbox checks the version at the same moment as it deletes. With `expect` and no read, the server first looks up the rev.
+
+A delete answers like this, on a local door:
+
+```
+deleted: notes/old-plan.md, 17 bytes. The last version is kept.
+```
+
+With Dropbox, the answer ends with `Dropbox keeps it in Deleted files, rev <rev>.` in place of the last sentence.
+
 `download` and `upload` give one line for each file, in the order given. A line that works gives the path, for a download the size, and the link last. A file that is refused gets `refused, exit code N:` and the reason, and the others still get their links. With a refusal, the text starts with `exit code N` of the first file that failed. Use each link at once in the code sandbox, and never show, store or log it:
 
 ```
@@ -86,7 +106,7 @@ curl -sS -T p088-1.jpg '<link>'
 orgthread 0.2.5 (abc1234)
 door: remote
 storage: Dropbox
-tools: read, write, patch, list, download, upload, version
+tools: read, write, patch, delete, list, download, upload, version
 ```
 
 - The first line is the same as `orgthread --version`. A `+` after the commit means that the build had changes not yet committed.
@@ -265,6 +285,34 @@ Reply:
 ```json
 {"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 11\norgthread: refused, nothing written. Edit 1: the old text is not in the file. Its new text is at line 4, so this patch may have gone through already.\n","type":"text"}],"isError":true}}
 ```
+
+### `delete`
+
+These come from a run of the local server with `ORGTHREAD_ROOT=/tmp/claude/example-delete/root` and `ORGTHREAD_DELETE_ALLOW=notes`. The file `notes/old-plan.md` held the line "walk in the park".
+
+First the delete came before any read, so it was refused:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete","arguments":{"file":"/tmp/claude/example-delete/root/notes/old-plan.md","who":"chat a"}}}
+```
+
+```json
+{"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 4\norgthread: refused, nothing deleted. chat a has not read notes/old-plan.md, and no --expect was given. Read it first with: orgthread read <file> --who <same name>\n","type":"text"}],"isError":true}}
+```
+
+After a `read` by the same name, a check, then the delete:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"delete","arguments":{"file":"/tmp/claude/example-delete/root/notes/old-plan.md","who":"chat a","check":true}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"delete","arguments":{"file":"/tmp/claude/example-delete/root/notes/old-plan.md","who":"chat a"}}}
+```
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"check passed, nothing deleted: notes/old-plan.md, 17 bytes\n","type":"text"}],"isError":false}}
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"deleted: notes/old-plan.md, 17 bytes. The last version is kept.\n","type":"text"}],"isError":false}}
+```
+
+The log line of the delete has 8 fields: the time, `deleted`, the path, the name, the fingerprint before, `-`, the size, and the rev. A local folder has no rev, so the last field is `-`.
 
 ### `version`
 

@@ -28,18 +28,47 @@ impl Reads {
     }
 
     pub fn remember(&self, who: &str, path: &str, print: &str) -> io::Result<()> {
+        self.remember_rev(who, path, print, None)
+    }
+
+    /// The same, with the version the storage gave in the same reply, such as a
+    /// Dropbox rev. It sits on a second line of the note.
+    pub fn remember_rev(
+        &self,
+        who: &str,
+        path: &str,
+        print: &str,
+        rev: Option<&str>,
+    ) -> io::Result<()> {
         crate::log::private_dir(&self.dir)?;
         let note = self.note(who, path);
         let temp = note.with_extension(format!("{}.tmp", std::process::id()));
-        fs::write(&temp, print)?;
+        let text = match rev {
+            Some(rev) if !rev.is_empty() && !rev.contains('\n') => format!("{print}\n{rev}"),
+            _ => print.to_string(),
+        };
+        fs::write(&temp, text)?;
         fs::rename(&temp, &note).inspect_err(|_| {
             let _ = fs::remove_file(&temp);
         })
     }
 
     pub fn recall(&self, who: &str, path: &str) -> io::Result<Option<String>> {
+        Ok(self.recall_rev(who, path)?.map(|(print, _)| print))
+    }
+
+    /// The fingerprint, and the version noted with it, if any.
+    pub fn recall_rev(
+        &self,
+        who: &str,
+        path: &str,
+    ) -> io::Result<Option<(String, Option<String>)>> {
         match fs::read_to_string(self.note(who, path)) {
-            Ok(print) => Ok(Some(print)),
+            Ok(text) => Ok(Some(match text.split_once('\n') {
+                Some((print, rev)) if !rev.is_empty() => (print.to_string(), Some(rev.to_string())),
+                Some((print, _)) => (print.to_string(), None),
+                None => (text, None),
+            })),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -107,6 +136,29 @@ mod tests {
         assert_eq!(
             r.recall("chat a", "org/x.md").unwrap().as_deref(),
             Some("newer")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rev_comes_back_with_its_fingerprint_and_a_plain_note_has_none() {
+        let dir = place("rev");
+        let r = Reads::new(&dir);
+        r.remember_rev("chat", "org/x.md", "print", Some("015f00a1"))
+            .unwrap();
+        assert_eq!(
+            r.recall("chat", "org/x.md").unwrap().as_deref(),
+            Some("print")
+        );
+        assert_eq!(
+            r.recall_rev("chat", "org/x.md").unwrap(),
+            Some(("print".to_string(), Some("015f00a1".to_string())))
+        );
+        // A write notes a new fingerprint and no rev: the old rev must go.
+        r.remember("chat", "org/x.md", "newer").unwrap();
+        assert_eq!(
+            r.recall_rev("chat", "org/x.md").unwrap(),
+            Some(("newer".to_string(), None))
         );
         fs::remove_dir_all(&dir).unwrap();
     }

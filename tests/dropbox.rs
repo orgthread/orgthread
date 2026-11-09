@@ -37,6 +37,10 @@ struct State {
     list_calls: u32,
     /// How many downloads came in.
     downloads: u32,
+    /// How many `get_metadata` calls came in.
+    metadata_calls: u32,
+    /// The `parent_rev` of each `delete_v2` call, or `None` for a call with none.
+    deletes: Vec<Option<String>>,
 }
 
 impl State {
@@ -97,6 +101,15 @@ impl State {
 fn reply(stream: &mut TcpStream, status: u16, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+}
+
+fn reply_with_result(stream: &mut TcpStream, body: &[u8], result: &Value) {
+    let head = format!(
+        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nDropbox-API-Result: {result}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -168,9 +181,18 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
     if endpoint == "/2/files/download" {
         s.downloads += 1;
     }
+    if endpoint == "/2/files/get_metadata" {
+        s.metadata_calls += 1;
+    }
     match endpoint.as_str() {
         "/2/files/download" => match s.files.get(&path) {
-            Some(file) => reply(&mut stream, 200, &file.bytes),
+            Some(file) => {
+                let result = json!({
+                    "rev": file.rev.to_string(),
+                    "content_hash": fingerprint(&file.bytes),
+                });
+                reply_with_result(&mut stream, &file.bytes, &result)
+            }
             None => error(&mut stream, "path/not_found/.."),
         },
         "/2/files/list_folder" => {
@@ -228,16 +250,27 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
                 error(&mut stream, "path/conflict/file/..");
             }
         }
-        "/2/files/delete_v2" => match s.files.get(&path).map(|f| f.rev.to_string()) {
-            None => error(&mut stream, "path_lookup/not_found/.."),
-            Some(rev) if arg["parent_rev"].as_str().is_some_and(|want| want != rev) => {
-                error(&mut stream, "path_write/conflict/file/..");
+        "/2/files/delete_v2" => {
+            s.deletes
+                .push(arg["parent_rev"].as_str().map(str::to_string));
+            match s.files.get(&path).map(|f| f.rev.to_string()) {
+                None => error(&mut stream, "path_lookup/not_found/.."),
+                Some(rev) if arg["parent_rev"].as_str().is_some_and(|want| want != rev) => {
+                    error(&mut stream, "path_write/conflict/file/..");
+                }
+                Some(rev) => {
+                    let file = s.files.remove(&path).unwrap();
+                    let v = json!({ "metadata": {
+                        ".tag": "file",
+                        "name": path.rsplit('/').next().unwrap_or(""),
+                        "size": file.bytes.len(),
+                        "rev": rev,
+                        "content_hash": fingerprint(&file.bytes),
+                    }});
+                    reply(&mut stream, 200, v.to_string().as_bytes());
+                }
             }
-            Some(_) => {
-                s.files.remove(&path);
-                reply(&mut stream, 200, b"{}");
-            }
-        },
+        }
         _ => reply(&mut stream, 404, b"no such endpoint"),
     }
 }
@@ -991,4 +1024,111 @@ fn a_download_from_dropbox_knows_the_size_first() {
         code(&f.run(&["download", "/org/scans/none.pdf", "--who", "a"], b"")),
         6
     );
+}
+
+const ALLOW: (&str, &str) = ("ORGTHREAD_DELETE_ALLOW", "/org/notes");
+
+fn deleted_fields(f: &Fake) -> Vec<String> {
+    let log = fs::read_to_string(f.dir.join("log")).unwrap();
+    let line = log.lines().last().unwrap();
+    line.split('\t').skip(1).map(str::to_string).collect()
+}
+
+#[test]
+fn read_then_delete_is_one_trip_with_the_rev_of_the_read() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    f.read("chat");
+    let rev = f.state.lock().unwrap().files[FILE].rev.to_string();
+    let before = f.state.lock().unwrap().metadata_calls;
+    let o = f.run_with_env(&["delete", FILE, "--who", "chat"], b"", &[ALLOW]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        format!(
+            "deleted: org/notes/invented.md, 4 bytes. Dropbox keeps it in Deleted files, rev {rev}.\n"
+        )
+    );
+    assert_eq!(f.get(FILE), None);
+    let s = f.state.lock().unwrap();
+    assert_eq!(s.deletes, [Some(rev.clone())], "one call, with parent_rev");
+    assert_eq!(s.metadata_calls, before, "no get_metadata first");
+    drop(s);
+    let print = fingerprint(b"old\n");
+    assert_eq!(
+        deleted_fields(&f),
+        [
+            "deleted",
+            "org/notes/invented.md",
+            "chat",
+            &print,
+            "-",
+            "4",
+            &rev
+        ]
+    );
+    assert!(
+        !f.dir.join("versions").exists(),
+        "no text on the disk of a server"
+    );
+}
+
+#[test]
+fn a_newer_version_in_dropbox_is_a_409_conflict_and_stays() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    f.read("chat");
+    // The same bytes again: a new rev. Only Dropbox's own check can see this.
+    f.put(FILE, b"old\n");
+    let o = f.run_with_env(&["delete", FILE, "--who", "chat"], b"", &[ALLOW]);
+    assert_eq!(code(&o), 4, "{o:?}");
+    assert_eq!(f.get(FILE).unwrap(), b"old\n");
+    assert_eq!(f.state.lock().unwrap().deletes.len(), 1);
+}
+
+#[test]
+fn a_file_gone_in_dropbox_is_not_found_and_exit_6() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    f.read("chat");
+    f.state.lock().unwrap().files.clear();
+    let o = f.run_with_env(&["delete", FILE, "--who", "chat"], b"", &[ALLOW]);
+    assert_eq!(code(&o), 6, "{o:?}");
+}
+
+#[test]
+fn expect_with_no_noted_rev_looks_up_the_rev_first() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    let print = fingerprint(b"old\n");
+    let args = ["delete", FILE, "--who", "x", "--expect", &print];
+    let wrong = fingerprint(b"other\n");
+    let o = f.run_with_env(
+        &["delete", FILE, "--who", "x", "--expect", &wrong],
+        b"",
+        &[ALLOW],
+    );
+    assert_eq!(code(&o), 4, "{o:?}");
+    assert!(f.state.lock().unwrap().deletes.is_empty(), "no delete call");
+    let o = f.run_with_env(&args, b"", &[ALLOW]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(FILE), None);
+    let rev = f.state.lock().unwrap().deletes.clone();
+    assert_eq!(rev.len(), 1);
+    assert!(rev[0].is_some(), "the rev from get_metadata went with it");
+}
+
+#[test]
+fn a_delete_in_dropbox_needs_the_setting_and_a_fingerprint() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    f.read("chat");
+    let o = f.run(&["delete", FILE, "--who", "chat"], b"");
+    assert_eq!(code(&o), 2, "{o:?}");
+    let o = f.run_with_env(&["delete", FILE, "--who", "other"], b"", &[ALLOW]);
+    assert_eq!(code(&o), 4, "{o:?}");
+    let o = f.run_with_env(&["delete", FILE, "--who", "chat", "--check"], b"", &[ALLOW]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(FILE).unwrap(), b"old\n");
+    assert!(f.state.lock().unwrap().deletes.is_empty());
 }

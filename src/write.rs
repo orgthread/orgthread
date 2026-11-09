@@ -196,7 +196,7 @@ impl Report {
 
 /// Releases the lock also when the steps panic. It removes the lock only while
 /// the lock still holds this write's own line.
-struct Held<'a> {
+pub(crate) struct Held<'a> {
     storage: &'a dyn Storage,
     name: String,
     line: String,
@@ -291,7 +291,7 @@ enum Plan<'a> {
 /// The steps between taking and releasing the lock.
 fn change(
     storage: &dyn Storage,
-    held: &Held,
+    held: &Held<'_>,
     path: &str,
     plan: &Plan,
     stop: &AtomicBool,
@@ -463,17 +463,65 @@ pub fn patch_unless_stopped(
 }
 
 fn run(storage: &dyn Storage, path: &str, plan: &Plan, line: &str, stop: &AtomicBool) -> Report {
-    let name = lock_name(path);
-    let refused = |outcome| Report {
+    let run = under_lock(storage, path, line, |held| {
+        change(storage, held, path, plan, stop)
+    });
+    let outcome = match run.result {
+        Ok(outcome) => outcome,
+        Err(Gate::Busy { holder, age }) => Outcome::Locked { holder, age },
+        Err(Gate::Failed(reason)) => failed("could not reserve the file", reason),
+    };
+    Report {
         outcome,
+        took_over: run.took_over,
+        lock_left: run.lock_left,
+        lock_lost: run.lock_lost,
+    }
+}
+
+/// Why the steps under a lock did not run.
+pub(crate) enum Gate {
+    Busy { holder: String, age: Duration },
+    Failed(String),
+}
+
+/// What happened around the steps under a lock.
+pub(crate) struct Locked<T> {
+    pub result: Result<T, Gate>,
+    pub took_over: Option<String>,
+    pub lock_left: Option<String>,
+    pub lock_lost: Option<String>,
+}
+
+impl Held<'_> {
+    /// True while the lock still holds this caller's own line.
+    pub(crate) fn still_ours(&self) -> io::Result<bool> {
+        self.is_ours()
+    }
+}
+
+/// Takes the lock of `path`, runs `steps`, and releases the lock, also on a panic.
+/// The write and the delete share it, so both lock in the same way.
+pub(crate) fn under_lock<T>(
+    storage: &dyn Storage,
+    path: &str,
+    line: &str,
+    steps: impl FnOnce(&Held<'_>) -> T,
+) -> Locked<T> {
+    let name = lock_name(path);
+    let refused = |gate| Locked {
+        result: Err(gate),
         took_over: None,
         lock_left: None,
         lock_lost: None,
     };
     let took_over = match acquire(storage, &name, line) {
         Ok(Acquired::Yes { took_over }) => took_over,
-        Ok(Acquired::No(outcome)) => return refused(outcome),
-        Err(e) => return refused(failed("could not reserve the file", e)),
+        Ok(Acquired::No(Outcome::Locked { holder, age })) => {
+            return refused(Gate::Busy { holder, age });
+        }
+        Ok(Acquired::No(other)) => return refused(Gate::Failed(format!("{other:?}"))),
+        Err(e) => return refused(Gate::Failed(e.to_string())),
     };
     let mut held = Held {
         storage,
@@ -481,7 +529,7 @@ fn run(storage: &dyn Storage, path: &str, plan: &Plan, line: &str, stop: &Atomic
         line: line.to_string(),
         done: false,
     };
-    let outcome = change(storage, &held, path, plan, stop);
+    let result = steps(&held);
     let (lock_left, lock_lost) = match held.release() {
         Ok(Release::Done) => (None, None),
         Ok(Release::NotOurs(other)) => (
@@ -490,8 +538,8 @@ fn run(storage: &dyn Storage, path: &str, plan: &Plan, line: &str, stop: &Atomic
         ),
         Err(e) => (Some(e.to_string()), None),
     };
-    Report {
-        outcome,
+    Locked {
+        result: Ok(result),
         took_over,
         lock_left,
         lock_lost,

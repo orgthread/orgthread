@@ -346,6 +346,26 @@ fn tools(remote: bool) -> Value {
             },
         },
         {
+            "name": "delete",
+            "description": "Deletes one file, never a folder, and only the version this name \
+                saw: read it first with the same name, or give its fingerprint as expect, \
+                from list with fingerprint. A delete is refused when the file changed since, \
+                and outside the folders the owner opened for deletes. There is a way back: \
+                Dropbox keeps the file in Deleted files, and a local door keeps the last \
+                version. With check, it only checks the rules and the version, and deletes \
+                nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": file,
+                    "who": who,
+                    "expect": {"type": "string", "description": "The fingerprint of the version to delete, when this name has not read it"},
+                    "check": {"type": "boolean", "description": "true only checks, and deletes nothing"},
+                },
+                "required": ["file", "who"],
+            },
+        },
+        {
             "name": "list",
             "description": "Lists the files and folders in one or more folders: one group per \
                 folder, and per entry its size in bytes, its time and its name. A folder name \
@@ -596,6 +616,22 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
             return links_for(params, exe, remote, direction);
         }
         Some("version") => return Ok(version(remote.is_some())),
+        Some("delete") => {
+            let arguments = &params["arguments"];
+            let mut args = vec!["delete", "--who", text_of("who")?];
+            match &arguments["expect"] {
+                Value::Null => {}
+                Value::String(print) => args.extend(["--expect", print.as_str()]),
+                _ => return Err((INVALID_PARAMS, "delete needs expect, as text".into())),
+            }
+            match &arguments["check"] {
+                Value::Null | Value::Bool(false) => {}
+                Value::Bool(true) => args.push("--check"),
+                _ => return Err((INVALID_PARAMS, "delete needs check as true or false".into())),
+            }
+            args.push(text_of("file")?);
+            return Ok(result(name, start(exe, &args, None)));
+        }
         Some("list") => {
             let owned = list_args(params)?;
             let args: Vec<&str> = owned.iter().map(String::as_str).collect();
