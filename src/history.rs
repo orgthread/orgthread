@@ -197,12 +197,19 @@ impl Cache {
         self.revs.get(&Self::key(path))?.get(print).cloned()
     }
 
-    /// Notes the `rev` of each fingerprint in a list. A `rev` never changes.
+    /// Notes the `rev` of each fingerprint in a list, newest first. A text that
+    /// came back gets the newest `rev`, as it stays kept the longest.
     pub fn learn(&mut self, path: &str, list: &[Revision]) {
         let map = self.revs.entry(Self::key(path)).or_default();
-        for revision in list {
-            map.entry(revision.hash.clone())
-                .or_insert_with(|| revision.clone());
+        for revision in list.iter().rev() {
+            map.insert(revision.hash.clone(), revision.clone());
+        }
+    }
+
+    /// Forgets a `rev` that Dropbox no longer keeps.
+    pub fn forget(&mut self, path: &str, print: &str) {
+        if let Some(map) = self.revs.get_mut(&Self::key(path)) {
+            map.remove(print);
         }
     }
 }
@@ -291,112 +298,132 @@ pub fn fetch(
             }
         }
     }
-    if !found.is_empty() {
-        tell(Step::Did(format!("{} from memory", versions(found.len()))));
+    let from_cache = found.len();
+    if from_cache > 0 {
+        tell(Step::Did(format!("{} from memory", versions(from_cache))));
     }
-    let missing: Vec<&str> = prints
-        .iter()
-        .copied()
-        .filter(|p| !found.contains_key(*p))
-        .collect();
-    if missing.is_empty() {
+    if from_cache == prints.len() {
         return Ok(texts_of(job, &found));
     }
 
-    let known = |c: &Cache| -> Vec<Option<Revision>> {
-        missing.iter().map(|p| c.rev(&job.path, p)).collect()
-    };
-    let mut revs = known(&hold(cache));
-    if revs.iter().any(Option::is_none) {
-        tell(Step::Doing("Looking in the list of revisions".to_string()));
-        let list = history.revisions(&job.path).map_err(|e| {
-            format!(
-                "Dropbox could not list the versions: {}",
-                clean(&e.to_string())
-            )
-        })?;
-        let mut c = hold(cache);
-        c.learn(&job.path, &list);
-        revs = known(&c);
-        let listed = revs.iter().filter(|r| r.is_some()).count();
-        tell(Step::Did(format!(
-            "Found {} in the list of revisions",
-            versions(listed)
-        )));
-    }
-    let is_gone = |print: &str, revs: &[Option<Revision>]| {
-        missing
+    // A `rev` from memory can be gone, while the same text is still kept under
+    // a newer one. Then the list is read once more.
+    let mut listed = false;
+    loop {
+        let missing: Vec<&str> = prints
             .iter()
-            .zip(revs)
-            .any(|(p, r)| *p == print && r.is_none())
-    };
-    let old_gone = is_gone(&job.old, &revs);
-    let new_gone = is_gone(&job.new, &revs);
-    if old_gone || new_gone {
-        return Err(job.gone(old_gone, new_gone));
-    }
-    let revs: Vec<Revision> = revs.into_iter().flatten().collect();
-    if revs.iter().any(|r| r.size > MAX_SIZE) {
-        return Err(TOO_BIG.to_string());
-    }
-
-    tell(Step::Doing(if revs.len() > 1 {
-        "Downloading before and after, at the same time".to_string()
-    } else {
-        "Downloading the version".to_string()
-    }));
-    let results: Vec<io::Result<Option<Vec<u8>>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = revs
-            .iter()
-            .map(|r| scope.spawn(|| history.read_revision(&r.rev)))
+            .copied()
+            .filter(|p| !found.contains_key(*p))
             .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(io::Error::other("the download stopped")))
-            })
-            .collect()
-    });
-
-    let mut gone = Vec::new();
-    let mut problem = None;
-    for (print, result) in missing.iter().zip(results) {
-        match result {
-            Ok(Some(bytes)) => {
-                if fingerprint(&bytes) != *print {
-                    problem.get_or_insert(MISMATCH.to_string());
-                    continue;
-                }
-                match String::from_utf8(bytes) {
-                    Ok(text) if !text.contains('\0') => {
-                        hold(cache).put(print, text.clone());
-                        found.insert(print.to_string(), text);
-                    }
-                    _ => {
-                        problem.get_or_insert(NOT_TEXT.to_string());
-                    }
-                }
-            }
-            Ok(None) => gone.push(*print),
-            Err(e) => {
-                problem.get_or_insert(format!(
-                    "Dropbox could not give a version: {}",
+        let known = |c: &Cache| -> Vec<Option<Revision>> {
+            missing.iter().map(|p| c.rev(&job.path, p)).collect()
+        };
+        let mut revs = known(&hold(cache));
+        if !listed && revs.iter().any(Option::is_none) {
+            listed = true;
+            tell(Step::Doing("Looking in the list of revisions".to_string()));
+            let list = history.revisions(&job.path).map_err(|e| {
+                format!(
+                    "Dropbox could not list the versions: {}",
                     clean(&e.to_string())
-                ));
+                )
+            })?;
+            let mut c = hold(cache);
+            c.learn(&job.path, &list);
+            revs = known(&c);
+            let listed = revs.iter().filter(|r| r.is_some()).count();
+            tell(Step::Did(format!(
+                "Found {} in the list of revisions",
+                versions(listed)
+            )));
+        }
+        let is_gone = |print: &str| {
+            !print.is_empty()
+                && !found.contains_key(print)
+                && missing
+                    .iter()
+                    .zip(&revs)
+                    .any(|(p, r)| *p == print && r.is_none())
+        };
+        let (old_gone, new_gone) = (is_gone(&job.old), is_gone(&job.new));
+        if old_gone || new_gone {
+            return Err(job.gone(old_gone, new_gone));
+        }
+        let revs: Vec<Revision> = revs.into_iter().flatten().collect();
+        if revs.iter().any(|r| r.size > MAX_SIZE) {
+            return Err(TOO_BIG.to_string());
+        }
+
+        tell(Step::Doing(if revs.len() > 1 {
+            "Downloading before and after, at the same time".to_string()
+        } else {
+            "Downloading the version".to_string()
+        }));
+        let results: Vec<io::Result<Option<Vec<u8>>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = revs
+                .iter()
+                .map(|r| scope.spawn(|| history.read_revision(&r.rev)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(io::Error::other("the download stopped")))
+                })
+                .collect()
+        });
+
+        let mut gone = Vec::new();
+        let mut problem = None;
+        for (print, result) in missing.iter().zip(results) {
+            match result {
+                Ok(Some(bytes)) => {
+                    if fingerprint(&bytes) != *print {
+                        problem.get_or_insert(MISMATCH.to_string());
+                        continue;
+                    }
+                    match String::from_utf8(bytes) {
+                        Ok(text) if !text.contains('\0') => {
+                            hold(cache).put(print, text.clone());
+                            found.insert(print.to_string(), text);
+                        }
+                        _ => {
+                            problem.get_or_insert(NOT_TEXT.to_string());
+                        }
+                    }
+                }
+                Ok(None) => gone.push(*print),
+                Err(e) => {
+                    problem.get_or_insert(format!(
+                        "Dropbox could not give a version: {}",
+                        clean(&e.to_string())
+                    ));
+                }
             }
         }
+        if let Some(problem) = problem {
+            return Err(problem);
+        }
+        if gone.is_empty() {
+            break;
+        }
+        {
+            let mut c = hold(cache);
+            for print in &gone {
+                c.forget(&job.path, print);
+            }
+        }
+        if listed {
+            return Err(job.gone(
+                gone.contains(&job.old.as_str()),
+                gone.contains(&job.new.as_str()),
+            ));
+        }
     }
-    if let Some(problem) = problem {
-        return Err(problem);
-    }
-    if !gone.is_empty() {
-        return Err(job.gone(
-            gone.contains(&job.old.as_str()),
-            gone.contains(&job.new.as_str()),
-        ));
-    }
-    tell(Step::Did(format!("Downloaded {}", versions(missing.len()))));
+    tell(Step::Did(format!(
+        "Downloaded {}",
+        versions(prints.len() - from_cache)
+    )));
     Ok(texts_of(job, &found))
 }
 
@@ -556,6 +583,51 @@ pub mod tests {
         let next = job(&fingerprint(NEW.as_bytes()), &fingerprint(third.as_bytes()));
         assert_eq!(run(&next, &fake, &cache).unwrap().1, third);
         assert_eq!(fake.downloads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_rev_that_went_is_replaced_by_a_newer_one_with_the_same_text() {
+        let cache = Mutex::new(Cache::new(CACHE_LIMIT));
+        let job = job(&fingerprint(OLD.as_bytes()), &fingerprint(NEW.as_bytes()));
+        // Memory still names r0 for OLD, but Dropbox dropped it. The same text
+        // came back later as r7.
+        hold(&cache).learn(
+            &job.path,
+            &[
+                Revision {
+                    rev: "r6".into(),
+                    hash: job.new.clone(),
+                    size: NEW.len() as u64,
+                    modified: None,
+                },
+                Revision {
+                    rev: "r0".into(),
+                    hash: job.old.clone(),
+                    size: OLD.len() as u64,
+                    modified: None,
+                },
+            ],
+        );
+        let mut fake = Fake::default();
+        fake.add("r7", OLD.as_bytes());
+        fake.add("r6", NEW.as_bytes());
+        assert_eq!(run(&job, &fake, &cache).unwrap(), (OLD.into(), NEW.into()));
+        assert_eq!(hold(&cache).rev(&job.path, &job.old).unwrap().rev, "r7");
+        assert_eq!(
+            fake.lists.load(Ordering::SeqCst),
+            1,
+            "one new list, no more"
+        );
+        // A list names the newest rev of a text that came back.
+        let mut c = Cache::new(CACHE_LIMIT);
+        let rev = |rev: &str| Revision {
+            rev: rev.into(),
+            hash: "same".into(),
+            size: 1,
+            modified: None,
+        };
+        c.learn("org/a.md", &[rev("r9"), rev("r2")]);
+        assert_eq!(c.rev("org/a.md", "same").unwrap().rev, "r9");
     }
 
     #[test]
