@@ -96,7 +96,7 @@ The tool starts `orgthread list`, as `read` and `write` start their commands. It
 
 ## Not part of this step
 
-- A fingerprint per file. A chat needs none for a write, as each read notes it.
+- A fingerprint per file. A chat needs none for a write, as each read notes it. Added later as the option `--fingerprint`, for tasks that look for changed files: see [mcp-api.md](mcp-api.md).
 - A mark "changed since this name read it". It needs `--who`, so it is a feature of its own, for later.
 - A sort by time, a JSON shape, and a cursor for the chat.
 - A move tool. It comes later, as a separate step.

@@ -350,7 +350,9 @@ fn tools(remote: bool) -> Value {
             "description": "Lists the files and folders in one or more folders: one group per \
                 folder, and per entry its size in bytes, its time and its name. A folder name \
                 ends with /. To read a file, join the header of its group and its name. One \
-                level by default. Names that start with a dot are hidden.",
+                level by default. Names that start with a dot are hidden. With fingerprint, also \
+                the fingerprint of each file, the content hash that Dropbox reports, before \
+                its name.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -370,6 +372,10 @@ fn tools(remote: bool) -> Value {
                     "all": {
                         "type": "boolean",
                         "description": "true also shows the names that start with a dot",
+                    },
+                    "fingerprint": {
+                        "type": "boolean",
+                        "description": "true also shows the fingerprint of each file",
                     },
                 },
                 "required": ["folders"],
@@ -627,6 +633,11 @@ fn list_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
         Value::Null | Value::Bool(false) => {}
         Value::Bool(true) => args.push("--all".into()),
         _ => return Err(wrong("all as true or false")),
+    }
+    match &arguments["fingerprint"] {
+        Value::Null | Value::Bool(false) => {}
+        Value::Bool(true) => args.push("--fingerprint".into()),
+        _ => return Err(wrong("fingerprint as true or false")),
     }
     args.push("--".into());
     for folder in folders {

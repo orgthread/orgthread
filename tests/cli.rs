@@ -596,6 +596,20 @@ fn list_and_ls_give_the_folder_and_its_exit_code() {
         assert!(text.starts_with(&format!("{notes}:\n")), "{text}");
         assert!(text.ends_with("  invented.md\n"), "{text}");
     }
+    let o = p.command(&["ls", "--fingerprint", notes]).output().unwrap();
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    let line = format!("  {}  invented.md\n", fingerprint(b"four"));
+    assert!(text.ends_with(&line), "{text}");
+    // The same fingerprint as the command fingerprint gives.
+    let one = p
+        .command(&["fingerprint", p.file().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        text.contains(String::from_utf8(one.stdout).unwrap().trim()),
+        "{text}"
+    );
 }
 
 #[test]

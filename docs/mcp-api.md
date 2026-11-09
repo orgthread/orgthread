@@ -18,6 +18,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | `list` | `folders` | A list of full paths of folders, at least one |
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
+| | `fingerprint` | Optional: `true` also shows the fingerprint of each file. The default is `false` |
 | `download` | `files` | A list of 1 to 25 full paths of files. Remote server only |
 | | `who` | The name of this chat, the same one each time |
 | `upload` | `files` | A list of 1 to 25 full paths, where the files will go. Remote server only |
@@ -64,6 +65,7 @@ A task that may send the same patch twice, for example after a lost answer, puts
 - A file in place of a folder shows under its own folder.
 - A list shows at most 1000 entries. After that, a last line says `more entries not shown: list a smaller folder or a lower depth`.
 - The time is in the time zone of the machine that runs the server, with the day name. On a server, set `TZ`, for example `TZ=Europe/Vienna`.
+- With `fingerprint` set to `true`, each line gets the fingerprint of the file before its name: the content hash that Dropbox reports, 64 hex signs. It is the same as `orgthread fingerprint` gives. A folder shows `-`. With Dropbox, the fingerprint comes with the list, so it costs no more web calls. With a local folder, the server reads each file for it, so a large folder takes longer. A task can compare it with the fingerprint from an earlier run, to find the files that changed, and read only those.
 
 A list notes nothing, so it needs no `who`.
 
@@ -189,6 +191,22 @@ Reply:
 
 ```json
 {"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"/tmp/claude/example/notes:\n         11  2026-11-08 Sun 14:05  a.md\n          -  -                     drafts/\n","type":"text"}],"isError":false}}
+```
+
+### A list with fingerprints
+
+The same folder, two levels down, with the fingerprints:
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list","arguments":{"folders":["/tmp/claude/example/notes"],"depth":2,"fingerprint":true}}}
+```
+
+Reply:
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"/tmp/claude/example/notes:\n         11  2026-11-08 Sun 14:05  e56b9a770f9012640f47cafa3ae75b4fa504d84aed0268245c5b3b246070410d  a.md\n          -  -                     -                                                                 drafts/\n\n/tmp/claude/example/notes/drafts:\n          2  2026-11-09 Mon 09:03  c606dd677840d364890dce4afe87cfa83260633ed6020d197e8837f553dbbb89  b.md\n","type":"text"}],"isError":false}}
 ```
 
 ### A list that fails in part

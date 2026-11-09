@@ -71,6 +71,7 @@ fn entry_of(v: &Value) -> Option<Entry> {
             folder: true,
             size: None,
             modified: None,
+            hash: None,
         }),
         "file" => Some(Entry {
             name,
@@ -80,6 +81,7 @@ fn entry_of(v: &Value) -> Option<Entry> {
                 .as_str()
                 .and_then(|t| t.parse::<jiff::Timestamp>().ok())
                 .map(|t| t.as_second()),
+            hash: v["content_hash"].as_str().map(str::to_string),
         }),
         _ => None,
     }
@@ -514,7 +516,7 @@ mod tests {
     #[test]
     fn a_page_of_list_folder_becomes_entries() {
         let body = br#"{"entries":[
-            {".tag":"file","name":"a.md","size":12,"server_modified":"2026-11-07T10:00:00Z"},
+            {".tag":"file","name":"a.md","size":12,"server_modified":"2026-11-07T10:00:00Z","content_hash":"ab12"},
             {".tag":"folder","name":"drafts"},
             {".tag":"deleted","name":"gone.md"}
         ],"cursor":"next-page","has_more":true}"#;
@@ -529,12 +531,14 @@ mod tests {
                     folder: false,
                     size: Some(12),
                     modified: Some(1_794_045_600),
+                    hash: Some("ab12".into()),
                 },
                 Entry {
                     name: "drafts".into(),
                     folder: true,
                     size: None,
                     modified: None,
+                    hash: None,
                 },
             ]
         );

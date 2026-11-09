@@ -3,6 +3,7 @@
 //! The text looks like `ls`, so that a model reads it with no help. The size and
 //! the time come first and the name last, so a space in a name does no harm.
 
+use crate::fingerprint::Fingerprinter;
 use crate::storage::{Entry, Listing, Storage};
 use crate::write::exit;
 use jiff::Timestamp;
@@ -18,6 +19,8 @@ pub struct Options {
     pub depth: Option<usize>,
     /// Also the names that start with a dot.
     pub all: bool,
+    /// Also the fingerprint of each file, in a column before the name.
+    pub fingerprint: bool,
     /// The time zone of the times.
     pub zone: TimeZone,
 }
@@ -140,7 +143,34 @@ impl Run<'_> {
         self.fail(code);
     }
 
+    /// The fingerprint of a file. Dropbox gives it with the list. A local file
+    /// is read for it, in parts, so a large file never sits whole in memory.
+    fn print_of(&mut self, entry: &Entry, path: &str) -> String {
+        if entry.folder {
+            return "-".to_string();
+        }
+        if let Some(hash) = &entry.hash {
+            return hash.clone();
+        }
+        let mut print = Fingerprinter::default();
+        match self.storage.read_to(path, &mut print) {
+            Ok(true) => print.finish(),
+            // Gone since the list: nothing to fingerprint.
+            Ok(false) => "-".to_string(),
+            Err(e) => {
+                self.fail(exit::FAILED);
+                format!("- (could not read it: {e})")
+            }
+        }
+    }
+
     fn line(&mut self, entry: &Entry, path: &str) {
+        let print = if self.options.fingerprint {
+            let print = self.print_of(entry, path);
+            format!("{print:<64}  ")
+        } else {
+            String::new()
+        };
         let size = entry.size.map_or("-".to_string(), |s| s.to_string());
         let time = entry
             .modified
@@ -152,7 +182,7 @@ impl Run<'_> {
             ""
         };
         self.out.push_str(&format!(
-            "  {size:>9}  {time:<20}  {}{slash}{mark}\n",
+            "  {size:>9}  {time:<20}  {print}{}{slash}{mark}\n",
             entry.name
         ));
         self.left -= 1;
@@ -273,6 +303,7 @@ mod tests {
         Options {
             depth,
             all,
+            fingerprint: false,
             zone: TimeZone::UTC,
         }
     }
@@ -316,6 +347,96 @@ mod tests {
             "/notes:\n          4  T  a.md\n          2  T  B.md\n          -  -                     drafts/"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fingerprints_come_before_the_names_of_files() {
+        use crate::fingerprint::fingerprint;
+        let root = place();
+        let o = Options {
+            fingerprint: true,
+            ..options(Some(1), false)
+        };
+        let (text, code) = run(&root, &[target("notes")], &o, "", "");
+        assert_eq!(code, 0);
+        let (a, b) = (fingerprint(b"1234"), fingerprint(b"12"));
+        let dash = format!("{:<64}", "-");
+        assert_eq!(
+            text,
+            format!(
+                "/notes:\n          4  T  {a}  a.md\n          2  T  {b}  B.md\n          -  -                     {dash}  drafts/"
+            )
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fingerprint_from_the_storage_needs_no_read() {
+        struct Given;
+        impl Storage for Given {
+            fn list(&self, _: &str, _: usize) -> std::io::Result<Listing> {
+                Ok(Listing::Folder {
+                    entries: vec![Entry {
+                        name: "a.md".into(),
+                        folder: false,
+                        size: Some(4),
+                        modified: None,
+                        hash: Some("given".into()),
+                    }],
+                    complete: true,
+                })
+            }
+            fn read(&self, _: &str) -> std::io::Result<Option<Vec<u8>>> {
+                panic!("a read, though the list gave the fingerprint")
+            }
+            fn write_if_unchanged(
+                &self,
+                _: &str,
+                _: &crate::storage::Expect,
+                _: &[u8],
+            ) -> Result<(), crate::storage::WriteError> {
+                unreachable!()
+            }
+            fn restore(&self, _: &str, _: Option<&[u8]>) -> std::io::Result<()> {
+                unreachable!()
+            }
+            fn rescue(&self, _: &str, _: &[u8]) -> std::io::Result<String> {
+                unreachable!()
+            }
+            fn lock_create(&self, _: &str, _: &str) -> std::io::Result<bool> {
+                unreachable!()
+            }
+            fn lock_read(&self, _: &str) -> std::io::Result<Option<String>> {
+                unreachable!()
+            }
+            fn lock_age(&self, _: &str) -> std::io::Result<Option<std::time::Duration>> {
+                unreachable!()
+            }
+            fn lock_take_stale(
+                &self,
+                _: &str,
+                _: std::time::Duration,
+            ) -> std::io::Result<Option<String>> {
+                unreachable!()
+            }
+            fn lock_remove(&self, _: &str) -> std::io::Result<()> {
+                unreachable!()
+            }
+        }
+        let o = Options {
+            fingerprint: true,
+            ..options(Some(1), false)
+        };
+        let open = |_: &str, _: bool| Ok(());
+        let (text, code) = list(&Given, &[target("notes")], &o, &open);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            format!(
+                "/notes:\n          4  -                     {:<64}  a.md\n",
+                "given"
+            )
+        );
     }
 
     #[test]

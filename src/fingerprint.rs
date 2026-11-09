@@ -20,6 +20,7 @@ pub fn fingerprint(bytes: &[u8]) -> String {
 }
 
 /// The same fingerprint, for bytes that come in parts, as in a stream.
+/// It is also a writer, so that a copy can go straight into it.
 #[derive(Default)]
 pub struct Fingerprinter {
     outer: Sha256,
@@ -56,6 +57,17 @@ impl Fingerprinter {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+}
+
+impl std::io::Write for Fingerprinter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

@@ -35,6 +35,8 @@ struct State {
     page: usize,
     /// How many `list_folder` calls came in, the first page and the next ones.
     list_calls: u32,
+    /// How many downloads came in.
+    downloads: u32,
 }
 
 impl State {
@@ -56,6 +58,7 @@ impl State {
                     "name": rest,
                     "size": file.bytes.len(),
                     "server_modified": file.modified,
+                    "content_hash": fingerprint(&file.bytes),
                 }),
             };
             let name = entry["name"].as_str().unwrap().to_string();
@@ -162,6 +165,9 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
     };
     let path = arg["path"].as_str().unwrap_or("").to_string();
     let mut s = state.lock().unwrap();
+    if endpoint == "/2/files/download" {
+        s.downloads += 1;
+    }
     match endpoint.as_str() {
         "/2/files/download" => match s.files.get(&path) {
             Some(file) => reply(&mut stream, 200, &file.bytes),
@@ -837,6 +843,33 @@ fn a_list_of_the_root_a_file_and_a_missing_folder() {
         text.contains("/org/:\n") && text.contains("  notes/\n"),
         "{text}"
     );
+}
+
+#[test]
+fn a_list_gives_the_fingerprints_of_dropbox_with_no_download() {
+    let f = Fake::new();
+    f.put("/org/notes/a.md", b"four");
+    f.put("/org/notes/drafts/c.md", b"c");
+    let o = f.run(
+        &[
+            "list",
+            "--fingerprint",
+            "/org/notes",
+            "/org/notes/drafts/c.md",
+        ],
+        b"",
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    let a = format!("  {}  a.md\n", fingerprint(b"four"));
+    let c = format!("  {}  c.md\n", fingerprint(b"c"));
+    assert!(text.contains(&a), "{text}");
+    assert!(text.contains(&c), "{text}");
+    assert!(
+        text.contains(&format!("  {:<64}  drafts/\n", "-")),
+        "{text}"
+    );
+    assert_eq!(f.state.lock().unwrap().downloads, 0, "{text}");
 }
 
 #[test]

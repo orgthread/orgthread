@@ -1,5 +1,6 @@
 //! The MCP server: real messages to a real `orgthread serve`, on invented files.
 
+use orgthread::fingerprint::fingerprint;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -393,6 +394,17 @@ fn a_list_gives_the_same_text_as_the_command() {
     assert!(said.contains("  c.md\n"), "{said}");
     let (said, _) = server.tool("list", json!({"folders": [notes], "depth": "all"}));
     assert!(said.contains("  c.md\n"), "{said}");
+    assert!(
+        !said.contains(&fingerprint(b"four")),
+        "no fingerprint unless asked: {said}"
+    );
+
+    let (said, refused) = server.tool("list", json!({"folders": [notes], "fingerprint": true}));
+    assert!(!refused, "{said}");
+    assert!(
+        said.contains(&format!("  {}  invented.md\n", fingerprint(b"four"))),
+        "{said}"
+    );
 }
 
 #[test]
@@ -440,6 +452,7 @@ fn wrong_list_fields_get_an_error_and_the_server_goes_on() {
         json!({"folders": [notes], "depth": 0}),
         json!({"folders": [notes], "depth": "deep"}),
         json!({"folders": [notes], "all": "yes"}),
+        json!({"folders": [notes], "fingerprint": "yes"}),
     ] {
         let answer = server.ask(
             "tools/call",

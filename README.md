@@ -14,7 +14,7 @@ orgthread upload <file> --who <name>  < any file
 orgthread watch
 ```
 
-To see what a folder holds, list it: `orgthread list notes tasks` shows each folder as a group, with the size, the time and the name of each entry, as `ls` does. `ls` is a short form of `list`. It goes one level down, and `--depth 3` or `--depth all` goes deeper. Names that start with a dot stay out, unless you add `--all`. Paths that the limits close stay out too, and read-only ones get a mark.
+To see what a folder holds, list it: `orgthread list notes tasks` shows each folder as a group, with the size, the time and the name of each entry, as `ls` does. `ls` is a short form of `list`. It goes one level down, and `--depth 3` or `--depth all` goes deeper. Names that start with a dot stay out, unless you add `--all`. Paths that the limits close stay out too, and read-only ones get a mark. With `--fingerprint`, each file also shows its fingerprint, the content hash that Dropbox reports. With Dropbox it costs nothing more. With a local folder, it reads each file.
 
 To change a file, read it first with the same name. A new file needs no read. orgthread remembers what each name read, and it refuses a write when the file changed since.
 

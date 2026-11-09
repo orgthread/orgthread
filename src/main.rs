@@ -63,6 +63,8 @@ needs no new read. patch takes --size too.
 
 Options of list, also called ls: --depth <n> goes n levels down (default 1), and
 --depth all to the bottom. --all also shows the names that start with a dot.
+--fingerprint also shows the fingerprint of each file, before its name. With
+Dropbox it costs nothing more. With a local folder, it reads each file.
 After --, each word is a folder. A list shows at most 1000 entries, leaves out
 closed paths, and marks read-only ones. The time is in the zone of TZ.
 
@@ -322,18 +324,21 @@ struct ListArgs {
     folders: Vec<String>,
     depth: Option<usize>,
     all: bool,
+    fingerprint: bool,
 }
 
 fn parse_list(args: &[String]) -> Result<ListArgs, String> {
     let mut folders = Vec::new();
     let mut depth = Some(1);
     let mut all = false;
+    let mut fingerprint = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             // After --, each word is a folder, also one named like an option.
             "--" => folders.extend(rest.by_ref().cloned()),
             "--all" => all = true,
+            "--fingerprint" => fingerprint = true,
             "--depth" => {
                 let value = rest.next().ok_or("--depth needs a number from 1, or all")?;
                 depth = match value.as_str() {
@@ -355,6 +360,7 @@ fn parse_list(args: &[String]) -> Result<ListArgs, String> {
         folders,
         depth,
         all,
+        fingerprint,
     })
 }
 
@@ -364,6 +370,7 @@ fn cmd_list(args: &[String]) -> Result<i32, String> {
         folders,
         depth,
         all,
+        fingerprint,
     } = parse_list(args)?;
     let settings = Settings::load()?;
     let storage = settings.storage()?;
@@ -377,6 +384,7 @@ fn cmd_list(args: &[String]) -> Result<i32, String> {
     let options = Options {
         depth,
         all,
+        fingerprint,
         zone: TimeZone::system(),
     };
     let limits = |path: &str, writing: bool| settings.limits(path, writing);

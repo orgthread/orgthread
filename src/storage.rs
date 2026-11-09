@@ -43,6 +43,9 @@ pub struct Entry {
     pub size: Option<u64>,
     /// Seconds since 1970-01-01 UTC. A folder has none, as Dropbox gives none.
     pub modified: Option<i64>,
+    /// The fingerprint, when the storage gives it with no extra work. Dropbox
+    /// does. A local folder does not, as it would have to read each file.
+    pub hash: Option<String>,
 }
 
 /// What a path holds, one level down.
@@ -208,6 +211,7 @@ impl LocalFolder {
             } else {
                 meta.modified().ok().and_then(seconds)
             },
+            hash: None,
         })
     }
 }
