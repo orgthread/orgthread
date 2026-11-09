@@ -712,7 +712,14 @@ fn the_version_tool_of_the_remote_door_gives_no_secret() {
     );
     assert_eq!(text, want);
     // Not the address, not the token, not a path, not a limit, not a setting.
-    for secret in [BASE, "door.test", &t, d.root.to_str().unwrap(), "org/scans", "MB"] {
+    for secret in [
+        BASE,
+        "door.test",
+        &t,
+        d.root.to_str().unwrap(),
+        "org/scans",
+        "MB",
+    ] {
         assert!(!text.contains(secret), "{secret} in {text}");
     }
 }
@@ -825,7 +832,10 @@ fn an_upload_over_the_limit_or_to_a_text_folder_writes_nothing() {
         .to_string();
     let reply = d.call(&t, "upload", json!({"files": [&named], "who": "a"}));
     assert!(links_in(text_of(&reply)).is_empty(), "{reply}");
-    assert!(text_of(&reply).contains("ORGTHREAD_BINARY_ALLOW"), "{reply}");
+    assert!(
+        text_of(&reply).contains("ORGTHREAD_BINARY_ALLOW"),
+        "{reply}"
+    );
 
     // A name that does not show it gets a link, and the bytes are refused.
     let notes = d

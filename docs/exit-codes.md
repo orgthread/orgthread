@@ -54,7 +54,7 @@ A link from the `download` or `upload` tool answers with an HTTP status. `curl` 
 | 404 | No such link, or it was used already. The answer is empty, as for any wrong address |
 | 405 | The link is for the other direction, or the method is not `GET` or `PUT` |
 | 409 | Refused. The text starts with `exit code N`, with a code from the table above |
-| 410 | The link waited more than 60 seconds. Ask the tool for a new one |
+| 410 | The link waited more than 5 minutes. Ask the tool for a new one |
 | 411 | An upload without a `Content-Length`. `curl -T` gives one |
 | 500 | The command could not start, or it was stopped |
 

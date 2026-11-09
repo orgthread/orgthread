@@ -435,7 +435,7 @@ fn transfer_tools() -> [Value; 2] {
             "description": format!("Gives a one-time link for each file, to fetch its exact bytes \
                 into your code sandbox: curl -sS -o <name> '<link>'. For any file, also not \
                 text, up to {}. Each line gives the path, the size and the link, or why the file \
-                is refused. A link works once and must start within 60 seconds, so use it at once. \
+                is refused. A link works once and must start within 5 minutes, so use it soon. \
                 Never show, store or log a link. Notes what this name read, as read does. {}",
                 mb(transfer::download_limit()), BLOCKED),
             "inputSchema": {
@@ -451,7 +451,7 @@ fn transfer_tools() -> [Value; 2] {
                 or exit code N and the refusal. The rules of write hold: to replace a file, \
                 download or read it first with the same name. A file that is not text may go \
                 only to the folders that the owner allowed. Up to {}. A link works once and must \
-                start within 60 seconds, so use it at once. Never show, store or log a link. {}",
+                start within 5 minutes, so use it soon. Never show, store or log a link. {}",
                 mb(transfer::upload_limit()), BLOCKED),
             "inputSchema": {
                 "type": "object",
@@ -738,7 +738,7 @@ fn transfer(
         }
         Taken::Expired => (
             "410 Gone",
-            "This link waited more than 60 seconds, and it is gone now. Ask the tool for a new one.\n",
+            "This link waited more than 5 minutes, and it is gone now. Ask the tool for a new one.\n",
         ),
         Taken::WrongDirection => (
             "405 Method Not Allowed",

@@ -100,7 +100,7 @@ tools: read, write, patch, list, download, upload, version
 |---|---|
 | 200 | Done |
 | 409 | Refused. The text starts with `exit code N`, as in [exit-codes.md](exit-codes.md) |
-| 410 | The link waited more than 60 seconds. Ask the tool for a new one |
+| 410 | The link waited more than 5 minutes. Ask the tool for a new one |
 | 404 | No such link, or it was used already. The answer is empty, as for any wrong address |
 | 405 | The link is for the other direction |
 

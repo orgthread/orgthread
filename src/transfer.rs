@@ -16,7 +16,7 @@ pub const UPLOAD_MB: &str = "ORGTHREAD_UPLOAD_MB";
 pub const BINARY_ALLOW: &str = "ORGTHREAD_BINARY_ALLOW";
 
 /// The time a link has to start. Once started, a transfer may take longer.
-pub const START_WITHIN: Duration = Duration::from_secs(60);
+pub const START_WITHIN: Duration = Duration::from_secs(5 * 60);
 
 /// At most this many links wait at one time, so a loop in a chat cannot fill
 /// the memory of the server.
@@ -64,9 +64,9 @@ pub fn binary_allowed(path: &str) -> bool {
 /// not made for an upload that would be refused.
 pub fn named_binary(path: &str) -> bool {
     const NEVER_TEXT: &[&str] = &[
-        "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "ico",
-        "pdf", "zip", "gz", "tgz", "7z", "rar", "mp3", "m4a", "wav", "mp4", "mov", "epub",
-        "docx", "xlsx", "pptx", "sqlite",
+        "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "ico", "pdf",
+        "zip", "gz", "tgz", "7z", "rar", "mp3", "m4a", "wav", "mp4", "mov", "epub", "docx", "xlsx",
+        "pptx", "sqlite",
     ];
     let name = path.rsplit('/').next().unwrap_or(path);
     match name.rsplit_once('.') {
@@ -95,7 +95,7 @@ pub struct Link {
 #[derive(Debug)]
 pub enum Taken {
     Ready(Link),
-    /// The link exists, but its 60 seconds passed. It is gone now.
+    /// The link exists, but its 5 minutes passed. It is gone now.
     Expired,
     /// The link is for the other direction. It stays, unused.
     WrongDirection,
@@ -154,7 +154,7 @@ impl Links {
         }
     }
 
-    /// Makes a link look older, for tests of the 60 seconds.
+    /// Makes a link look older, for tests of the 5 minutes.
     #[cfg(test)]
     fn age_all(&self, by: Duration) {
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
@@ -196,7 +196,23 @@ mod tests {
     }
 
     #[test]
-    fn a_link_ends_after_60_seconds() {
+    fn a_link_still_works_after_61_seconds() {
+        let links = Links::default();
+        let s = links.make(Direction::Download, "/a.pdf", "chat a").unwrap();
+        links.age_all(Duration::from_secs(61));
+        assert!(matches!(
+            links.take(&s, Direction::Download),
+            Taken::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn the_window_is_5_minutes() {
+        assert_eq!(START_WITHIN, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_link_ends_after_5_minutes() {
         let links = Links::default();
         let s = links.make(Direction::Download, "/a.pdf", "chat a").unwrap();
         links.age_all(START_WITHIN + Duration::from_secs(1));
