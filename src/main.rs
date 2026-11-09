@@ -1056,6 +1056,13 @@ fn cmd_delete(args: &[String]) -> Result<i32, String> {
     if to.is_some() {
         return Err("there is no option --to for delete".into());
     }
+    // An empty value is wrong use, never a version: refused before any lock or log.
+    if expect
+        .as_deref()
+        .is_some_and(|print| print.trim().is_empty())
+    {
+        return Err("--expect needs the fingerprint you saw, and it is empty".into());
+    }
     let settings = Settings::load()?;
     let path = settings.path_of(&file)?;
     settings.limits(&path, true)?;

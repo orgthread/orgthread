@@ -255,3 +255,34 @@ fn a_refusal_by_the_setting_is_logged_and_says_why() {
     assert_eq!(p.log().lines().count(), 2);
     assert!(p.file().exists());
 }
+
+#[test]
+fn an_empty_expect_is_wrong_use_and_logs_nothing() {
+    let p = Place::new();
+    fs::write(p.file(), "text\n").unwrap();
+    let wanted = "--expect needs the fingerprint you saw, and it is empty";
+    let check = |o: &Output| {
+        assert_eq!(code(o), 2, "{o:?}");
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains(wanted), "{said}");
+    };
+    for empty in ["", "   "] {
+        check(&p.run(&["delete", &p.f(), "--who", "chat", "--expect", empty]));
+        check(&p.run(&[
+            "delete",
+            &p.f(),
+            "--who",
+            "chat",
+            "--expect",
+            empty,
+            "--check",
+        ]));
+    }
+    // A read by the same name does not make an empty value count.
+    p.read("chat");
+    let before = p.log();
+    check(&p.run(&["delete", &p.f(), "--who", "chat", "--expect", ""]));
+    assert_eq!(p.log(), before, "no log line");
+    assert!(p.file().exists());
+    assert_eq!(fs::read_dir(p.root.join("org/.locks")).unwrap().count(), 0);
+}

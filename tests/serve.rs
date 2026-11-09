@@ -704,3 +704,31 @@ fn a_copy_pair_with_an_empty_fingerprint_is_refused_for_that_pair() {
     assert!(!b.exists());
     assert!(c.exists());
 }
+
+#[test]
+fn the_delete_tool_refuses_an_empty_expect_as_wrong_use() {
+    let place = Place::new();
+    fs::write(place.file(), "old\n").unwrap();
+    let file = place.f();
+    let mut server = place.serve_with(&[("ORGTHREAD_DELETE_ALLOW", "org/notes")]);
+    server.read(&file, "chat");
+    for args in [
+        json!({"file": file, "who": "chat", "expect": ""}),
+        json!({"file": file, "who": "chat", "expect": " ", "check": true}),
+    ] {
+        let (said, refused) = server.tool("delete", args);
+        assert!(refused, "{said}");
+        assert!(
+            said.starts_with(
+                "exit code 2\norgthread: --expect needs the fingerprint you saw, and it is empty"
+            ),
+            "{said}"
+        );
+    }
+    assert!(place.file().exists());
+    assert!(
+        !fs::read_to_string(place.log())
+            .unwrap_or_default()
+            .contains("delete")
+    );
+}
