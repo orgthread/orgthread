@@ -1132,3 +1132,34 @@ fn a_delete_in_dropbox_needs_the_setting_and_a_fingerprint() {
     assert_eq!(f.get(FILE).unwrap(), b"old\n");
     assert!(f.state.lock().unwrap().deletes.is_empty());
 }
+
+#[test]
+fn a_delete_works_with_or_without_the_first_slash() {
+    let f = Fake::new();
+    let bare = FILE.trim_start_matches('/');
+    // Read with the slash, delete in the form of the log: the same note, one trip.
+    f.put(FILE, b"old\n");
+    assert_eq!(code(&f.read("chat")), 0);
+    let rev = f.state.lock().unwrap().files[FILE].rev.to_string();
+    let o = f.run_with_env(&["delete", bare, "--who", "chat"], b"", &[ALLOW]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(FILE), None);
+    assert_eq!(f.state.lock().unwrap().deletes, [Some(rev)]);
+    // The other way round, with an allow folder written with no slash.
+    f.put(FILE, b"new\n");
+    assert_eq!(code(&f.run(&["read", bare, "--who", "chat"], b"")), 0);
+    let allow = ("ORGTHREAD_DELETE_ALLOW", "org/notes");
+    let o = f.run_with_env(&["delete", FILE, "--who", "chat", "--check"], b"", &[allow]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    let o = f.run_with_env(&["delete", FILE, "--who", "chat"], b"", &[allow]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(FILE), None);
+    assert_eq!(f.state.lock().unwrap().deletes.len(), 2);
+    let log = fs::read_to_string(f.dir.join("log")).unwrap();
+    let paths: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("\tdeleted\t"))
+        .map(|l| l.split('\t').nth(2).unwrap())
+        .collect();
+    assert_eq!(paths, [bare, bare], "the log names the file one way");
+}
