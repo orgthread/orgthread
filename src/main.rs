@@ -95,8 +95,9 @@ ORGTHREAD_BINARY_ALLOW: with Dropbox only the names tell this, so a picture
 with no extension, such as a name with no dot, passes; a local folder also reads
 the bytes. --fingerprint <hash> refuses a source of any other version, code 4.
 After the copy, the fingerprint of the new file must be the one of the source.
-If not, the copy is removed again, code 7, or 9 if that fails. The log line
-copied has the source as its 8th field.
+If not, the copy is removed again, code 7 and the log word removed, or 9 and
+not-removed if that fails. The log line of a copy has the source as its 8th
+field.
 
 Settings, from the environment:
   A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each

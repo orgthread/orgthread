@@ -233,8 +233,8 @@ pub fn why_copy(outcome: &str) -> &'static str {
             "The source is not text, and the new name is outside the folders open for such files. Nothing was copied."
         }
         "locked" => "Another writer held the lock of the new name. Nothing was copied.",
-        "restored" => "The copy differed from the source, and it was removed again.",
-        "not-restored" => {
+        "removed" => "The copy differed from the source, and it was removed again.",
+        "not-removed" => {
             "The copy differed from the source, and it could not be removed. Look at this file now."
         }
         "failed" => "The copy failed. Nothing was copied, unless the message says otherwise.",
@@ -554,6 +554,8 @@ mod tests {
             assert_eq!(e.copy_from.as_deref(), Some("delete"));
             assert!(!why_of(&e).contains("deleted"), "{word}: {}", why_of(&e));
         }
+        assert!(why_copy("removed").contains("removed again"));
+        assert!(why_copy("not-removed").contains("could not be removed"));
         // Every refusal word of a copy has a copy text.
         for word in [
             "exists",

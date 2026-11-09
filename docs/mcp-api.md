@@ -98,7 +98,7 @@ With Dropbox, the answer ends with `Dropbox keeps it in Deleted files, rev <rev>
 - It makes the missing folders of `to`.
 - The source must be open to read, and `to` open to write, as for `read` and `write`. A file that is not text may go only to the folders that the owner allowed. On the server, only the names tell this, as for `upload`: a picture whose name has no extension passes. The local door also reads the bytes.
 - With `fingerprint`, a source of another version is refused with code 4. Without it, the copy takes the source as it is.
-- After the copy, the fingerprint of the new file must be the one of the source. If not, the copy is removed again, code 7, or 9 if the removal fails.
+- After the copy, the fingerprint of the new file must be the one of the source. If not, the copy is removed again, code 7 and the log word `removed`, or 9 and `not-removed` if the removal fails.
 - With Dropbox, the copy is made inside Dropbox, in two web calls per pair: one look at the source, and the copy. No byte passes the server. If Dropbox gives no answer, one more look at `to` tells whether the copy is there. If something other than the source is there, it is never removed, as it may be older than the copy.
 - Each pair gives one line: `copied:`, the source, the new name, the size and the fingerprint, or `refused, exit code N:` and the reason. The pairs that passed stay copied, and the next pairs still run. With a refusal, the text starts with `exit code N` of the first pair that failed.
 

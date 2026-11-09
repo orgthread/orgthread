@@ -1336,7 +1336,7 @@ fn a_dropbox_copy_with_other_bytes_is_removed_by_its_rev_and_gives_7() {
     );
     drop(s);
     let line = last_log(&f);
-    assert_eq!(line[1], "restored");
+    assert_eq!(line[1], "removed");
     assert_eq!(line[4], fingerprint(b"source\n"));
     assert_eq!(line[5], fingerprint(b"broken"));
 }
@@ -1355,7 +1355,7 @@ fn a_dropbox_copy_that_cannot_be_removed_gives_9() {
     let said = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(said.contains("DAMAGE POSSIBLE"), "{said}");
     assert_eq!(f.get("/org/b.md").unwrap(), b"broken");
-    assert_eq!(last_log(&f)[1], "not-restored");
+    assert_eq!(last_log(&f)[1], "not-removed");
 }
 
 #[test]

@@ -83,8 +83,9 @@ impl Outcome {
             Outcome::NotAllowed { .. } => "not-allowed",
             Outcome::NotText { .. } => "not-text",
             Outcome::Locked { .. } => "locked",
-            Outcome::Removed { .. } => "restored",
-            Outcome::NotRemoved { .. } => "not-restored",
+            // Not restored: a copy brings nothing back, it only goes again.
+            Outcome::Removed { .. } => "removed",
+            Outcome::NotRemoved { .. } => "not-removed",
             Outcome::Failed { .. } => "failed",
         }
     }
@@ -534,6 +535,29 @@ mod tests {
             log_line("T", "a", "b", "chat", &changed),
             "T\tchanged\tb\tchat\taa\tbb\t-\t/a"
         );
+    }
+
+    #[test]
+    fn a_removed_copy_logs_removed_never_restored() {
+        let removed = Outcome::Removed {
+            source: "aa".into(),
+            target: "bb".into(),
+        };
+        let not_removed = Outcome::NotRemoved {
+            source: "aa".into(),
+            target: "bb".into(),
+            reason: "r".into(),
+        };
+        assert_eq!(removed.word(), "removed");
+        assert_eq!(not_removed.word(), "not-removed");
+        for outcome in [&removed, &not_removed] {
+            let line = log_line("T", "a", "b", "chat", outcome);
+            assert!(!line.contains("restored"), "{line}");
+            let entry = crate::watch::parse_line(&line).unwrap();
+            let why = crate::watch::why_of(&entry);
+            assert!(why.contains("removed"), "{why}");
+            assert!(!why.contains("not known"), "{why}");
+        }
     }
 
     #[test]
