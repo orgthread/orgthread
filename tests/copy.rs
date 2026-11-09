@@ -304,3 +304,30 @@ fn watch_shows_a_copy_line_as_a_copy() {
     assert!(text.contains("copied"), "{text}");
     assert!(!text.contains("Nothing was deleted"), "{text}");
 }
+
+#[test]
+fn an_empty_fingerprint_is_wrong_use_and_logs_nothing() {
+    let p = Place::new();
+    p.put("org/notes/a.md", b"text\n");
+    for empty in ["", "   "] {
+        let args = [
+            "copy",
+            &p.p("org/notes/a.md"),
+            &p.p("org/notes/b.md"),
+            "--who",
+            "x",
+            "--fingerprint",
+            empty,
+        ];
+        let o = p.run_with(&args, &[]);
+        assert_eq!(code(&o), 2, "{o:?}");
+        assert!(
+            said(&o).contains("--fingerprint needs the fingerprint of the source, and it is empty"),
+            "{}",
+            said(&o)
+        );
+    }
+    assert!(!p.at("org/notes/b.md").exists());
+    assert_eq!(p.log(), "", "no log line");
+    assert!(p.locks_empty());
+}

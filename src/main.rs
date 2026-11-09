@@ -1152,6 +1152,13 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
         return Err("copy takes two files: the source, then the new name".into());
     };
     let who = checked_who(who)?;
+    // An empty value is wrong use, never a version: refused before any lock or log.
+    if expect
+        .as_deref()
+        .is_some_and(|print| print.trim().is_empty())
+    {
+        return Err("--fingerprint needs the fingerprint of the source, and it is empty".into());
+    }
     let settings = Settings::load()?;
     let from = settings.path_of(from)?;
     let to = settings.target_of(to)?;

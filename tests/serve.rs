@@ -679,3 +679,28 @@ fn a_copy_path_named_like_an_option_stays_a_path() {
     assert!(refused, "{said}");
     assert!(said.contains("is outside the folder"), "{said}");
 }
+
+#[test]
+fn a_copy_pair_with_an_empty_fingerprint_is_refused_for_that_pair() {
+    let place = Place::new();
+    fs::write(place.file(), "text\n").unwrap();
+    let file = place.f();
+    let b = place.root.join("org/b.md");
+    let c = place.root.join("org/c.md");
+    let mut server = place.serve();
+    let pairs = json!([
+        {"from": file, "to": b.to_str().unwrap(), "fingerprint": ""},
+        pair(&file, c.to_str().unwrap()),
+    ]);
+    let (said, refused) = server.tool("copy", json!({"pairs": pairs, "who": "chat"}));
+    assert!(refused, "{said}");
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines[0], "exit code 2", "{said}");
+    assert!(
+        lines[1].ends_with("refused, exit code 2: --fingerprint needs the fingerprint of the source, and it is empty"),
+        "{said}"
+    );
+    assert!(lines[2].starts_with("copied: "), "{said}");
+    assert!(!b.exists());
+    assert!(c.exists());
+}
