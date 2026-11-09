@@ -150,8 +150,8 @@ Settings, from the environment:
                       (default: not set, and move has only the limits above)
   ORGTHREAD_FIXED_FOLDERS
                       comma-separated folders: no new folder may appear directly inside them,
-                      for write, upload, copy and move. Deeper new folders are fine
-                      (default: not set, and any new folder is made)
+                      for write, upload, copy and move. Deeper new folders are fine.
+                      / stands for the root (default: not set, and any new folder is made)
   ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
                       the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
   ORGTHREAD_LISTEN_ANYWHERE
