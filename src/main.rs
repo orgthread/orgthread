@@ -519,9 +519,7 @@ impl Settings {
 
     fn path_of(&self, file: &str) -> Result<String, String> {
         if self.dropbox {
-            let inside = file
-                .strip_prefix('/')
-                .ok_or_else(|| format!("{file} must start with / in Dropbox"))?;
+            let inside = dropbox_path(file);
             let bad = inside.is_empty()
                 || inside.ends_with('/')
                 || inside
@@ -540,20 +538,21 @@ impl Settings {
     }
 }
 
+/// A path in Dropbox from the root. The log and the screen show it with no `/`
+/// at its start, so both forms name the same file.
+fn dropbox_path(given: &str) -> &str {
+    given.strip_prefix('/').unwrap_or(given)
+}
+
 impl Settings {
     /// The path of a folder from the root, empty for the root itself. A path
     /// that names nothing gets exit code 6, and any other problem exit code 2.
     fn folder_of(&self, folder: &str) -> Result<String, (i32, String)> {
         if self.dropbox {
-            let inside = folder
-                .strip_prefix('/')
-                .ok_or_else(|| {
-                    (
-                        exit::USAGE,
-                        format!("{folder} must start with / in Dropbox"),
-                    )
-                })?
-                .trim_end_matches('/');
+            if folder.is_empty() {
+                return Err((exit::USAGE, "name a folder, or / for the root".to_string()));
+            }
+            let inside = dropbox_path(folder).trim_end_matches('/');
             let bad = !inside.is_empty()
                 && inside
                     .split('/')

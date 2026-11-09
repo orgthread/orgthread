@@ -662,11 +662,65 @@ fn a_missing_token_and_a_bad_path_are_wrong_use() {
         code(&f.run_with(None, &["read", FILE, "--who", "c"], b"")),
         2
     );
-    for path in ["org/notes/a.md", "/org/../a.md", "/", "/org/"] {
+    for path in [
+        "/org/../a.md",
+        "org/../a.md",
+        "/",
+        "",
+        "/org/",
+        "//org/a.md",
+    ] {
         let o = f.run(&["write", path, "--who", "c"], b"x");
         assert_eq!(code(&o), 2, "{path} {o:?}");
     }
     assert!(f.names().is_empty());
+}
+
+/// The log and the screen show a path with no `/` at its start, so a path
+/// copied from there works for every command, as the one with the `/` does.
+#[test]
+fn a_path_from_the_log_works_with_or_without_the_first_slash() {
+    let f = Fake::new();
+    let bare = "org/notes/invented.md";
+    let o = f.run(&["write", bare, "--who", "a"], b"one\n");
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        f.get(FILE).unwrap(),
+        b"one\n",
+        "the same file as with the /"
+    );
+    let o = f.run(&["read", bare, "--who", "a"], b"");
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.stdout, b"one\n");
+    // A read without the / counts for a write with it, and the other way round.
+    let o = f.run(&["write", FILE, "--who", "a"], b"two\n");
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let patch = br#"{"edits": [{"old": "two\n", "new": "three\n"}]}"#;
+    let o = f.run(&["patch", bare, "--who", "a"], patch);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(f.get(FILE).unwrap(), b"three\n");
+    let o = f.run(&["download", bare, "--who", "b"], b"");
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.stdout, b"three\n");
+    let o = f.run(&["upload", bare, "--who", "b"], b"four\n");
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(f.get(FILE).unwrap(), b"four\n");
+    let bare_list = f.run(&["list", "org/notes"], b"");
+    let list = f.run(&["list", "/org/notes"], b"");
+    assert_eq!(
+        code(&bare_list),
+        0,
+        "{}",
+        String::from_utf8_lossy(&bare_list.stderr)
+    );
+    // The same entries; only the heading repeats the name as it was given.
+    let body = |o: &std::process::Output| {
+        let text = String::from_utf8_lossy(&o.stdout).to_string();
+        text.split_once('\n').map(|(_, rest)| rest.to_string())
+    };
+    assert!(String::from_utf8_lossy(&list.stdout).contains("invented.md"));
+    assert_eq!(body(&bare_list), body(&list));
+    assert_eq!(f.names(), [FILE], "one file, no copy beside it");
 }
 
 #[test]
@@ -875,7 +929,7 @@ fn a_list_gives_the_fingerprints_of_dropbox_with_no_download() {
 #[test]
 fn a_list_in_dropbox_needs_a_clean_path() {
     let f = Fake::new();
-    for folder in ["org/notes", "/org/../x", "/org//notes"] {
+    for folder in ["", "/org/../x", "org/../x", "/org//notes"] {
         let o = f.run(&["list", folder], b"");
         assert_eq!(code(&o), 2, "{folder}: {o:?}");
     }

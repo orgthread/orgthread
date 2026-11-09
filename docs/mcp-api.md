@@ -25,7 +25,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `who` | The name of this chat, the same one each time |
 | `version` | | No fields |
 
-The fields of `read` and `write` are all required, and `file` and `who` of `patch`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`. A list may name the root itself: `/`.
+The fields of `read` and `write` are all required, and `file` and `who` of `patch`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
 
 `read` gives the exact text of the file, and notes what this name read.
 
