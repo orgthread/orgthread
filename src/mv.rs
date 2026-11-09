@@ -152,6 +152,9 @@ pub fn is_move_word(word: &str) -> bool {
 #[derive(Debug)]
 pub struct Report {
     pub outcome: Outcome,
+    /// The folders the move made, the outer one first, also when the file went
+    /// back after a failed check: the folders stay, and the log names them.
+    pub folders: Vec<String>,
     pub took_over: Option<String>,
     pub lock_left: Option<String>,
     pub lock_lost: Option<String>,
@@ -161,6 +164,7 @@ impl Report {
     pub fn plain(outcome: Outcome) -> Report {
         Report {
             outcome,
+            folders: Vec::new(),
             took_over: None,
             lock_left: None,
             lock_lost: None,
@@ -221,16 +225,15 @@ pub fn move_file(
         write::under_lock(storage, second, line, |held_second| {
             // The last safe point: from here on, the move runs to its end and its check.
             if stop.load(Ordering::SeqCst) {
-                return failed("nothing moved", "a stop was asked for");
+                return (failed("nothing moved", "a stop was asked for"), Vec::new());
             }
             for held in [held_first, held_second] {
-                match held.still_ours() {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return failed("nothing moved", "another writer came in before this move");
-                    }
-                    Err(e) => return failed("could not check that both names are free", e),
-                }
+                let refused = match held.still_ours() {
+                    Ok(true) => continue,
+                    Ok(false) => failed("nothing moved", "another writer came in before this move"),
+                    Err(e) => failed("could not check that both names are free", e),
+                };
+                return (refused, Vec::new());
             }
             steps(storage, from, to, expect)
         })
@@ -245,34 +248,46 @@ pub fn move_file(
     };
     match outer.result {
         Err(gate) => Report::plain(locked(first, gate)),
-        Ok(inner) => Report {
-            outcome: match inner.result {
-                Ok(outcome) => outcome,
-                Err(gate) => locked(second, gate),
-            },
-            took_over: both(outer.took_over, inner.took_over),
-            lock_left: both(outer.lock_left, inner.lock_left),
-            lock_lost: both(outer.lock_lost, inner.lock_lost),
-        },
+        Ok(inner) => {
+            let (outcome, folders) = match inner.result {
+                Ok(done) => done,
+                Err(gate) => (locked(second, gate), Vec::new()),
+            };
+            Report {
+                outcome,
+                folders,
+                took_over: both(outer.took_over, inner.took_over),
+                lock_left: both(outer.lock_left, inner.lock_left),
+                lock_lost: both(outer.lock_lost, inner.lock_lost),
+            }
+        }
     }
 }
 
 /// The steps under both locks: the move, and the check of `--fingerprint` at
 /// the new name.
-fn steps(storage: &dyn Storage, from: &str, to: &str, expect: Option<&str>) -> Outcome {
+fn steps(
+    storage: &dyn Storage,
+    from: &str,
+    to: &str,
+    expect: Option<&str>,
+) -> (Outcome, Vec<String>) {
     let moved = match storage.move_file(from, to, expect) {
         Ok(moved) => moved,
-        Err(CopyError::Exists) => return Outcome::Exists,
-        Err(CopyError::Missing) => return Outcome::Missing,
-        Err(CopyError::Folder) => return Outcome::Folder,
-        Err(CopyError::Changed { found }) => {
-            return Outcome::Changed {
-                expected: expect.unwrap_or_default().to_string(),
-                found,
+        Err(e) => {
+            let outcome = match e {
+                CopyError::Exists => Outcome::Exists,
+                CopyError::Missing => Outcome::Missing,
+                CopyError::Folder => Outcome::Folder,
+                CopyError::Changed { found } => Outcome::Changed {
+                    expected: expect.unwrap_or_default().to_string(),
+                    found,
+                },
+                CopyError::Unexpected { reason } => Outcome::Unexpected { reason },
+                CopyError::Io(e) => failed("could not move the file", e),
             };
+            return (outcome, Vec::new());
         }
-        Err(CopyError::Unexpected { reason }) => return Outcome::Unexpected { reason },
-        Err(CopyError::Io(e)) => return failed("could not move the file", e),
     };
     let Moved {
         target,
@@ -285,7 +300,7 @@ fn steps(storage: &dyn Storage, from: &str, to: &str, expect: Option<&str>) -> O
     if let Some(want) = expect
         && want != target
     {
-        return match storage.move_file(to, from, Some(&target)) {
+        let outcome = match storage.move_file(to, from, Some(&target)) {
             Ok(_) => Outcome::MovedBack {
                 expected: want.to_string(),
                 found: target,
@@ -308,12 +323,15 @@ fn steps(storage: &dyn Storage, from: &str, to: &str, expect: Option<&str>) -> O
                 }
             }
         };
+        return (outcome, folders);
     }
-    Outcome::Moved {
+    let made = folders.clone();
+    let outcome = Outcome::Moved {
         print: target,
         size,
         folders,
-    }
+    };
+    (outcome, made)
 }
 
 /// The log line: time, word, new name, who, fingerprint before, after, size, and

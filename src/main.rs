@@ -12,7 +12,7 @@ use orgthread::reads::Reads;
 use orgthread::screen;
 use orgthread::serve;
 use orgthread::stop;
-use orgthread::storage::{Expect, LocalFolder, Storage};
+use orgthread::storage::{Expect, LocalFolder, Storage, new_folders};
 use orgthread::transfer;
 use orgthread::versions::Versions;
 use orgthread::write::{self, Outcome, Refusal, exit};
@@ -589,6 +589,56 @@ impl Settings {
 }
 
 impl Settings {
+    /// The path of a file to write, from the root. Its folders may not exist
+    /// yet, as the write makes them. A path that is a folder is refused.
+    fn file_of(&self, file: &str) -> Result<String, String> {
+        let path = self.target_of(file)?;
+        if !self.dropbox && fs::metadata(self.root.join(&path)).is_ok_and(|m| !m.is_file()) {
+            return Err(format!("{file} is not a file"));
+        }
+        Ok(path)
+    }
+
+    /// The new folders a new file at `path` needs, the outer one first, after
+    /// the guard of `ORGTHREAD_FIXED_FOLDERS`. The error is an exit code and the
+    /// reason, for a refusal before the lock: then nothing is made.
+    fn new_folders_for(
+        &self,
+        storage: &dyn Storage,
+        path: &str,
+    ) -> Result<Vec<String>, (i32, String)> {
+        let folders = new_folders(path, |folder| storage.exists(folder)).map_err(|e| {
+            (
+                exit::FAILED,
+                format!("could not look at the folders of {path}: {e}"),
+            )
+        })?;
+        let fixed = env::var(write::FIXED_FOLDERS).unwrap_or_default();
+        write::check_fixed(&folders, &fixed).map_err(|reason| (exit::USAGE, reason))?;
+        Ok(folders)
+    }
+
+    /// One `made-folder` line per new folder, the outer one first, then `line`.
+    /// Each line that fails gives its own message. None means all are logged.
+    fn log_all(&self, now: &str, who: &str, folders: &[String], line: &str) -> Vec<String> {
+        let mut lines: Vec<String> = folders
+            .iter()
+            .map(|folder| log::line(&[now, "made-folder", folder, who, "", "", ""]))
+            .collect();
+        lines.push(line.to_string());
+        lines
+            .iter()
+            .filter_map(|line| {
+                log::append(&self.log, line).err().map(|e| {
+                    format!(
+                        "the log line failed, {}: {e}. The line: {line}",
+                        self.log.display()
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// The new name of a copy, from the root. Its folders may not exist yet, as
     /// the copy makes them. Locally the part that exists is followed as for any
     /// path, and each new part must be a plain name, never `..`.
@@ -844,7 +894,7 @@ fn cmd_write(args: &[String]) -> Result<i32, String> {
     let args = parse_write(args, "write")?;
     let settings = Settings::load()?;
     let reads = Reads::new(&settings.reads);
-    let path = settings.path_of(&args.file)?;
+    let path = settings.file_of(&args.file)?;
     settings.limits(&path, true)?;
 
     let text = read_input("the new text")?;
@@ -888,13 +938,43 @@ fn write_whole(
 ) -> Result<i32, String> {
     let now = log::utc_now();
     let storage = settings.storage()?;
+    // A file that exists has its folders, so a change costs no look.
+    let folders = match expect {
+        Expect::Absent => match settings.new_folders_for(storage.as_ref(), path) {
+            Ok(folders) => folders,
+            Err((code, reason)) => {
+                say(refusal(code, "nothing written", &reason));
+                return Ok(code);
+            }
+        },
+        Expect::Fingerprint(_) => Vec::new(),
+    };
     let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
     let Some(stop) = arm_stop() else {
         return Ok(exit::FAILED);
     };
-    let report =
-        write::write_unless_stopped(storage.as_ref(), path, expect, bytes, &lock_line, &stop);
-    Ok(finish(settings, reads, path, who, &now, &report, kind))
+    let report = write::write_into(
+        storage.as_ref(),
+        path,
+        expect,
+        bytes,
+        &folders,
+        &lock_line,
+        &stop,
+    );
+    // A folder gets its log line only once it exists. A write that failed
+    // after its folders were made leaves them, and the log says so.
+    let made: Vec<String> = match &report.outcome {
+        Outcome::Written { folders, .. } => folders.clone(),
+        Outcome::Failed { .. } | Outcome::Restored { .. } | Outcome::NotRestored { .. } => folders
+            .into_iter()
+            .filter(|folder| storage.exists(folder).unwrap_or(false))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(finish(
+        settings, reads, path, who, &now, &report, kind, &made,
+    ))
 }
 
 /// Takes `--check` out of the arguments, and says if it was there.
@@ -1019,7 +1099,7 @@ fn cmd_upload(args: &[String]) -> Result<i32, String> {
     let args = parse_write(&args, "upload")?;
     let settings = Settings::load()?;
     let reads = Reads::new(&settings.reads);
-    let path = settings.path_of(&args.file)?;
+    let path = settings.file_of(&args.file)?;
     settings.limits(&path, true)?;
     let limit = transfer::upload_limit()?;
     let Some(expect) = expected(&reads, &args.who, &path) else {
@@ -1035,7 +1115,12 @@ fn cmd_upload(args: &[String]) -> Result<i32, String> {
             return Ok(exit::USAGE);
         }
         if expect == Expect::Absent {
-            match settings.storage()?.size(&path) {
+            let storage = settings.storage()?;
+            if let Err((code, reason)) = settings.new_folders_for(storage.as_ref(), &path) {
+                say(refusal(code, "no link made", &reason));
+                return Ok(code);
+            }
+            match storage.size(&path) {
                 Ok(None) => {}
                 Ok(Some(_)) => {
                     say(format!(
@@ -1180,6 +1265,28 @@ fn cmd_delete(args: &[String]) -> Result<i32, String> {
     Ok(report.exit_code(logged.is_ok()))
 }
 
+/// The guard of `ORGTHREAD_FIXED_FOLDERS` for the new name of a copy or a move,
+/// before the lock. With no setting there is no guard and no look. `Ok` holds
+/// the reason of a refusal, `Err` a look that failed.
+fn fixed_refusal(
+    settings: &Settings,
+    storage: &dyn Storage,
+    to: &str,
+) -> Option<Result<String, String>> {
+    if env::var(write::FIXED_FOLDERS)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+    match settings.new_folders_for(storage, to) {
+        Ok(_) => None,
+        Err((code, reason)) if code == exit::USAGE => Some(Ok(reason)),
+        Err((_, reason)) => Some(Err(reason)),
+    }
+}
+
 /// One file to a new name. The steps live in `copy.rs`.
 fn cmd_copy(args: &[String]) -> Result<i32, String> {
     let mut names = Vec::new();
@@ -1240,6 +1347,12 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
         return refuse(copy::Outcome::NotText { reason });
     }
     let storage = settings.storage()?;
+    if let Some(refused) = fixed_refusal(&settings, storage.as_ref(), &to) {
+        return match refused {
+            Ok(reason) => refuse(copy::Outcome::NotAllowed { reason }),
+            Err(reason) => refuse(copy::Outcome::Failed { reason }),
+        };
+    }
     let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
     let Some(stop) = arm_stop() else {
         return Ok(exit::FAILED);
@@ -1253,7 +1366,7 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
         &stop,
     );
     let line = copy::log_line(&now, &from, &to, &who, &report.outcome);
-    let logged = log::append(&settings.log, &line);
+    let failures = settings.log_all(&now, &who, &report.folders, &line);
     let text = copy::message(&from, &to, &report.outcome);
     match report.outcome {
         copy::Outcome::Copied { .. } => println!("{text}"),
@@ -1269,18 +1382,15 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
             "another writer may have been at work during this copy. Check {to}. That writer: {other}"
         ));
     }
-    if let Err(e) = &logged {
-        say(format!(
-            "the log line failed, {}: {e}. The line: {line}",
-            settings.log.display()
-        ));
+    for failure in &failures {
+        say(failure.clone());
     }
     if let Some(reason) = &report.lock_left {
         say(format!(
             "the copy is made, but orgthread's clean-up did not finish: {reason}. There is nothing to do: {to} is free again within 15 minutes."
         ));
     }
-    Ok(report.exit_code(logged.is_ok()))
+    Ok(report.exit_code(failures.is_empty()))
 }
 
 /// One file to a new name, or a rename. The steps live in `mv.rs`.
@@ -1352,6 +1462,12 @@ fn cmd_move(args: &[String]) -> Result<i32, String> {
         return refuse(mv::Outcome::NotText { reason });
     }
     let storage = settings.storage()?;
+    if let Some(refused) = fixed_refusal(&settings, storage.as_ref(), &to) {
+        return match refused {
+            Ok(reason) => refuse(mv::Outcome::NotAllowed { reason }),
+            Err(reason) => refuse(mv::Outcome::Failed { reason }),
+        };
+    }
     let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
     let Some(stop) = arm_stop() else {
         return Ok(exit::FAILED);
@@ -1365,7 +1481,7 @@ fn cmd_move(args: &[String]) -> Result<i32, String> {
         &stop,
     );
     let line = mv::log_line(&now, &from, &to, &who, &report.outcome);
-    let logged = log::append(&settings.log, &line);
+    let failures = settings.log_all(&now, &who, &report.folders, &line);
     let text = mv::message(&from, &to, &report.outcome);
     match report.outcome {
         mv::Outcome::Moved { .. } => println!("{text}"),
@@ -1381,18 +1497,15 @@ fn cmd_move(args: &[String]) -> Result<i32, String> {
             "another writer may have been at work during this move. Check {from} and {to}. That writer: {other}"
         ));
     }
-    if let Err(e) = &logged {
-        say(format!(
-            "the log line failed, {}: {e}. The line: {line}",
-            settings.log.display()
-        ));
+    for failure in &failures {
+        say(failure.clone());
     }
     if let Some(reason) = &report.lock_left {
         say(format!(
             "the move is done, but orgthread's clean-up did not finish: {reason}. There is nothing to do: both names are free again within 15 minutes."
         ));
     }
-    Ok(report.exit_code(logged.is_ok()))
+    Ok(report.exit_code(failures.is_empty()))
 }
 
 fn cmd_patch(args: &[String]) -> Result<i32, String> {
@@ -1452,7 +1565,14 @@ fn cmd_patch(args: &[String]) -> Result<i32, String> {
         append: patch.append.is_some(),
     };
     Ok(finish(
-        &settings, &reads, &path, &args.who, &now, &report, kind,
+        &settings,
+        &reads,
+        &path,
+        &args.who,
+        &now,
+        &report,
+        kind,
+        &[],
     ))
 }
 
@@ -1501,7 +1621,9 @@ enum Kind {
     },
 }
 
-/// The log line, the answer and the exit code of a write or a patch.
+/// The log lines, the answer and the exit code of a write or a patch. `made`
+/// are the folders this write made: each gets a `made-folder` line first.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     settings: &Settings,
     reads: &Reads,
@@ -1510,6 +1632,7 @@ fn finish(
     now: &str,
     report: &write::Report,
     kind: Kind,
+    made: &[String],
 ) -> i32 {
     let patching = matches!(kind, Kind::Patch { .. });
     let (before, after, size) = match &report.outcome {
@@ -1529,7 +1652,7 @@ fn finish(
     let line = log::line(&[now, word, path, who, &before, &after, &size]);
 
     // First the log. A closed output must never hide what happened to the file.
-    let logged = log::append(&settings.log, &line);
+    let failures = settings.log_all(now, who, made, &line);
     let saved = |rescued: &Option<String>| match rescued {
         Some(_) => " What the file held instead is kept for its owner: orgthread watch shows it.",
         None => "",
@@ -1564,7 +1687,14 @@ fn finish(
             }
             let mut out = io::stdout();
             let _ = match kind {
-                Kind::Write | Kind::Upload { .. } => writeln!(out, "written: {path}, {size} bytes"),
+                Kind::Write | Kind::Upload { .. } if made.is_empty() => {
+                    writeln!(out, "written: {path}, {size} bytes")
+                }
+                Kind::Write | Kind::Upload { .. } => writeln!(
+                    out,
+                    "written: {path}, {size} bytes, new folders: {}",
+                    made.join(", ")
+                ),
                 Kind::Patch { edits, append } => {
                     let mut parts = Vec::new();
                     if edits > 0 {
@@ -1621,18 +1751,30 @@ fn finish(
             "another writer may have been at work during this write. Check {path}. That writer: {other}"
         ));
     }
-    if let Err(e) = &logged {
+    if !made.is_empty() && !matches!(report.outcome, Outcome::Written { .. }) {
         say(format!(
-            "the log line failed, {}: {e}. The line: {line}",
-            settings.log.display()
+            "these new folders were made, and they stay: {}",
+            made.join(", ")
         ));
+    }
+    for failure in &failures {
+        say(failure.clone());
     }
     if let Some(reason) = &report.lock_left {
         say(format!(
             "the file is written, but orgthread's clean-up did not finish: {reason}. There is nothing to do: {path} is free again within 15 minutes."
         ));
     }
-    report.exit_code(logged.is_ok())
+    report.exit_code(failures.is_empty())
+}
+
+/// The words of a stop before the lock: a refusal for wrong use, else a failure.
+fn refusal(code: i32, nothing: &str, reason: &str) -> String {
+    if code == exit::USAGE {
+        format!("refused, {nothing}. {reason}")
+    } else {
+        format!("failed, {nothing}: {reason}")
+    }
 }
 
 /// A closed error output must not stop the command.

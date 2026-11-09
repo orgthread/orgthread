@@ -296,6 +296,7 @@ pub fn why(outcome: &str) -> &'static str {
         "failed" => "The write failed, and the file is unchanged.",
         "downloaded" => "This chat got the exact bytes of the file. Nothing was written.",
         "copied" => "A new file was made with the exact bytes of the source.",
+        "made-folder" => "A missing folder was made for the file on the next line.",
         "deleted" => {
             "The file was deleted. Dropbox keeps it in Deleted files, or the last version is kept beside the program."
         }
@@ -393,6 +394,26 @@ mod tests {
         assert_eq!(e.before, "");
         assert_eq!(e.after, "abc");
         assert_eq!(e.size, "170");
+    }
+
+    #[test]
+    fn a_made_folder_line_parses_and_says_why() {
+        let line =
+            "2026-11-10 06:00:00Z\tmade-folder\torg/proposals/items/2026/11\tcareful run\t-\t-\t-";
+        let e = parse_line(line).unwrap();
+        assert_eq!(e.outcome, "made-folder");
+        assert_eq!(e.path, "org/proposals/items/2026/11");
+        assert_eq!(e.who, "careful run");
+        assert_eq!(
+            (e.before.as_str(), e.after.as_str(), e.size.as_str()),
+            ("", "", "")
+        );
+        assert!(e.copy_from.is_none() && e.move_from.is_none() && !e.delete);
+        assert_eq!(
+            why_of(&e),
+            "A missing folder was made for the file on the next line."
+        );
+        assert!(!is_written(&e.outcome), "a folder has no diff to show");
     }
 
     #[test]

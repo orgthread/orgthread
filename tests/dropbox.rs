@@ -39,6 +39,8 @@ struct State {
     downloads: u32,
     /// How many `get_metadata` calls came in.
     metadata_calls: u32,
+    /// How many uploads came in.
+    uploads: u32,
     /// The `parent_rev` of each `delete_v2` call, or `None` for a call with none.
     deletes: Vec<Option<String>>,
     /// The argument of each `copy_v2` call.
@@ -197,6 +199,9 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
     }
     if endpoint == "/2/files/get_metadata" {
         s.metadata_calls += 1;
+    }
+    if endpoint == "/2/files/upload" {
+        s.uploads += 1;
     }
     match endpoint.as_str() {
         "/2/files/download" => match s.files.get(&path) {
@@ -1273,11 +1278,16 @@ fn a_dropbox_copy_is_two_calls_and_no_byte_passes_the_server() {
     let print = fingerprint("Grüße\n".as_bytes());
     assert_eq!(
         String::from_utf8_lossy(&o.stdout),
-        format!("copied: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}\n")
+        format!(
+            "copied: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}, new folders: org/new, org/new/deep\n"
+        )
     );
     assert_eq!(f.get("/org/new/deep/b.md").unwrap(), "Grüße\n".as_bytes());
     let s = f.state.lock().unwrap();
-    assert_eq!(s.metadata_calls, 1, "one get_metadata, of the source");
+    assert_eq!(
+        s.metadata_calls, 4,
+        "one look at the source, and one at each folder up to the first that exists"
+    );
     assert_eq!(s.copies.len(), 1);
     assert_eq!(s.downloads, 0, "no byte passes this server");
     assert_eq!(
@@ -1410,7 +1420,11 @@ fn with_no_answer_one_look_at_the_target_tells() {
     f.state.lock().unwrap().copy_hangs_up = Some(true);
     let o = copy(&f, FILE, "/org/b.md");
     assert_eq!(code(&o), 0, "{o:?}");
-    assert_eq!(f.state.lock().unwrap().metadata_calls, 2);
+    assert_eq!(
+        f.state.lock().unwrap().metadata_calls,
+        3,
+        "the source, the folder, and the target after no answer"
+    );
     assert_eq!(last_log(&f)[1], "copied");
     // The copy was not made: exit 1, and the task can try again.
     f.state.lock().unwrap().copy_hangs_up = Some(false);
@@ -1687,4 +1701,116 @@ fn on_a_server_the_name_decides_if_a_moved_file_is_not_text() {
     );
     assert_eq!(code(&o), 0, "{o:?}");
     assert!(f.get("/org/pictures/b.jpg").is_some());
+}
+
+const FIXED: (&str, &str) = ("ORGTHREAD_FIXED_FOLDERS", "/org");
+
+/// The word and the path of each log line.
+fn log_words(f: &Fake) -> Vec<(String, String)> {
+    fs::read_to_string(f.dir.join("log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let fields: Vec<&str> = l.split('\t').collect();
+            (fields[1].to_string(), fields[2].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn an_upload_into_a_missing_dropbox_folder_names_and_logs_the_folders() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    let o = f.run(&["upload", "/org/new/deep/a.md", "--who", "chat"], b"abc");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        "written: org/new/deep/a.md, 3 bytes, new folders: org/new, org/new/deep\n"
+    );
+    assert_eq!(f.get("/org/new/deep/a.md").unwrap(), b"abc");
+    let words: Vec<(&str, &str)> = vec![
+        ("made-folder", "org/new"),
+        ("made-folder", "org/new/deep"),
+        ("written", "org/new/deep/a.md"),
+    ];
+    let want: Vec<(String, String)> = words
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    assert_eq!(log_words(&f), want);
+    let first = fs::read_to_string(f.dir.join("log")).unwrap();
+    let first: Vec<&str> = first.lines().next().unwrap().split('\t').collect();
+    assert_eq!(first[3..], ["chat", "-", "-", "-"]);
+}
+
+#[test]
+fn the_guard_refuses_before_any_dropbox_call_that_writes() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    for command in [&["write"][..], &["upload"]] {
+        let o = f.run_with_env(
+            &[command[0], "/org/garden/a.md", "--who", "chat"],
+            b"abc",
+            &[FIXED],
+        );
+        assert_eq!(code(&o), 2, "{o:?}");
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            said.contains("a folder of ORGTHREAD_FIXED_FOLDERS"),
+            "{said}"
+        );
+    }
+    for command in ["copy", "move"] {
+        let o = f.run_with_env(
+            &[command, FILE, "/org/garden/a.md", "--who", "chat"],
+            b"",
+            &[FIXED],
+        );
+        assert_eq!(code(&o), 2, "{command}: {o:?}");
+    }
+    let s = f.state.lock().unwrap();
+    assert_eq!(s.uploads, 0, "no upload call");
+    assert!(
+        s.copies.is_empty() && s.moves.is_empty(),
+        "no copy or move call"
+    );
+    drop(s);
+    assert_eq!(f.names(), [FILE]);
+    assert!(fs::read_dir(f.dir.join("locks")).unwrap().next().is_none());
+    // Deeper is fine.
+    let o = f.run_with_env(
+        &["write", "/org/notes/2026/a.md", "--who", "chat"],
+        b"abc",
+        &[FIXED],
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stdout).ends_with(", new folders: org/notes/2026\n"),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn a_change_to_a_dropbox_file_that_exists_makes_no_extra_look() {
+    let f = Fake::new();
+    f.put(FILE, b"old\n");
+    assert_eq!(code(&f.read("chat")), 0);
+    let before = f.state.lock().unwrap().metadata_calls;
+    let o = f.run_with_env(&["write", FILE, "--who", "chat"], b"new\n", &[FIXED]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        "written: org/notes/invented.md, 4 bytes\n"
+    );
+    assert_eq!(
+        f.state.lock().unwrap().metadata_calls - before,
+        1,
+        "only the look for the rev of the file, no look at its folders"
+    );
+    assert_eq!(log_words(&f).len(), 1, "no made-folder line");
+    // A new file in a folder that exists costs one look at that folder.
+    let before = f.state.lock().unwrap().metadata_calls;
+    let o = f.run(&["write", "/org/notes/b.md", "--who", "chat"], b"b\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.state.lock().unwrap().metadata_calls - before, 1);
 }

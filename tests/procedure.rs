@@ -640,3 +640,272 @@ mod patch {
         f.assert_locks_empty();
     }
 }
+
+/// The program itself on a test folder, with its own state folder beside it.
+struct Door {
+    folder: Folder,
+    state: PathBuf,
+}
+
+impl Door {
+    fn new() -> Self {
+        let mut folder = Folder::new();
+        folder.0 = fs::canonicalize(&folder.0).unwrap();
+        let state = folder.0.with_extension("state");
+        fs::create_dir_all(&state).unwrap();
+        Door { folder, state }
+    }
+    fn at(&self, path: &str) -> PathBuf {
+        self.folder.0.join(path)
+    }
+    fn run(&self, args: &[&str], stdin: &[u8], fixed: Option<&str>) -> std::process::Output {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+        c.args(args)
+            .env("ORGTHREAD_ROOT", &self.folder.0)
+            .env("ORGTHREAD_LOCK_DIR", self.at("org/.locks"))
+            .env("ORGTHREAD_LOG", self.state.join("writes.log"))
+            .env("ORGTHREAD_READS", self.state.join("reads"))
+            .env("ORGTHREAD_VERSIONS", self.state.join("versions"))
+            .env_remove("ORGTHREAD_STORAGE")
+            .env_remove("ORGTHREAD_ALLOW")
+            .env_remove("ORGTHREAD_DENY")
+            .env_remove("ORGTHREAD_READ_ONLY")
+            .env_remove("ORGTHREAD_BINARY_ALLOW")
+            .env_remove("ORGTHREAD_MOVE_ALLOW")
+            .env_remove("ORGTHREAD_FIXED_FOLDERS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(fixed) = fixed {
+            c.env("ORGTHREAD_FIXED_FOLDERS", fixed);
+        }
+        let mut child = c.spawn().unwrap();
+        let _ = child.stdin.take().unwrap().write_all(stdin);
+        child.wait_with_output().unwrap()
+    }
+    fn p(&self, path: &str) -> String {
+        self.at(path).to_str().unwrap().to_string()
+    }
+    fn write(&self, path: &str, fixed: Option<&str>) -> std::process::Output {
+        self.run(&["write", &self.p(path), "--who", "chat"], b"abc", fixed)
+    }
+    /// Each log line as its fields.
+    fn log(&self) -> Vec<Vec<String>> {
+        fs::read_to_string(self.state.join("writes.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split('\t').map(str::to_string).collect())
+            .collect()
+    }
+    /// The word and the path of each log line.
+    fn words(&self) -> Vec<(String, String)> {
+        self.log()
+            .into_iter()
+            .map(|f| (f[1].clone(), f[2].clone()))
+            .collect()
+    }
+}
+
+impl Drop for Door {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.state);
+    }
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+fn out(o: &std::process::Output) -> String {
+    String::from_utf8_lossy(&o.stdout).to_string()
+}
+
+#[test]
+fn a_write_into_missing_folders_makes_names_and_logs_them() {
+    let d = Door::new();
+    let o = d.write("org/new/deep/a.md", None);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(
+        out(&o),
+        "written: org/new/deep/a.md, 3 bytes, new folders: org/new, org/new/deep\n"
+    );
+    assert_eq!(fs::read(d.at("org/new/deep/a.md")).unwrap(), b"abc");
+    assert_eq!(
+        d.words(),
+        pairs(&[
+            ("made-folder", "org/new"),
+            ("made-folder", "org/new/deep"),
+            ("written", "org/new/deep/a.md"),
+        ]),
+        "the outer folder first, right before the line of the file"
+    );
+    let line = &d.log()[0];
+    assert_eq!(line.len(), 7, "the usual 7 fields: {line:?}");
+    assert_eq!(line[3..], ["chat", "-", "-", "-"]);
+    d.folder.assert_locks_empty();
+}
+
+#[test]
+fn a_write_into_a_folder_that_exists_logs_no_new_folder() {
+    let d = Door::new();
+    let o = d.write("org/notes/b.md", None);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(out(&o), "written: org/notes/b.md, 3 bytes\n");
+    assert_eq!(d.words(), pairs(&[("written", "org/notes/b.md")]));
+    // A change to the file names no folder either.
+    let o = d.write("org/notes/b.md", None);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(out(&o), "written: org/notes/b.md, 3 bytes\n");
+    assert!(d.words().iter().all(|(word, _)| word == "written"));
+}
+
+#[test]
+fn the_fixed_folders_refuse_a_new_first_level_folder_and_make_nothing() {
+    let d = Door::new();
+    for path in ["org/garden/notes.md", "org/helth/diet/x.md"] {
+        let o = d.write(path, Some("/org"));
+        assert_eq!(o.status.code(), Some(2), "{o:?}");
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            said.contains("refused, nothing written.")
+                && said.contains("directly in org, a folder of ORGTHREAD_FIXED_FOLDERS"),
+            "{said}"
+        );
+    }
+    assert!(!d.at("org/garden").exists());
+    assert!(!d.at("org/helth").exists());
+    assert!(d.log().is_empty(), "nothing made, nothing logged");
+    d.folder.assert_locks_empty();
+    // A file directly in a fixed folder is no new folder.
+    let o = d.write("org/x.md", Some("/org"));
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(out(&o), "written: org/x.md, 3 bytes\n");
+}
+
+#[test]
+fn a_deeper_new_folder_below_a_fixed_folder_is_made() {
+    let d = Door::new();
+    let o = d.write("org/notes/items/2026/11/p.md", Some("/org"));
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(
+        out(&o),
+        "written: org/notes/items/2026/11/p.md, 3 bytes, new folders: org/notes/items, org/notes/items/2026, org/notes/items/2026/11\n"
+    );
+    assert_eq!(
+        fs::read(d.at("org/notes/items/2026/11/p.md")).unwrap(),
+        b"abc"
+    );
+    assert_eq!(d.log().len(), 4);
+}
+
+#[test]
+fn an_upload_makes_its_folders_and_the_guard_holds_for_it() {
+    let d = Door::new();
+    let upload = |path: &str, fixed| d.run(&["upload", &d.p(path), "--who", "chat"], b"abc", fixed);
+    let o = upload("org/garden/a.md", Some("org"));
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
+    assert!(!d.at("org/garden").exists());
+    let o = d.run(
+        &[
+            "upload",
+            "--check",
+            &d.p("org/garden/a.md"),
+            "--who",
+            "chat",
+        ],
+        b"",
+        Some("org"),
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "a check knows the guard too: {o:?}"
+    );
+    assert!(d.log().is_empty());
+    let o = upload("org/notes/new/a.md", Some("org"));
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(
+        out(&o),
+        "written: org/notes/new/a.md, 3 bytes, new folders: org/notes/new\n"
+    );
+    assert_eq!(
+        d.words(),
+        pairs(&[
+            ("made-folder", "org/notes/new"),
+            ("written", "org/notes/new/a.md"),
+        ])
+    );
+}
+
+#[test]
+fn the_guard_holds_for_copy_and_move_and_makes_nothing() {
+    let d = Door::new();
+    d.folder.put(FILE, b"old\n");
+    let from = d.p(FILE);
+    for command in ["copy", "move"] {
+        let to = d.p("org/garden/b.md");
+        let o = d.run(&[command, &from, &to, "--who", "chat"], b"", Some("org"));
+        assert_eq!(o.status.code(), Some(2), "{command}: {o:?}");
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            said.contains("a folder of ORGTHREAD_FIXED_FOLDERS"),
+            "{said}"
+        );
+        assert!(!d.at("org/garden").exists());
+        assert_eq!(d.folder.get(FILE), b"old\n");
+    }
+    let words: Vec<String> = d.words().into_iter().map(|(w, _)| w).collect();
+    assert_eq!(words, ["not-allowed", "move-not-allowed"]);
+    d.folder.assert_locks_empty();
+    // Deeper is fine, for both.
+    let o = d.run(
+        &["copy", &from, &d.p("org/notes/2026/c.md"), "--who", "chat"],
+        b"",
+        Some("org"),
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let o = d.run(
+        &["move", &from, &d.p("org/notes/2027/m.md"), "--who", "chat"],
+        b"",
+        Some("org"),
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert!(out(&o).contains(", new folders: org/notes/2027"), "{o:?}");
+}
+
+#[test]
+fn a_copy_names_its_new_folders_and_logs_them_first() {
+    let d = Door::new();
+    d.folder.put(FILE, b"old\n");
+    let o = d.run(
+        &[
+            "copy",
+            &d.p(FILE),
+            &d.p("org/new/deep/c.md"),
+            "--who",
+            "chat",
+        ],
+        b"",
+        None,
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(
+        out(&o),
+        format!(
+            "copied: {FILE} -> org/new/deep/c.md, 4 bytes, {}, new folders: org/new, org/new/deep\n",
+            fingerprint(b"old\n")
+        )
+    );
+    assert_eq!(
+        d.words(),
+        pairs(&[
+            ("made-folder", "org/new"),
+            ("made-folder", "org/new/deep"),
+            ("copied", "org/new/deep/c.md"),
+        ])
+    );
+}

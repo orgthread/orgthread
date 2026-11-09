@@ -81,6 +81,35 @@ pub fn check_limits(
     Ok(())
 }
 
+/// The setting that keeps the first level fixed.
+pub const FIXED_FOLDERS: &str = "ORGTHREAD_FIXED_FOLDERS";
+
+/// The guard of `ORGTHREAD_FIXED_FOLDERS`, a comma-separated list: no new folder
+/// may appear directly inside a folder of the list. Deeper new folders are fine.
+/// `new` holds the new folders from the root, as `new_folders` gives them. `/`
+/// in the list stands for the root itself. An empty list guards nothing.
+pub fn check_fixed(new: &[String], fixed: &str) -> Result<(), String> {
+    let clean = |path: &str| path.trim().trim_matches('/').to_lowercase();
+    let list: Vec<String> = fixed
+        .split(',')
+        .filter(|rule| !rule.trim().is_empty())
+        .map(clean)
+        .collect();
+    for folder in new {
+        let parent = match folder.trim_matches('/').rsplit_once('/') {
+            Some((parent, _)) => clean(parent),
+            None => String::new(),
+        };
+        if let Some(rule) = list.iter().find(|rule| **rule == parent) {
+            let place = if rule.is_empty() { "/" } else { rule.as_str() };
+            return Err(format!(
+                "{folder} would be a new folder directly in {place}, a folder of {FIXED_FOLDERS}. Only the owner makes a new folder there, by hand. Use a folder that exists."
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     Written {
@@ -93,6 +122,8 @@ pub enum Outcome {
         new_text: Vec<u8>,
         /// Notes of a patch for the answer.
         notes: Vec<String>,
+        /// The folders made for the file, from the root, the outer one first.
+        folders: Vec<String>,
     },
     /// An edit of a patch does not fit the file. Nothing was written.
     Misfit {
@@ -282,8 +313,13 @@ pub type Build<'a> = &'a dyn Fn(&[u8]) -> Result<(Vec<u8>, Vec<String>), Refusal
 
 /// What the write puts in the file.
 enum Plan<'a> {
-    /// A whole new text, when the file is as the caller expects.
-    Text { expect: &'a Expect, text: &'a [u8] },
+    /// A whole new text, when the file is as the caller expects. `folders` are
+    /// the folders the write makes for a new file.
+    Text {
+        expect: &'a Expect,
+        text: &'a [u8],
+        folders: &'a [String],
+    },
     /// A text made from the file as it is under the lock. The file must exist.
     Patch(Build<'a>),
 }
@@ -301,8 +337,12 @@ fn change(
         Err(e) => return failed("could not read the file", e),
     };
     let old_print = old.as_deref().map(fingerprint);
-    let (expect, new, notes) = match plan {
-        Plan::Text { expect, text } => {
+    let (expect, new, notes, folders) = match plan {
+        Plan::Text {
+            expect,
+            text,
+            folders,
+        } => {
             match (expect, &old_print) {
                 (Expect::Absent, Some(found)) => {
                     return Outcome::Exists {
@@ -322,7 +362,12 @@ fn change(
                 }
                 _ => {}
             }
-            ((*expect).clone(), text.to_vec(), Vec::new())
+            (
+                (*expect).clone(),
+                text.to_vec(),
+                Vec::new(),
+                folders.to_vec(),
+            )
         }
         Plan::Patch(build) => {
             let (Some(old), Some(print)) = (&old, &old_print) else {
@@ -332,7 +377,7 @@ fn change(
             };
             match build(old) {
                 // The file must still be the one the patch was applied to.
-                Ok((new, notes)) => (Expect::Fingerprint(print.clone()), new, notes),
+                Ok((new, notes)) => (Expect::Fingerprint(print.clone()), new, notes, Vec::new()),
                 Err(Refusal::Misfit(reason)) => return Outcome::Misfit { reason },
                 Err(Refusal::NotText(reason)) => return Outcome::NotText { reason },
             }
@@ -386,6 +431,7 @@ fn change(
                 old_text: old,
                 new_text: new.to_vec(),
                 notes,
+                folders,
             };
         }
         Ok(Some(back)) => format!(
@@ -446,7 +492,25 @@ pub fn write_unless_stopped(
     line: &str,
     stop: &AtomicBool,
 ) -> Report {
-    let plan = Plan::Text { expect, text: new };
+    write_into(storage, path, expect, new, &[], line, stop)
+}
+
+/// The same, for a file that needs new folders: `folders` are the ones missing
+/// right before this call, from `new_folders`. The answer names them.
+pub fn write_into(
+    storage: &dyn Storage,
+    path: &str,
+    expect: &Expect,
+    new: &[u8],
+    folders: &[String],
+    line: &str,
+    stop: &AtomicBool,
+) -> Report {
+    let plan = Plan::Text {
+        expect,
+        text: new,
+        folders,
+    };
     run(storage, path, &plan, line, stop)
 }
 
@@ -543,5 +607,37 @@ pub(crate) fn under_lock<T>(
         took_over,
         lock_left,
         lock_lost,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new(list: &[&str]) -> Vec<String> {
+        list.iter().map(|f| f.to_string()).collect()
+    }
+
+    #[test]
+    fn the_fixed_folders_refuse_only_a_new_folder_directly_inside() {
+        let fixed = " /org , /Archive/";
+        assert!(check_fixed(&new(&["org/garden"]), fixed).is_err());
+        assert!(check_fixed(&new(&["org/helth", "org/helth/diet"]), fixed).is_err());
+        assert!(
+            check_fixed(&new(&["Org/Garden"]), fixed).is_err(),
+            "capitals do not count"
+        );
+        assert!(check_fixed(&new(&["archive/2026"]), fixed).is_err());
+        assert!(check_fixed(&new(&["org/proposals/items/2026"]), fixed).is_ok());
+        assert!(
+            check_fixed(&new(&["new"]), fixed).is_ok(),
+            "the root is not in the list"
+        );
+        assert!(check_fixed(&[], fixed).is_ok());
+        assert!(
+            check_fixed(&new(&["org/garden"]), "").is_ok(),
+            "no setting, no guard"
+        );
+        assert!(check_fixed(&new(&["new"]), "/").is_err(), "/ is the root");
     }
 }

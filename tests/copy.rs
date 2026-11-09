@@ -58,6 +58,7 @@ impl Place {
             .env_remove("ORGTHREAD_DENY")
             .env_remove("ORGTHREAD_READ_ONLY")
             .env_remove("ORGTHREAD_BINARY_ALLOW")
+            .env_remove("ORGTHREAD_FIXED_FOLDERS")
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -100,7 +101,23 @@ fn a_copy_makes_its_folders_keeps_every_byte_and_logs_the_source() {
     let print = fingerprint("Grüße\n".as_bytes());
     assert_eq!(
         String::from_utf8_lossy(&o.stdout),
-        format!("copied: org/notes/a.md -> org/new/deep/b.md, 8 bytes, {print}\n")
+        format!(
+            "copied: org/notes/a.md -> org/new/deep/b.md, 8 bytes, {print}, new folders: org/new, org/new/deep\n"
+        )
+    );
+    let log = p.log();
+    let words: Vec<Vec<&str>> = log
+        .lines()
+        .map(|l| l.split('\t').skip(1).take(3).collect())
+        .collect();
+    assert_eq!(
+        words,
+        [
+            ["made-folder", "org/new", "chat"],
+            ["made-folder", "org/new/deep", "chat"],
+            ["copied", "org/new/deep/b.md", "chat"],
+        ],
+        "the outer folder first, right before the line of the file"
     );
     assert_eq!(
         fs::read(p.at("org/new/deep/b.md")).unwrap(),

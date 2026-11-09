@@ -74,6 +74,9 @@ pub struct Copied {
     pub size: u64,
     /// The version of the new file, where the storage names one, for a remove.
     pub rev: Option<String>,
+    /// The folders the copy made for the new name, from the root, the outer one
+    /// first. Empty when the folder of the new name existed.
+    pub folders: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -269,6 +272,12 @@ pub trait Storage {
         )))
     }
 
+    /// True when a file or a folder is at `path`, named from the root. The
+    /// write, the upload, the copy and the move use it with `new_folders`.
+    fn exists(&self, path: &str) -> io::Result<bool> {
+        Ok(self.list(path, 1)? != Listing::Missing)
+    }
+
     /// The size of a file in bytes, or `None` when it does not exist.
     fn size(&self, path: &str) -> io::Result<Option<u64>> {
         Ok(self.read(path)?.map(|bytes| bytes.len() as u64))
@@ -414,6 +423,14 @@ impl LocalFolder {
 }
 
 impl Storage for LocalFolder {
+    fn exists(&self, path: &str) -> io::Result<bool> {
+        match fs::symlink_metadata(self.full(path)) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn size(&self, path: &str) -> io::Result<Option<u64>> {
         match fs::metadata(self.full(path)) {
             Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
@@ -481,6 +498,14 @@ impl Storage for LocalFolder {
         match expect {
             Expect::Absent => {
                 let temp = self.write_temp(path, bytes, None)?;
+                // A new file may need new folders. They come right before the
+                // link, as for a copy, and stay if the link fails.
+                if let Some(parent) = target.parent()
+                    && let Err(e) = fs::create_dir_all(parent)
+                {
+                    let _ = fs::remove_file(&temp);
+                    return Err(e.into());
+                }
                 // A hard link never replaces what is there: if a file or a
                 // dangling link appeared meanwhile, this fails and changes nothing.
                 let linked = fs::hard_link(&temp, &target);
@@ -653,6 +678,7 @@ impl Storage for LocalFolder {
                     found: source_print,
                 });
             }
+            let folders = new_folders(to, |folder| self.exists(folder))?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -668,6 +694,7 @@ impl Storage for LocalFolder {
                 target: target_print,
                 size,
                 rev: None,
+                folders,
             })
         })();
         let _ = fs::remove_file(&temp);
@@ -701,9 +728,7 @@ impl Storage for LocalFolder {
         {
             return Err(CopyError::Changed { found: print });
         }
-        let folders = new_folders(to, |folder| {
-            Ok(fs::symlink_metadata(self.full(folder)).is_ok())
-        })?;
+        let folders = new_folders(to, |folder| self.exists(folder))?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }

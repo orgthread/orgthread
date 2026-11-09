@@ -604,7 +604,9 @@ fn the_copy_tool_copies_each_pair_and_names_each_refusal() {
     let print = fingerprint("Grüße\n".as_bytes());
     assert_eq!(
         lines[1],
-        format!("copied: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}")
+        format!(
+            "copied: org/notes/invented.md -> org/new/deep/b.md, 8 bytes, {print}, new folders: org/new, org/new/deep"
+        )
     );
     assert!(
         lines[2].starts_with(&format!(
@@ -623,7 +625,11 @@ fn the_copy_tool_copies_each_pair_and_names_each_refusal() {
     assert!(!place.root.join("org/c.md").exists());
     let log = fs::read_to_string(place.log()).unwrap();
     assert_eq!(log.lines().filter(|l| l.contains("\tcopied\t")).count(), 2);
-    assert_eq!(log.lines().count(), 4, "one log line per pair: {log}");
+    assert_eq!(
+        log.lines().count(),
+        6,
+        "one log line per pair, and one per new folder: {log}"
+    );
 }
 
 #[test]
@@ -795,7 +801,17 @@ fn the_move_tool_moves_each_pair_and_names_each_refusal() {
     assert!(!place.root.join("org/c.md").exists());
     let log = fs::read_to_string(place.log()).unwrap();
     assert_eq!(log.lines().filter(|l| l.contains("\tmoved\t")).count(), 2);
-    assert_eq!(log.lines().count(), 4, "one log line per pair: {log}");
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("\tmade-folder\t"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        log.lines().count(),
+        6,
+        "one log line per pair, and one per new folder: {log}"
+    );
 }
 
 #[test]

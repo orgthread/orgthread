@@ -516,6 +516,7 @@ impl Dropbox {
         from: &str,
         to: &str,
         source: &str,
+        folders: Vec<String>,
         cause: io::Error,
     ) -> Result<Copied, CopyError> {
         let look = match self.look(to) {
@@ -532,6 +533,7 @@ impl Dropbox {
                 target: hash,
                 size,
                 rev: (!rev.is_empty()).then_some(rev),
+                folders,
             }),
             Look::Missing => Err(CopyError::Io(failure(format!(
                 "Dropbox gave no answer to the copy ({cause}), and {to} is not there, so nothing was copied. Try again"
@@ -731,10 +733,12 @@ impl Storage for Dropbox {
         }
     }
 
-    /// Two calls: `get_metadata` of the source, then `copy_v2`, which copies
-    /// inside Dropbox, so no byte passes this server. `autorename: false`: a
-    /// target that exists is a refusal, never a renamed copy. The hash in the
-    /// answer is the check, as Dropbox makes it from the stored file.
+    /// `get_metadata` of the source, a look at the folders of the new name, then
+    /// `copy_v2`, which copies inside Dropbox, so no byte passes this server.
+    /// `autorename: false`: a target that exists is a refusal, never a renamed
+    /// copy. The hash in the answer is the check, as Dropbox makes it from the
+    /// stored file. Dropbox makes the missing folders itself; the look before
+    /// only names them for the answer.
     fn copy(&self, from: &str, to: &str, expect: Option<&str>) -> Result<Copied, CopyError> {
         let (source, target) = (Self::file(from), Self::file(to));
         let hash = match self.look(&source)? {
@@ -752,10 +756,11 @@ impl Storage for Dropbox {
         {
             return Err(CopyError::Changed { found: hash });
         }
+        let folders = new_folders(to, |folder| self.exists(folder))?;
         let arg = json!({ "from_path": source, "to_path": target, "autorename": false });
         let reply = match self.rpc("copy_v2", &arg) {
             Ok(reply) => reply,
-            Err(cause) => return self.after_no_answer(&source, &target, &hash, cause),
+            Err(cause) => return self.after_no_answer(&source, &target, &hash, folders, cause),
         };
         match reply.status {
             200 => match made_of(&reply.body) {
@@ -764,6 +769,7 @@ impl Storage for Dropbox {
                     target: made,
                     size,
                     rev,
+                    folders,
                 }),
                 // No hash in the answer: one look gives it.
                 Ok((None, size, rev)) => match self.look(&target)? {
@@ -772,6 +778,7 @@ impl Storage for Dropbox {
                         target: made,
                         size,
                         rev,
+                        folders,
                     }),
                     _ => Err(CopyError::Unexpected {
                         reason: format!(
@@ -812,9 +819,7 @@ impl Storage for Dropbox {
         {
             return Err(CopyError::Changed { found: hash });
         }
-        let folders = new_folders(to, |folder| {
-            Ok(self.look(&Self::file(folder))? != Look::Missing)
-        })?;
+        let folders = new_folders(to, |folder| self.exists(folder))?;
         let arg = json!({
             "from_path": source,
             "to_path": target,
@@ -859,6 +864,10 @@ impl Storage for Dropbox {
                 .unwrap_or_else(|| CopyError::Io(refused(&reply)))),
             _ => Err(CopyError::Io(refused(&reply))),
         }
+    }
+
+    fn exists(&self, path: &str) -> io::Result<bool> {
+        Ok(self.look(&Self::file(path))? != Look::Missing)
     }
 
     fn size(&self, path: &str) -> io::Result<Option<u64>> {

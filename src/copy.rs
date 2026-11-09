@@ -16,6 +16,8 @@ pub enum Outcome {
     Copied {
         print: String,
         size: u64,
+        /// The folders made for the new name, the outer one first.
+        folders: Vec<String>,
     },
     /// A file or folder is at the target already.
     Exists,
@@ -94,6 +96,9 @@ impl Outcome {
 #[derive(Debug)]
 pub struct Report {
     pub outcome: Outcome,
+    /// The folders the copy made, the outer one first, also when the copy went
+    /// again after a failed check: the folders stay, and the log names them.
+    pub folders: Vec<String>,
     pub took_over: Option<String>,
     pub lock_left: Option<String>,
     pub lock_lost: Option<String>,
@@ -103,6 +108,7 @@ impl Report {
     pub fn plain(outcome: Outcome) -> Report {
         Report {
             outcome,
+            folders: Vec::new(),
             took_over: None,
             lock_left: None,
             lock_lost: None,
@@ -144,45 +150,52 @@ pub fn copy(
 ) -> Report {
     let run = write::under_lock(storage, to, line, |held| {
         // The last safe point: from here on, the copy runs to its end and its check.
+        let none = Vec::new;
         if stop.load(Ordering::SeqCst) {
-            return failed("nothing copied", "a stop was asked for");
+            return (failed("nothing copied", "a stop was asked for"), none());
         }
         match held.still_ours() {
             Ok(true) => {}
             Ok(false) => {
-                return failed("nothing copied", "another writer came in before this copy");
+                let outcome = failed("nothing copied", "another writer came in before this copy");
+                return (outcome, none());
             }
-            Err(e) => return failed("could not check that the target is free", e),
+            Err(e) => return (failed("could not check that the target is free", e), none()),
         }
         let made = match storage.copy(from, to, expect) {
             Ok(made) => made,
-            Err(CopyError::Exists) => return Outcome::Exists,
-            Err(CopyError::Missing) => return Outcome::Missing,
-            Err(CopyError::Folder) => return Outcome::Folder,
+            Err(CopyError::Exists) => return (Outcome::Exists, none()),
+            Err(CopyError::Missing) => return (Outcome::Missing, none()),
+            Err(CopyError::Folder) => return (Outcome::Folder, none()),
             Err(CopyError::Changed { found }) => {
-                return Outcome::Changed {
+                let outcome = Outcome::Changed {
                     expected: expect.unwrap_or_default().to_string(),
                     found,
                 };
+                return (outcome, none());
             }
             Err(CopyError::Unexpected { reason }) => {
-                return Outcome::NotRemoved {
+                let outcome = Outcome::NotRemoved {
                     source: String::new(),
                     target: String::new(),
                     reason,
                 };
+                return (outcome, none());
             }
-            Err(CopyError::Io(e)) => return failed("could not copy the file", e),
+            Err(CopyError::Io(e)) => return (failed("could not copy the file", e), none()),
         };
+        let folders = made.folders.clone();
         if made.source == made.target {
-            return Outcome::Copied {
+            let outcome = Outcome::Copied {
                 print: made.target,
                 size: made.size,
+                folders: made.folders,
             };
+            return (outcome, folders);
         }
         // Only the exact copy that was made goes, by its fingerprint and its rev.
         let expect = Expect::Fingerprint(made.target.clone());
-        match storage.remove_if(to, &expect, made.rev.as_deref()) {
+        let outcome = match storage.remove_if(to, &expect, made.rev.as_deref()) {
             Ok(_) => Outcome::Removed {
                 source: made.source,
                 target: made.target,
@@ -202,15 +215,17 @@ pub fn copy(
                     reason: format!("removing the copy failed: {why}"),
                 }
             }
-        }
+        };
+        (outcome, folders)
     });
-    let outcome = match run.result {
-        Ok(outcome) => outcome,
-        Err(Gate::Busy { holder, age }) => Outcome::Locked { holder, age },
-        Err(Gate::Failed(reason)) => failed("could not reserve the target", reason),
+    let (outcome, folders) = match run.result {
+        Ok(done) => done,
+        Err(Gate::Busy { holder, age }) => (Outcome::Locked { holder, age }, Vec::new()),
+        Err(Gate::Failed(reason)) => (failed("could not reserve the target", reason), Vec::new()),
     };
     Report {
         outcome,
+        folders,
         took_over: run.took_over,
         lock_left: run.lock_left,
         lock_lost: run.lock_lost,
@@ -230,7 +245,7 @@ pub fn source_field(from: &str) -> String {
 /// copy logs the source fingerprint and the one of the copy.
 pub fn log_line(now: &str, from: &str, to: &str, who: &str, outcome: &Outcome) -> String {
     let (before, after, size) = match outcome {
-        Outcome::Copied { print, size } => (String::new(), print.clone(), size.to_string()),
+        Outcome::Copied { print, size, .. } => (String::new(), print.clone(), size.to_string()),
         Outcome::Changed { expected, found } => (expected.clone(), found.clone(), String::new()),
         Outcome::Removed { source, target } | Outcome::NotRemoved { source, target, .. } => {
             (source.clone(), target.clone(), String::new())
@@ -253,8 +268,16 @@ pub fn log_line(now: &str, from: &str, to: &str, who: &str, outcome: &Outcome) -
 /// The answer for the person or the chat, in plain words.
 pub fn message(from: &str, to: &str, outcome: &Outcome) -> String {
     match outcome {
-        Outcome::Copied { print, size } => {
-            format!("copied: {from} -> {to}, {size} bytes, {print}")
+        Outcome::Copied {
+            print,
+            size,
+            folders,
+        } => {
+            let mut text = format!("copied: {from} -> {to}, {size} bytes, {print}");
+            if !folders.is_empty() {
+                text.push_str(&format!(", new folders: {}", folders.join(", ")));
+            }
+            text
         }
         Outcome::Exists => format!(
             "refused, nothing copied. {to} exists, and a copy never replaces a file. Name a new copy."
@@ -316,7 +339,8 @@ mod tests {
             report.outcome,
             Outcome::Copied {
                 print: fingerprint("Grüße\n".as_bytes()),
-                size: 8
+                size: 8,
+                folders: vec!["new".to_string(), "new/deep".to_string()],
             }
         );
         assert_eq!(
@@ -445,6 +469,7 @@ mod tests {
                 target: "bb".into(),
                 size: 3,
                 rev: Some("r7".into()),
+                folders: Vec::new(),
             })
         }
         fn remove_if(
@@ -506,6 +531,7 @@ mod tests {
         let copied = Outcome::Copied {
             print: "aa".into(),
             size: 12,
+            folders: Vec::new(),
         };
         assert_eq!(
             log_line("T", "org/a.md", "org/b.md", "chat", &copied),
