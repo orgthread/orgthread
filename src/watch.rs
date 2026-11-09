@@ -195,6 +195,9 @@ pub fn why(outcome: &str) -> &'static str {
         "not-restored" => "The check failed and the old state is NOT back. Look at this file now.",
         "failed" => "The write failed, and the file is unchanged.",
         "downloaded" => "This chat got the exact bytes of the file. Nothing was written.",
+        "deleted" => {
+            "The file was deleted. Dropbox keeps it in Deleted files, or the last version is kept beside the program."
+        }
         _ => "This outcome is not known to this version.",
     }
 }
@@ -424,6 +427,19 @@ mod tests {
     #[test]
     fn a_broken_line_is_skipped() {
         assert_eq!(parse_line("not a log line"), None);
+        let nine = "T\tdeleted\torg/a.md\tchat\taa\t-\t12\t015f\textra";
+        assert_eq!(parse_line(nine), None);
+    }
+
+    #[test]
+    fn a_delete_line_with_its_rev_as_the_8th_field_parses() {
+        let e =
+            parse_line("2026-11-09 11:55:02Z\tdeleted\torg/a.md\tchat\taa\t-\t12\t015f").unwrap();
+        assert_eq!(e.outcome, "deleted");
+        assert_eq!((e.before.as_str(), e.after.as_str()), ("aa", ""));
+        assert_eq!(e.size, "12");
+        assert!(!is_written(&e.outcome), "a delete has no diff to show");
+        assert!(why("deleted").starts_with("The file was deleted"));
     }
 
     #[test]
