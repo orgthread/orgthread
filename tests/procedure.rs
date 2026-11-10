@@ -934,10 +934,6 @@ fn a_copy_names_its_new_folders_and_logs_them_first() {
 /// Gives the owner the right to write again, so that the test folder can go.
 fn writable_again(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::process::Command::new("chflags")
-        .args(["-R", "nouchg"])
-        .arg(path)
-        .status();
     for entry in fs::read_dir(path).into_iter().flatten().flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -983,28 +979,23 @@ fn a_write_that_fails_after_its_folders_logs_them_then_failed_and_they_stay() {
 fn a_move_that_fails_after_its_folders_logs_them_before_its_refusal() {
     let d = Door::new();
     d.folder.put(FILE, b"old\n");
-    // An immutable file cannot get a second name, so the link fails after the
-    // folders of the new name are made.
-    let locked = std::process::Command::new("chflags")
-        .arg("uchg")
-        .arg(d.at(FILE))
-        .status()
-        .unwrap();
-    assert!(locked.success());
-    let o = d.run(
-        &[
-            "move",
-            &d.p(FILE),
-            &d.p("org/new/deep/a.md"),
-            "--who",
-            "chat",
-        ],
+    // With umask 222 the new folder comes without the right to write in it, so
+    // the folder is made, and the link of the file into it fails. This works
+    // on Linux and on macOS.
+    fs::write(d.state.join("writes.log"), "").unwrap();
+    let o = d.run_as(
+        &["move", &d.p(FILE), &d.p("org/new/a.md"), "--who", "chat"],
         b"",
         None,
+        Some("222"),
+        &d.state.join("writes.log"),
     );
+    let made = d.at("org/new").is_dir();
+    let file = d.at("org/new/a.md").exists();
     writable_again(&d.folder.0);
     assert_eq!(o.status.code(), Some(1), "{o:?}");
-    assert!(d.at("org/new/deep").is_dir(), "the folders stay");
+    assert!(made, "the folder stays");
+    assert!(!file, "nothing at the new name");
     assert_eq!(
         d.folder.get(FILE),
         b"old\n",
@@ -1012,15 +1003,12 @@ fn a_move_that_fails_after_its_folders_logs_them_before_its_refusal() {
     );
     assert_eq!(
         d.words(),
-        pairs(&[
-            ("made-folder", "org/new"),
-            ("made-folder", "org/new/deep"),
-            ("move-failed", "org/new/deep/a.md"),
-        ])
+        pairs(&[("made-folder", "org/new"), ("move-failed", "org/new/a.md")]),
+        "the made-folder line first, then the refusal"
     );
     let said = String::from_utf8_lossy(&o.stderr);
     assert!(
-        said.contains("these new folders were made, and they stay: org/new, org/new/deep"),
+        said.contains("these new folders were made, and they stay: org/new"),
         "{said}"
     );
     d.folder.assert_locks_empty();
