@@ -1,7 +1,7 @@
 //! The one-time links of `download` and `upload`, and their limits.
 //!
-//! A link works once, for one file and one direction, and must start within 60
-//! seconds. It works without a login, like a key under the mat, so it is short
+//! A link works once, for one file and one direction, and must start within 5
+//! minutes. It works without a login, like a key under the mat, so it is short
 //! and lives in memory only: a restart ends every link. It never goes into the
 //! log or into a message.
 
