@@ -664,3 +664,173 @@ fn list_keeps_to_the_limits_of_the_door() {
     assert_eq!(code(&o), 2, "{o:?}");
     assert!(!String::from_utf8_lossy(&o.stdout).contains("x.md"));
 }
+
+/// Invented notes for a search, in the test folder.
+fn search_place() -> (Place, String) {
+    let p = Place::new();
+    let notes = p.root.join("org/notes");
+    fs::create_dir_all(notes.join("health")).unwrap();
+    fs::write(
+        notes.join("health/log.md"),
+        "Blood pressure morning: 120/80\nslept well\n",
+    )
+    .unwrap();
+    fs::write(notes.join("plan.org"), "* TODO measure blood pressure\n").unwrap();
+    let notes = notes.to_str().unwrap().to_string();
+    (p, notes)
+}
+
+#[test]
+fn search_gives_the_hits_and_one_log_line_with_no_text() {
+    let (p, notes) = search_place();
+    let o = p.run(&["search", "BLOOD PRESSURE", &notes, "--who", "t"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let said = String::from_utf8(o.stdout).unwrap();
+    assert_eq!(
+        said,
+        format!(
+            "{notes}/health/log.md:1: Blood pressure morning: 120/80\n\
+             {notes}/plan.org:1: * TODO measure blood pressure\n"
+        )
+    );
+    let log = fs::read_to_string(p.log()).unwrap();
+    let fields: Vec<&str> = log.trim_end().split('\t').collect();
+    assert_eq!(fields[1..], ["searched", "org/notes", "t", "-", "-", "2"]);
+    // Neither the text nor a hit, in any case, in the log or any other file.
+    let lower = log.to_lowercase();
+    for secret in ["blood", "pressure", "120/80", "measure"] {
+        assert!(!lower.contains(secret), "{log}");
+    }
+    let outside = p.root.with_extension("outside");
+    for place in [p.root.join("org/.locks"), outside] {
+        for item in fs::read_dir(place).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_file() {
+                let text = fs::read_to_string(&path).unwrap_or_default().to_lowercase();
+                assert!(!text.contains("blood"), "{}", path.display());
+            }
+        }
+    }
+}
+
+#[test]
+fn search_with_no_hits_gives_0_and_says_so() {
+    let (p, notes) = search_place();
+    let o = p.run(&["search", "garden", &notes, "--who", "t"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        format!("no hits in {notes}\n")
+    );
+    let log = fs::read_to_string(p.log()).unwrap();
+    assert!(
+        log.trim_end()
+            .ends_with("\tsearched\torg/notes\tt\t-\t-\t0"),
+        "{log}"
+    );
+}
+
+#[test]
+fn search_names_max_and_the_line_of_the_rest() {
+    let (p, notes) = search_place();
+    let o = p.run(&["search", "LOG", &notes, "--names", "--who", "t"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        format!("{notes}/health/log.md\n")
+    );
+    let o = p.run(
+        &["search", "blood", &notes, "--max", "1", "--who", "t"],
+        b"",
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    let said = String::from_utf8(o.stdout).unwrap();
+    assert_eq!(said.lines().count(), 2, "{said}");
+    assert!(
+        said.ends_with("1 more hit not shown: search a smaller folder or a longer text\n"),
+        "{said}"
+    );
+}
+
+#[test]
+fn search_refuses_wrong_use_with_exit_2_and_logs_nothing() {
+    let (p, notes) = search_place();
+    let file = format!("{notes}/plan.org");
+    for args in [
+        vec!["search", "blood", &notes],
+        vec!["search", "blood", "--who", "t"],
+        vec!["search", "", &notes, "--who", "t"],
+        vec!["search", "a\nb", &notes, "--who", "t"],
+        vec!["search", "blood", &notes, "--who", "t", "--max", "0"],
+        vec!["search", "blood", &notes, "--who", "t", "--max", "1001"],
+        vec!["search", "blood", &notes, "--who", "t", "--max", "many"],
+        vec!["search", "blood", &notes, "extra", "--who", "t"],
+        vec!["search", "blood", &file, "--who", "t"],
+    ] {
+        let o = p.run(&args, b"");
+        assert_eq!(code(&o), 2, "{args:?}: {o:?}");
+        let said = String::from_utf8_lossy(&o.stderr).to_lowercase();
+        assert!(
+            !said.contains("blood"),
+            "the text is never repeated: {said}"
+        );
+    }
+    let o = p.run(
+        &["search", "blood", &format!("{notes}/gone"), "--who", "t"],
+        b"",
+    );
+    assert_eq!(code(&o), 6, "{o:?}");
+    assert!(!p.log().exists(), "a refusal leaves no log line");
+    // After --, a text named like an option is the text.
+    fs::write(p.root.join("org/notes/flags.md"), "use --all here\n").unwrap();
+    let o = p.run(&["search", "--who", "t", "--", "--all", &notes], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(
+        String::from_utf8(o.stdout)
+            .unwrap()
+            .contains("flags.md:1: use --all here")
+    );
+}
+
+#[test]
+fn search_keeps_to_the_limits_of_the_door() {
+    let (p, notes) = search_place();
+    let search = |deny: &str, read_only: &str| {
+        p.command(&["search", "blood", &notes, "--who", "t"])
+            .env("ORGTHREAD_DENY", deny)
+            .env("ORGTHREAD_READ_ONLY", read_only)
+            .output()
+            .unwrap()
+    };
+    let o = search("org/notes/health", "");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let said = String::from_utf8(o.stdout).unwrap();
+    assert_eq!(
+        said,
+        format!("{notes}/plan.org:1: * TODO measure blood pressure\n")
+    );
+    let o = search("", "org/notes/plan.org");
+    let said = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        said.contains("plan.org:1: * TODO measure blood pressure  (read only)\n"),
+        "{said}"
+    );
+    assert!(!said.contains("120/80  (read only)"), "{said}");
+    // On the Mac, a folder that holds a closed folder is searched, without it.
+    let o = search("org/notes/health", "");
+    assert_eq!(code(&o), 0);
+    let o = search("org/notes", "");
+    assert_eq!(code(&o), 2, "{o:?}");
+}
+
+#[test]
+fn a_search_whose_log_line_fails_gives_exit_8_after_the_hits() {
+    let (p, notes) = search_place();
+    fs::write(p.root.join("log"), "in the way").unwrap();
+    let o = p.run(&["search", "blood", &notes, "--who", "t"], b"");
+    assert_eq!(code(&o), 8, "{o:?}");
+    assert!(String::from_utf8(o.stdout).unwrap().contains("plan.org:1:"));
+    let said = String::from_utf8_lossy(&o.stderr).to_lowercase();
+    assert!(said.contains("the log line failed"), "{said}");
+    assert!(!said.contains("blood"), "{said}");
+}

@@ -10,6 +10,7 @@ use orgthread::mv;
 use orgthread::patch::{self, Patch};
 use orgthread::reads::Reads;
 use orgthread::screen;
+use orgthread::search::{self, Query};
 use orgthread::serve;
 use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage, new_folders, still_there};
@@ -33,6 +34,7 @@ For an agent:
   orgthread write <file> --who <name>            < the whole new text
   orgthread patch <file> --who <name>            < only the changes, as JSON
   orgthread list <folder>...                     the size, time and name of each entry
+  orgthread search <text> <folder> --who <name>  each line that holds the text, in a folder
   orgthread download <file> --who <name> --to <copy>
                                                  any file, also not text, as exact bytes
   orgthread upload <file> --who <name>           < any file, with the rules of write
@@ -46,7 +48,7 @@ the file changed since. The agent never handles anything else.
 
 For a chat with no shell:
 
-  orgthread serve                                the same read, write, patch, delete, copy, move and list, as MCP tools,
+  orgthread serve                                the same read, write, patch, delete, copy, move, list and search, as MCP tools,
                                                  and version: the build, the door, the storage, the tools
   orgthread serve --http <address>               also download and upload, through one-time links
 
@@ -81,6 +83,20 @@ Options of list, also called ls: --depth <n> goes n levels down (default 1), and
 Dropbox it costs nothing more. With a local folder, it reads each file.
 After --, each word is a folder. A list shows at most 1000 entries, leaves out
 closed paths, and marks read-only ones. The time is in the zone of TZ.
+
+Options of search: the text is plain text, and case does not count. A hit is
+path:line: text, and the line is cut at 300 characters, with … at the end.
+--names matches only the names of files and folders, and a hit is the path.
+--max <n> shows at most n hits, from 1 to 1000 (default 100). When more are
+found, the last line says how many are left out. --all also searches the names
+that start with a dot. After --, each word is the text or the folder. A folder
+is required. Closed paths stay out, read-only hits are marked, and files that
+are not text are skipped for content. No hits gives exit 0 and the answer: no
+hits in <folder>. The log line, searched, names the folder and the number of
+files with a hit: never the text and never a hit. With Dropbox, a content search
+fetches the folder as one zip, in memory only. It is refused, code 2, above
+ORGTHREAD_SEARCH_MB, and for a folder that holds a closed path. --names makes one
+listing and fetches no file.
 
 download without --to sends the bytes to its output, never to a terminal. It
 notes what this name read, as read does. upload takes --size too. A text file
@@ -154,6 +170,8 @@ Settings, from the environment:
                       / stands for the root (default: not set, and any new folder is made)
   ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
                       the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
+  ORGTHREAD_SEARCH_MB the largest zip of a search with Dropbox, in MB, and with a local
+                      folder the largest file a search reads (default: 25)
   ORGTHREAD_LISTEN_ANYWHERE
                       yes: let serve --http listen on an address that others can reach, with
                       no encryption (default: only 127.0.0.1, [::1] and localhost)
@@ -225,6 +243,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("write") => cmd_write(&args[1..]),
         Some("patch") => cmd_patch(&args[1..]),
         Some("list" | "ls") => cmd_list(&args[1..]),
+        Some("search") => cmd_search(&args[1..]),
         Some("download") => cmd_download(&args[1..]),
         Some("upload") => cmd_upload(&args[1..]),
         Some("delete") => cmd_delete(&args[1..]),
@@ -457,6 +476,118 @@ fn cmd_list(args: &[String]) -> Result<i32, String> {
             Ok(exit::FAILED)
         }
     }
+}
+
+struct SearchArgs {
+    folder: String,
+    who: String,
+    query: Query,
+}
+
+fn parse_search(args: &[String]) -> Result<SearchArgs, String> {
+    let mut words = Vec::new();
+    let mut who = None;
+    let mut names = false;
+    let mut all = false;
+    let mut max = search::MAX;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            // After --, each word is the text or the folder, also one named like an option.
+            "--" => words.extend(rest.by_ref().cloned()),
+            "--who" => who = Some(rest.next().ok_or("--who needs a name")?.clone()),
+            "--names" => names = true,
+            "--all" => all = true,
+            "--max" => {
+                let most = search::MOST;
+                let value = rest
+                    .next()
+                    .ok_or(format!("--max needs a number from 1 to {most}"))?;
+                max = match value.parse::<usize>() {
+                    Ok(n) if (1..=most).contains(&n) => n,
+                    _ => return Err(format!("--max needs a number from 1 to {most}")),
+                };
+            }
+            other if other.starts_with("--") => return Err(format!("there is no option {other}")),
+            other => words.push(other.to_string()),
+        }
+    }
+    // The messages never repeat the text: it can be health data.
+    let [text, folder] = <[String; 2]>::try_from(words)
+        .map_err(|_| "search needs a text and a folder, in this order".to_string())?;
+    if text.trim().is_empty() {
+        return Err("search needs a text that is not empty".into());
+    }
+    if text.contains(['\n', '\r']) {
+        return Err("search needs a text on one line, as it matches one line".into());
+    }
+    if folder.is_empty() {
+        return Err("search needs a folder".into());
+    }
+    let who = checked_who(who)?;
+    Ok(SearchArgs {
+        query: Query {
+            text,
+            names,
+            max,
+            all,
+        },
+        folder,
+        who,
+    })
+}
+
+/// The lines that hold a text in the files of one folder, or with --names, the
+/// paths whose name holds it. The log line names the folder and the number of
+/// files with a hit, never the text and never a hit.
+fn cmd_search(args: &[String]) -> Result<i32, String> {
+    let SearchArgs { folder, who, query } = parse_search(args)?;
+    let settings = Settings::load()?;
+    let path = match settings.folder_of(&folder) {
+        Ok(path) => path,
+        Err((code, reason)) => {
+            say(reason);
+            return Ok(code);
+        }
+    };
+    let named = if path.is_empty() { "/" } else { path.as_str() };
+    settings.limits(named, false)?;
+    // A content search on a server fetches the whole folder as one zip.
+    if settings.dropbox && !query.names {
+        let deny = env::var("ORGTHREAD_DENY").unwrap_or_default();
+        if let Some(reason) = search::holds_closed(&path, &deny) {
+            return Err(reason);
+        }
+    }
+    let limit = search::zip_limit()?;
+    let storage = settings.storage()?;
+    let limits = |path: &str, writing: bool| settings.limits(path, writing);
+    let found = match search::search(storage.as_ref(), &folder, &path, &query, &limits, limit) {
+        Ok(found) => found,
+        Err((code, reason)) => {
+            say(reason);
+            return Ok(code);
+        }
+    };
+    let mut out = io::stdout();
+    if let Err(e) = out
+        .write_all(found.text.as_bytes())
+        .and_then(|()| out.flush())
+    {
+        say(format!("could not hand over the hits: {e}"));
+        return Ok(exit::FAILED);
+    }
+    let now = log::utc_now();
+    let files = found.files.to_string();
+    let line = log::line(&[&now, "searched", named, &who, "", "", &files]);
+    if let Err(e) = log::append(&settings.log, &line) {
+        say(format!(
+            "the log line failed, {}: {e}. The line: {line}",
+            settings.log.display()
+        ));
+        return Ok(exit::NOT_LOGGED);
+    }
+    Ok(0)
 }
 
 /// The exact text, and a note of what this name read, from one single read.

@@ -57,6 +57,10 @@ struct State {
     move_hangs_up: Option<bool>,
     /// The next move finds these bytes in the file, as if a write landed in between.
     move_finds: Option<Vec<u8>>,
+    /// How many `download_zip` calls came in.
+    zips: u32,
+    /// The next `download_zip` answers that the folder is too large to zip.
+    zip_too_large: bool,
 }
 
 impl State {
@@ -88,6 +92,71 @@ impl State {
             return Err("path/not_found/..");
         }
         Ok(seen.into_values().collect())
+    }
+
+    /// Every entry under a folder, at any depth, as a recursive `list_folder`
+    /// gives it: the folder itself first, then each folder and file by path.
+    fn deep_children(&self, path: &str) -> Result<Vec<Value>, &'static str> {
+        self.children(path)?;
+        let prefix = format!("{path}/");
+        let mut seen = std::collections::BTreeMap::new();
+        for (key, file) in &self.files {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.split('/').collect();
+            for i in 1..parts.len() {
+                let folder = format!("{prefix}{}", parts[..i].join("/"));
+                let v = json!({ ".tag": "folder", "name": parts[i - 1], "path_display": folder });
+                seen.insert(folder, v);
+            }
+            let v = json!({
+                ".tag": "file",
+                "name": parts[parts.len() - 1],
+                "path_display": key,
+                "size": file.bytes.len(),
+                "content_hash": fingerprint(&file.bytes),
+            });
+            seen.insert(key.clone(), v);
+        }
+        let top =
+            json!({ ".tag": "folder", "name": path.rsplit('/').next(), "path_display": path });
+        Ok(std::iter::once(top).chain(seen.into_values()).collect())
+    }
+
+    /// One page of a recursive list from `start`, with its cursor.
+    fn deep_page_from(&mut self, path: &str, start: usize) -> Result<Value, &'static str> {
+        self.list_calls += 1;
+        let all = self.deep_children(path)?;
+        let size = if self.page == 0 { 100 } else { self.page };
+        let end = (start + size).min(all.len());
+        Ok(json!({
+            "entries": all[start..end],
+            "cursor": format!("deep:{path}|{end}"),
+            "has_more": end < all.len(),
+        }))
+    }
+
+    /// The zip of `download_zip`: the folder itself at the top, then its files,
+    /// stored with no packing, as a test needs only the names and the bytes.
+    fn zip_of(&self, path: &str) -> Result<Vec<u8>, &'static str> {
+        use zip::write::SimpleFileOptions;
+        self.children(path)?;
+        let top = path.rsplit('/').next().unwrap_or("");
+        let prefix = format!("{path}/");
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        out.add_directory(format!("{top}/"), options).unwrap();
+        let mut names: Vec<&String> = self.files.keys().collect();
+        names.sort();
+        for key in names {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                out.start_file(format!("{top}/{rest}"), options).unwrap();
+                out.write_all(&self.files[key].bytes).unwrap();
+            }
+        }
+        Ok(out.finish().unwrap().into_inner())
     }
 
     /// One page from `start`, with the cursor for the next one.
@@ -215,16 +284,38 @@ fn serve_one(mut stream: TcpStream, state: &Mutex<State>) {
             None => error(&mut stream, "path/not_found/.."),
         },
         "/2/files/list_folder" => {
-            assert_eq!(arg["recursive"], false);
-            match s.page_from(&path, 0) {
+            let page = if arg["recursive"] == true {
+                s.deep_page_from(&path, 0)
+            } else {
+                assert_eq!(arg["recursive"], false);
+                s.page_from(&path, 0)
+            };
+            match page {
                 Ok(v) => reply(&mut stream, 200, v.to_string().as_bytes()),
+                Err(summary) => error(&mut stream, summary),
+            }
+        }
+        "/2/files/download_zip" => {
+            s.zips += 1;
+            if std::mem::take(&mut s.zip_too_large) {
+                return error(&mut stream, "too_large/..");
+            }
+            match s.zip_of(&path) {
+                Ok(zip) => reply(&mut stream, 200, &zip),
                 Err(summary) => error(&mut stream, summary),
             }
         }
         "/2/files/list_folder/continue" => {
             let cursor = arg["cursor"].as_str().unwrap_or("").to_string();
             let (folder, start) = cursor.rsplit_once('|').unwrap();
-            match s.page_from(folder, start.parse().unwrap()) {
+            let start = start.parse().unwrap();
+            if let Some(folder) = folder.strip_prefix("deep:") {
+                return match s.deep_page_from(folder, start) {
+                    Ok(v) => reply(&mut stream, 200, v.to_string().as_bytes()),
+                    Err(summary) => error(&mut stream, summary),
+                };
+            }
+            match s.page_from(folder, start) {
                 Ok(v) => reply(&mut stream, 200, v.to_string().as_bytes()),
                 Err(summary) => error(&mut stream, summary),
             }
@@ -1846,4 +1937,164 @@ fn a_dropbox_copy_that_fails_after_its_folders_logs_them_before_its_refusal() {
         said.contains("these new folders were made, and they stay: org/new, org/new/deep"),
         "{said}"
     );
+}
+
+/// Invented notes in the stand-in for a search, with one closed folder.
+fn search_fake() -> Fake {
+    let f = Fake::new();
+    f.put(
+        "/org/notes/health/log.md",
+        b"Blood pressure morning: 120/80\nslept well\n",
+    );
+    f.put("/org/notes/plan.org", b"* TODO measure blood pressure\n");
+    f.put("/org/notes/.obsidian/app.json", b"blood pressure\n");
+    f.put("/org/notes/scan.bin", b"blood\0pressure");
+    f.put("/org/notes/photo.png", b"blood pressure");
+    f.put("/org/private/a.md", b"blood pressure\n");
+    f
+}
+
+fn search(f: &Fake, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut all = vec!["search"];
+    all.extend(args);
+    all.extend(["--who", "chat"]);
+    f.run_with_env(&all, b"", env)
+}
+
+#[test]
+fn a_dropbox_search_is_one_zip_in_memory_and_skips_what_it_should() {
+    let f = search_fake();
+    let o = search(&f, &["BLOOD pressure", "/org/notes"], &[]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        "/org/notes/health/log.md:1: Blood pressure morning: 120/80\n\
+         /org/notes/plan.org:1: * TODO measure blood pressure\n"
+    );
+    {
+        let s = f.state.lock().unwrap();
+        assert_eq!(s.zips, 1, "one zip for the whole search");
+        assert_eq!((s.downloads, s.list_calls), (0, 0), "no other call");
+    }
+    let o = search(&f, &["blood", "/org/notes", "--all"], &[]);
+    assert!(
+        String::from_utf8(o.stdout)
+            .unwrap()
+            .contains("/org/notes/.obsidian/app.json:1:")
+    );
+    // The log has the folder and the number of files, never the text or a hit.
+    let log = fs::read_to_string(f.dir.join("log")).unwrap();
+    let first: Vec<&str> = log.lines().next().unwrap().split('\t').collect();
+    assert_eq!(first[1..], ["searched", "org/notes", "chat", "-", "-", "2"]);
+    assert!(!log.to_lowercase().contains("blood"), "{log}");
+    assert!(!log.contains("120/80"), "{log}");
+    // No zip and no text stays on the disk of the server.
+    let mut todo = vec![f.dir.clone()];
+    while let Some(dir) = todo.pop() {
+        for item in fs::read_dir(dir).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_dir() {
+                todo.push(path);
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                let text = String::from_utf8_lossy(&bytes).to_lowercase();
+                assert!(!text.contains("blood"), "{}", path.display());
+                assert!(!bytes.starts_with(b"PK"), "a zip at {}", path.display());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_dropbox_search_with_names_lists_every_page_and_fetches_no_file() {
+    let f = search_fake();
+    f.state.lock().unwrap().page = 2;
+    let o = search(&f, &["LOG", "/org/notes", "--names"], &[]);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        "/org/notes/health/log.md\n"
+    );
+    let o = search(&f, &["o", "/org/notes", "--names"], &[]);
+    let said = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        said.contains("/org/notes/photo.png\n"),
+        "a picture is found by its name: {said}"
+    );
+    assert!(!said.contains(".obsidian"), "{said}");
+    let s = f.state.lock().unwrap();
+    assert_eq!(s.zips, 0);
+    assert_eq!(s.downloads, 0);
+    assert!(s.list_calls >= 4, "several pages: {}", s.list_calls);
+}
+
+#[test]
+fn a_dropbox_content_search_of_a_folder_with_a_closed_folder_is_refused() {
+    let f = search_fake();
+    let deny = [("ORGTHREAD_DENY", "/org/private")];
+    let o = search(&f, &["blood", "/org"], &deny);
+    assert_eq!(code(&o), 2, "{o:?}");
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("/org/private"), "{said}");
+    assert!(!said.to_lowercase().contains("blood"), "{said}");
+    assert_eq!(f.state.lock().unwrap().zips, 0, "no zip was fetched");
+    // A folder with no closed path works, and names work for /org too.
+    assert_eq!(code(&search(&f, &["blood", "/org/notes"], &deny)), 0);
+    let o = search(&f, &["a.md", "/org", "--names"], &deny);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(String::from_utf8(o.stdout).unwrap(), "no hits in /org\n");
+    // The closed folder itself is closed for names too.
+    assert_eq!(
+        code(&search(&f, &["a", "/org/private", "--names"], &deny)),
+        2
+    );
+}
+
+#[test]
+fn a_dropbox_zip_above_the_limit_is_refused_with_exit_2() {
+    let f = search_fake();
+    f.put("/org/notes/big.md", &vec![b'x'; 1_200_000]);
+    let o = search(
+        &f,
+        &["blood", "/org/notes"],
+        &[("ORGTHREAD_SEARCH_MB", "1")],
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        said.contains("too large") && said.contains("ORGTHREAD_SEARCH_MB"),
+        "{said}"
+    );
+    assert!(o.stdout.is_empty());
+    assert_eq!(
+        code(&search(&f, &["blood", "/org/notes"], &[])),
+        0,
+        "25 MB by default"
+    );
+    f.state.lock().unwrap().zip_too_large = true;
+    let o = search(&f, &["blood", "/org/notes"], &[]);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("too_large"));
+    let log = fs::read_to_string(f.dir.join("log")).unwrap();
+    assert_eq!(log.lines().count(), 1, "only the search that ran: {log}");
+}
+
+#[test]
+fn a_dropbox_search_of_nothing_is_6_and_of_a_file_is_2() {
+    let f = search_fake();
+    assert_eq!(code(&search(&f, &["blood", "/org/gone"], &[])), 6);
+    assert_eq!(
+        code(&search(&f, &["blood", "/org/gone", "--names"], &[])),
+        6
+    );
+    assert_eq!(code(&search(&f, &["blood", "/org/notes/plan.org"], &[])), 2);
+    assert_eq!(
+        code(&search(
+            &f,
+            &["blood", "/org/notes/plan.org", "--names"],
+            &[]
+        )),
+        2
+    );
+    assert_eq!(code(&search(&f, &["blood", "/org/../x"], &[])), 2);
 }

@@ -23,7 +23,7 @@ pub const START_WITHIN: Duration = Duration::from_secs(5 * 60);
 const MAX_WAITING: usize = 1000;
 
 /// A limit in bytes, from a setting in MB. A MB here is 1,000,000 bytes.
-fn limit(name: &str, default_mb: u64) -> Result<u64, String> {
+pub(crate) fn limit(name: &str, default_mb: u64) -> Result<u64, String> {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()

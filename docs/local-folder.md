@@ -110,7 +110,7 @@ A rule alone does not stop an agent. So give it a rule, and take the other ways 
 Write a file `CLAUDE.md` in the notes folder:
 
 ```
-Read and write files in this folder only with the orgthread tools: read, write, patch, list. Never edit them directly.
+Read and write files in this folder only with the orgthread tools: read, write, patch, list, search. Never edit them directly.
 Give the full path of each file. Use the name `claude-code` as `who`.
 ```
 
@@ -150,6 +150,6 @@ Commit again at the end of each day. To see what changed since the last commit, 
 
 ## What is different from the server
 
-- The local door has no `download` and `upload`. It gives `read`, `write`, `patch`, `delete`, `copy`, `move`, `list` and `version`. `delete` works only in the folders of `ORGTHREAD_DELETE_ALLOW`, and keeps the last version in `state/versions` first. `copy` also reads the bytes of the source, so a picture with no extension stays out of the folders that are closed to such files. So does `move`. A `move` puts a hard link at the new name and then removes the old name, so Dropbox may see a new file and a deleted one, not a move. The way back from a move is a move back: `orgthread move <new> <old> --who <name>`. These tools work on text only.
+- The local door has no `download` and `upload`. It gives `read`, `write`, `patch`, `delete`, `copy`, `move`, `list`, `search` and `version`. `delete` works only in the folders of `ORGTHREAD_DELETE_ALLOW`, and keeps the last version in `state/versions` first. `copy` also reads the bytes of the source, so a picture with no extension stays out of the folders that are closed to such files. So does `move`. A `move` puts a hard link at the new name and then removes the old name, so Dropbox may see a new file and a deleted one, not a move. The way back from a move is a move back: `orgthread move <new> <old> --who <name>`. These tools work on text only.
 - `orgthread watch` shows the diff of each write. For this, each write keeps a copy of the old and the new text for 30 days in `state/versions`, beside the program. That folder is not in your notes and not in git. Delete it if the copies must not stay on the Mac.
 - The log is `state/writes.log`, beside the program.

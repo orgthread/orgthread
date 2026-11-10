@@ -9,6 +9,7 @@ orgthread read <file> --who <name>
 orgthread write <file> --who <name>   < the whole new text
 orgthread patch <file> --who <name>   < only the changes, as JSON
 orgthread list <folder>...
+orgthread search <text> <folder> --who <name>
 orgthread download <file> --who <name> --to <copy>
 orgthread upload <file> --who <name>  < any file
 orgthread delete <file> --who <name>
@@ -18,6 +19,8 @@ orgthread watch
 ```
 
 To see what a folder holds, list it: `orgthread list notes tasks` shows each folder as a group, with the size, the time and the name of each entry, as `ls` does. `ls` is a short form of `list`. It goes one level down, and `--depth 3` or `--depth all` goes deeper. Names that start with a dot stay out, unless you add `--all`. Paths that the limits close stay out too, and read-only ones get a mark. With `--fingerprint`, each file also shows its fingerprint, the content hash that Dropbox reports. With Dropbox it costs nothing more. With a local folder, it reads each file.
+
+To find a text, search a folder: `orgthread search "blood pressure" notes --who me` gives each line that holds it, as `notes/log.md:14: the line`, in the files of that folder and of all its folders. Case does not count, and the text is plain text. `--names` matches only the names of files and folders. An answer shows 100 hits, or up to `--max 1000`, and a last line says how many more were found. The rules of `list` hold: closed paths stay out, read-only hits get a mark, names that start with a dot stay out unless `--all`, and files that are not text are skipped for content. The log line `searched` names the folder and the number of files with a hit, never the text. With Dropbox, a content search fetches the folder as one zip, in memory only, up to `ORGTHREAD_SEARCH_MB`, 25 MB by default, and it refuses a folder that holds a closed path.
 
 To change a file, read it first with the same name. A new file needs no read. orgthread remembers what each name read, and it refuses a write when the file changed since.
 
@@ -56,7 +59,7 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 
 ## MCP
 
-Two MCP servers give the same read, write, patch, delete, copy, move and list to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
+Two MCP servers give the same read, write, patch, delete, copy, move, list and search to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
 
 To set up the local door on a Mac with a plain folder, such as `~/notes`, with no Dropbox and no server, follow [docs/local-folder.md](docs/local-folder.md).
 

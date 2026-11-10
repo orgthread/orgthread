@@ -27,13 +27,19 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
 | | `fingerprint` | Optional: `true` also shows the fingerprint of each file. The default is `false` |
+| `search` | `text` | The text to find, on one line. Plain text, and case does not count |
+| | `folder` | The full path of the folder. Its folders are searched too |
+| | `who` | The name of this chat, the same one each time |
+| | `names` | Optional: `true` matches only the names of files and folders. The default is `false` |
+| | `max` | Optional: the most hits to show, from 1 to 1000. The default is 100. A number in text, such as `"20"`, works too |
+| | `all` | Optional: `true` also searches the names that start with a dot. The default is `false` |
 | `download` | `files` | A list of 1 to 25 full paths of files. Remote server only |
 | | `who` | The name of this chat, the same one each time |
 | `upload` | `files` | A list of 1 to 25 full paths, where the files will go. Remote server only |
 | | `who` | The name of this chat, the same one each time |
 | `version` | | No fields |
 
-The fields of `read` and `write` are all required, `file` and `who` of `patch` and `delete`, and `pairs` and `who` of `copy` and `move`, with `from` and `to` in each pair. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
+The fields of `read` and `write` are all required, `file` and `who` of `patch` and `delete`, `pairs` and `who` of `copy` and `move`, with `from` and `to` in each pair, and `text`, `folder` and `who` of `search`. With the local folder, `file` and each folder must lie inside `ORGTHREAD_ROOT`. With Dropbox, they start at the root of the Dropbox: `/org/a.md`, or `org/a.md` as the log and `orgthread watch` show it. Both name the same file. A list may name the root itself: `/`.
 
 `read` gives the exact text of the file, and notes what this name read.
 
@@ -88,6 +94,18 @@ A task that may send the same patch twice, for example after a lost answer, puts
 - With `fingerprint` set to `true`, each line gets the fingerprint of the file before its name: the content hash that Dropbox reports, 64 hex signs. It is the same as `orgthread fingerprint` gives. A folder shows `-`. With Dropbox, the fingerprint comes with the list, so it costs no more web calls. With a local folder, the server reads each file for it, so a large folder takes longer. A task can compare it with the fingerprint from an earlier run, to find the files that changed, and read only those.
 
 A list notes nothing, so it needs no `who`.
+
+`search` finds a text in the files of one folder and of all its folders. It matches plain text, and case does not count. There is no regex.
+
+- A content hit is the path, the number of the line and the line: `/org/notes/a.md:14: the line`. The path is the folder as given, then the path inside it. A line longer than 300 characters is cut, with `…` at the end.
+- With `names` set to `true`, it matches only the names of files and folders, and a hit is the path alone. A folder ends with `/`. Pictures and PDFs are found this way too.
+- An answer shows 100 hits, or up to `max`. When more were found, the last line says how many are left out: `1118 more hits not shown: search a smaller folder or a longer text`. There is no next page.
+- No hit is no refusal: the answer is `no hits in` and the folder, with exit code 0.
+- The rules of `list` hold: a closed path stays out, a hit in a read-only path gets `(read only)` at the end of its line, and names that start with a dot stay out, with all they hold, unless `all` is `true`. A file that is not text, such as a picture or a PDF, is skipped for content. A folder is always needed.
+- The hits come in the order of their paths, and capitals do not count. The lines of one file stay in their order.
+- With a local folder, each file is read at the time of the search. A file above `ORGTHREAD_SEARCH_MB`, 25 MB by default, is skipped.
+- With Dropbox, a content search fetches the folder as one zip, with one call. The zip stays in the memory of that one command for the time of the search, and never goes to the disk. A zip above `ORGTHREAD_SEARCH_MB` is refused with code 2: search a smaller folder. A content search of a folder that holds a closed path, such as `/`, is refused with code 2 too, as the zip would bring the closed files into memory. With `names`, the server lists the folder and fetches no file, so that works for such a folder.
+- The log gets one line `searched`, with the folder, the name of the chat, and the number of files with a hit in the size field. The search text and the hits never go to the log or to any file, as a search text can be health data. They go only to the chat that asked.
 
 `delete` removes one file, and only the version that this name saw:
 
@@ -163,7 +181,7 @@ curl -sS -T p088-1.jpg '<link>'
 orgthread 0.2.5 (abc1234)
 door: remote
 storage: Dropbox
-tools: read, write, patch, delete, copy, move, list, download, upload, version
+tools: read, write, patch, delete, copy, move, list, search, download, upload, version
 ```
 
 - The first line is the same as `orgthread --version`. A `+` after the commit means that the build had changes not yet committed.
@@ -300,6 +318,48 @@ Reply:
 
 ```json
 {"id":6,"jsonrpc":"2.0","result":{"content":[{"text":"exit code 6\n/tmp/claude/example/notes:\n         11  2026-11-08 Sun 14:05  a.md\n          -  -                     drafts/\n\n/tmp/claude/example/notes/drafts:\n          6  2026-11-07 Sat 19:12  b.md\n\n/tmp/claude/example/tasks:\n  there is no file or folder /tmp/claude/example/tasks\n","type":"text"}],"isError":true}}
+```
+
+### `search`
+
+Here `notes/a.md` held the lines "Walk in the park" and "walk again on Sunday", and `notes/drafts/b.md` the line "A long walk".
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search","arguments":{"text":"WALK","folder":"/tmp/claude/example/notes","who":"chat a"}}}
+```
+
+Reply:
+
+```json
+{"id":8,"jsonrpc":"2.0","result":{"content":[{"text":"/tmp/claude/example/notes/a.md:1: Walk in the park\n/tmp/claude/example/notes/a.md:2: walk again on Sunday\n/tmp/claude/example/notes/drafts/b.md:1: A long walk\n","type":"text"}],"isError":false}}
+```
+
+The same search with `max` as text, as some chats send it:
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search","arguments":{"text":"walk","folder":"/tmp/claude/example/notes","who":"chat a","max":"1"}}}
+```
+
+```json
+{"id":9,"jsonrpc":"2.0","result":{"content":[{"text":"/tmp/claude/example/notes/a.md:1: Walk in the park\n2 more hits not shown: search a smaller folder or a longer text\n","type":"text"}],"isError":false}}
+```
+
+A search of the names:
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"search","arguments":{"text":"b.md","folder":"/tmp/claude/example/notes","who":"chat a","names":true}}}
+```
+
+```json
+{"id":10,"jsonrpc":"2.0","result":{"content":[{"text":"/tmp/claude/example/notes/drafts/b.md\n","type":"text"}],"isError":false}}
+```
+
+The log got one line for each search, with no text and no hit. The first:
+
+```
+2026-11-10 17:41:33Z	searched	notes	chat a	-	-	2
 ```
 
 ### `patch`

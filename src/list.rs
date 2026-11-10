@@ -82,11 +82,11 @@ struct Run<'a> {
 }
 
 /// The root has an empty path, but a message needs a name for it.
-fn named(path: &str) -> &str {
+pub(crate) fn named(path: &str) -> &str {
     if path.is_empty() { "/" } else { path }
 }
 
-fn join(path: &str, name: &str) -> String {
+pub(crate) fn join(path: &str, name: &str) -> String {
     if path.is_empty() {
         name.to_string()
     } else {
@@ -94,7 +94,7 @@ fn join(path: &str, name: &str) -> String {
     }
 }
 
-fn join_shown(shown: &str, name: &str) -> String {
+pub(crate) fn join_shown(shown: &str, name: &str) -> String {
     if shown.ends_with('/') {
         format!("{shown}{name}")
     } else {

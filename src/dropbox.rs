@@ -10,8 +10,8 @@
 //! Between writers elsewhere, Dropbox's own version check decides.
 
 use crate::storage::{
-    Copied, CopyError, Entry, Expect, Listing, LocalFolder, Moved, RemoveError, Removed, Revision,
-    Storage, WriteError, new_folders,
+    Copied, CopyError, Entry, Expect, Keep, Listing, LocalFolder, Moved, RemoveError, Removed,
+    Revision, Storage, Walked, WriteError, kept, new_folders,
 };
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -277,6 +277,95 @@ fn revisions_of(body: &[u8]) -> io::Result<Vec<Revision>> {
         .collect())
 }
 
+/// The path of an entry of a recursive `list_folder` from the listed folder, as
+/// Dropbox shows it, and true for a folder. `None` for the folder itself, a
+/// deleted entry or an odd one. `depth` is the number of parts of the listed
+/// folder: Dropbox may show their case differently than the caller gave them.
+fn deep_entry_of(v: &Value, depth: usize) -> Option<(String, bool)> {
+    let folder = match v[".tag"].as_str()? {
+        "folder" => true,
+        "file" => false,
+        _ => return None,
+    };
+    let shown = v["path_display"].as_str()?;
+    let parts: Vec<&str> = shown.trim_start_matches('/').split('/').collect();
+    if parts.len() <= depth {
+        return None;
+    }
+    Some((parts[depth..].join("/"), folder))
+}
+
+/// One page of a recursive `list_folder`: each path and whether it is a folder,
+/// the cursor, and whether more pages follow.
+type DeepPage = (Vec<(String, bool)>, String, bool);
+
+/// The entries of one page of a recursive `list_folder` answer, its cursor, and
+/// whether more pages follow.
+fn deep_page_of(body: &[u8], depth: usize) -> io::Result<DeepPage> {
+    let v: Value = serde_json::from_slice(body)?;
+    let entries = v["entries"]
+        .as_array()
+        .ok_or_else(|| failure("Dropbox gave no entries".to_string()))?
+        .iter()
+        .filter_map(|e| deep_entry_of(e, depth))
+        .collect();
+    let cursor = v["cursor"].as_str().unwrap_or_default().to_string();
+    Ok((entries, cursor, v["has_more"].as_bool().unwrap_or(false)))
+}
+
+/// Each file of the zip of `download_zip` that `keep` takes, with its path from
+/// the zipped folder. Dropbox puts the folder itself at the top of the zip, named
+/// `top`: when every entry lies in it, that part goes. The zip and each file stay
+/// in memory: nothing goes to a disk. A file above `limit` bytes is left out.
+fn zip_texts(
+    zip: &[u8],
+    top: &str,
+    limit: u64,
+    keep: Keep,
+    found: &mut dyn FnMut(&str, &[u8]),
+) -> io::Result<()> {
+    let wrong = |e: zip::result::ZipError| failure(format!("the zip of Dropbox is broken: {e}"));
+    let mut archive = zip::ZipArchive::new(io::Cursor::new(zip)).map_err(wrong)?;
+    let names = archive
+        .file_names()
+        .map(|n| n.map(|n| n.to_string()))
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(wrong)?;
+    let top = top.to_lowercase();
+    let prefix = format!("{top}/");
+    let strip = !top.is_empty()
+        && names.iter().all(|n| {
+            let n = n.to_lowercase();
+            n.starts_with(&prefix) || n == top
+        });
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(wrong)?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file
+            .name()
+            .map_err(wrong)?
+            .trim_start_matches('/')
+            .to_string();
+        // Every name starts with the top folder and a `/`: the part after it.
+        let inside = match name.split_once('/') {
+            Some((_, rest)) if strip => rest,
+            _ => name.as_str(),
+        };
+        if inside.is_empty() || !kept(inside, false, keep) || file.size() > limit {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut io::Read::take(&mut file, limit + 1), &mut bytes)?;
+        if bytes.len() as u64 > limit {
+            continue;
+        }
+        found(inside, &bytes);
+    }
+    Ok(())
+}
+
 fn summary(body: &[u8]) -> String {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -359,17 +448,20 @@ impl Dropbox {
     }
 
     fn call(&self, url: &str, headers: &[String], body: Option<&[u8]>) -> io::Result<Reply> {
-        self.call_full(url, headers, body, false)
+        self.call_full(url, headers, body, false, None)
     }
 
     /// With `result`, the reply also gives the header `Dropbox-API-Result`, on a
     /// line of its own before the status. That header never holds a newline.
+    /// With `cap`, a reply body above that many bytes stops the call, with the
+    /// error kind `FileTooLarge`, so that it never fills the memory.
     fn call_full(
         &self,
         url: &str,
         headers: &[String],
         body: Option<&[u8]>,
         result: bool,
+        cap: Option<u64>,
     ) -> io::Result<Reply> {
         let mut curl = Command::new("curl");
         let format = if result {
@@ -411,13 +503,53 @@ impl Dropbox {
                     let _ = stdin.write_all(body);
                 });
             }
-            child.wait_with_output()
+            let Some(cap) = cap else {
+                return child.wait_with_output();
+            };
+            let stderr = child.stderr.take();
+            let said = scope.spawn(move || {
+                let mut text = Vec::new();
+                if let Some(mut stderr) = stderr {
+                    let _ = io::Read::read_to_end(&mut stderr, &mut text);
+                }
+                text
+            });
+            // The status and the header come after the body: room for both.
+            let room = cap + 1024;
+            let mut stdout = Vec::new();
+            if let Some(out) = child.stdout.take() {
+                io::Read::read_to_end(&mut io::Read::take(out, room + 1), &mut stdout)?;
+            }
+            if stdout.len() as u64 > room {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    format!("Dropbox gave more than {cap} bytes"),
+                ));
+            }
+            let status = child.wait()?;
+            let stderr = said.join().unwrap_or_default();
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         })?;
         if !output.status.success() {
             let text = String::from_utf8_lossy(&output.stderr);
             return Err(failure(format!("curl failed: {}", text.trim())));
         }
-        split_reply(output.stdout, result)
+        let reply = split_reply(output.stdout, result)?;
+        if let Some(cap) = cap
+            && reply.body.len() as u64 > cap
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("Dropbox gave more than {cap} bytes"),
+            ));
+        }
+        Ok(reply)
     }
 
     fn rpc(&self, endpoint: &str, arg: &Value) -> io::Result<Reply> {
@@ -446,7 +578,7 @@ impl Dropbox {
             "Dropbox-API-Arg: {}",
             ascii_json(&json!({ "path": full }))
         )];
-        let reply = self.call_full(&url, &headers, None, true)?;
+        let reply = self.call_full(&url, &headers, None, true, None)?;
         match reply.status {
             200 => {
                 let print = crate::fingerprint::fingerprint(&reply.body);
@@ -610,6 +742,91 @@ impl Dropbox {
 }
 
 impl Storage for Dropbox {
+    /// One recursive `list_folder` and its pages. No byte of a file comes.
+    fn names(
+        &self,
+        folder: &str,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, bool),
+    ) -> io::Result<Walked> {
+        let full = if folder.is_empty() {
+            String::new()
+        } else {
+            Self::file(folder)
+        };
+        let depth = if folder.is_empty() {
+            0
+        } else {
+            folder.split('/').count()
+        };
+        let arg = json!({ "path": full, "recursive": true, "include_deleted": false });
+        let mut reply = self.rpc("list_folder", &arg)?;
+        if reply.status == 409 {
+            let text = summary(&reply.body);
+            if text.contains("not_found") {
+                return Ok(Walked::Missing);
+            }
+            if text.contains("not_folder") {
+                return Ok(Walked::NotFolder);
+            }
+        }
+        loop {
+            if reply.status != 200 {
+                return Err(refused(&reply));
+            }
+            let (entries, cursor, more) = deep_page_of(&reply.body, depth)?;
+            for (inside, is_folder) in entries {
+                if kept(&inside, is_folder, keep) {
+                    found(&inside, is_folder);
+                }
+            }
+            if !more {
+                return Ok(Walked::Done);
+            }
+            reply = self.rpc("list_folder/continue", &json!({ "cursor": cursor }))?;
+        }
+    }
+
+    /// One `download_zip` of the folder, held in memory only, and refused above
+    /// `limit` bytes. Each file of the zip is read, and gone again after `found`.
+    fn texts(
+        &self,
+        folder: &str,
+        limit: u64,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, &[u8]),
+    ) -> io::Result<Walked> {
+        let url = format!("{}/2/files/download_zip", self.content);
+        let headers = [format!(
+            "Dropbox-API-Arg: {}",
+            ascii_json(&json!({ "path": Self::file(folder) }))
+        )];
+        let reply = self.call_full(&url, &headers, None, false, Some(limit))?;
+        match reply.status {
+            200 => {}
+            409 => {
+                let text = summary(&reply.body);
+                if text.contains("not_found") {
+                    return Ok(Walked::Missing);
+                }
+                if text.contains("not_folder") {
+                    return Ok(Walked::NotFolder);
+                }
+                if text.contains("too_large") || text.contains("too_many_files") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        format!("Dropbox cannot zip it: {text}"),
+                    ));
+                }
+                return Err(refused(&reply));
+            }
+            _ => return Err(refused(&reply)),
+        }
+        let top = folder.rsplit('/').next().unwrap_or(folder);
+        zip_texts(&reply.body, top, limit, keep, found)?;
+        Ok(Walked::Done)
+    }
+
     fn list(&self, path: &str, max: usize) -> io::Result<Listing> {
         // Dropbox names its root with an empty path.
         let full = if path.is_empty() {
@@ -1185,6 +1402,103 @@ mod tests {
         let folder = br#"{"metadata":{".tag":"folder","name":"b"}}"#;
         assert_eq!(made_of(folder), Err("folder".into()));
         assert_eq!(made_of(b"not json"), Err("nothing".into()));
+    }
+
+    /// A zip as `download_zip` gives it, with the files packed by deflate.
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+        let mut out = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in files {
+            if name.ends_with('/') {
+                out.add_directory(*name, options).unwrap();
+            } else {
+                out.start_file(*name, options).unwrap();
+                out.write_all(bytes).unwrap();
+            }
+        }
+        out.finish().unwrap().into_inner()
+    }
+
+    fn texts_of(zip: &[u8], top: &str, limit: u64, keep: Keep) -> Vec<(String, Vec<u8>)> {
+        let mut seen = Vec::new();
+        zip_texts(zip, top, limit, keep, &mut |p, b| {
+            seen.push((p.to_string(), b.to_vec()))
+        })
+        .unwrap();
+        seen
+    }
+
+    #[test]
+    fn a_zip_gives_each_file_from_the_zipped_folder() {
+        let zip = zip_of(&[
+            ("Health/", b""),
+            ("Health/log.md", b"blood pressure\n"),
+            ("Health/old/", b""),
+            ("Health/old/a.md", b"old"),
+            ("Health/.hidden/b.md", b"b"),
+        ]);
+        let all = |_: &str, _: bool| true;
+        let seen = texts_of(&zip, "health", 100, &all);
+        assert_eq!(
+            seen,
+            vec![
+                ("log.md".to_string(), b"blood pressure\n".to_vec()),
+                ("old/a.md".to_string(), b"old".to_vec()),
+                (".hidden/b.md".to_string(), b"b".to_vec()),
+            ]
+        );
+        // A folder that keep refuses leaves out what it holds.
+        let no_dots = |p: &str, _: bool| !p.rsplit('/').next().unwrap_or(p).starts_with('.');
+        let seen = texts_of(&zip, "health", 100, &no_dots);
+        assert_eq!(seen.len(), 2);
+        // A file above the limit stays out.
+        let seen = texts_of(&zip, "health", 5, &all);
+        assert_eq!(seen.len(), 2, "log.md has 15 bytes");
+    }
+
+    #[test]
+    fn a_zip_with_no_top_folder_keeps_its_names() {
+        let zip = zip_of(&[("log.md", b"x"), ("notes/a.md", b"y")]);
+        let all = |_: &str, _: bool| true;
+        let names: Vec<String> = texts_of(&zip, "notes", 100, &all)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(names, ["log.md", "notes/a.md"]);
+    }
+
+    #[test]
+    fn a_broken_zip_is_a_failure() {
+        let all = |_: &str, _: bool| true;
+        let e = zip_texts(b"not a zip", "x", 100, &all, &mut |_, _| {}).unwrap_err();
+        assert!(e.to_string().contains("broken"), "{e}");
+    }
+
+    #[test]
+    fn a_recursive_entry_is_named_from_the_listed_folder() {
+        let entry = |v: Value| deep_entry_of(&v, 2);
+        assert_eq!(
+            entry(json!({".tag": "file", "path_display": "/Org/Notes/Drafts/C.md"})),
+            Some(("Drafts/C.md".to_string(), false))
+        );
+        assert_eq!(
+            entry(json!({".tag": "folder", "path_display": "/Org/Notes/Drafts"})),
+            Some(("Drafts".to_string(), true))
+        );
+        assert_eq!(
+            entry(json!({".tag": "folder", "path_display": "/Org/Notes"})),
+            None
+        );
+        assert_eq!(
+            entry(json!({".tag": "deleted", "path_display": "/Org/Notes/x"})),
+            None
+        );
+        assert_eq!(
+            deep_entry_of(&json!({".tag": "file", "path_display": "/a.md"}), 0),
+            Some(("a.md".to_string(), false))
+        );
     }
 
     #[test]

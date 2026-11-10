@@ -42,3 +42,37 @@ fn the_history_of_a_test_file_gives_its_versions_and_limit() {
     let (status, text) = dropbox.probe_revisions(&file, 100).unwrap();
     println!("list_revisions, limit 100: {status} {text}");
 }
+
+/// That `download_zip` names each file from the zipped folder, so a search
+/// shows the right paths. It prints only counts, never a name or a line:
+/// `ORGTHREAD_LIVE_FOLDER=<folder from the root, with no closed path> live_dropbox --ignored --nocapture`
+#[test]
+#[ignore]
+fn a_zip_of_a_test_folder_names_each_file_from_that_folder() {
+    let folder = std::env::var("ORGTHREAD_LIVE_FOLDER").expect("ORGTHREAD_LIVE_FOLDER");
+    let dropbox = Dropbox::new(Path::new("live-check-locks")).expect("a Dropbox link");
+    let all = |_: &str, _: bool| true;
+    let mut zipped = Vec::new();
+    dropbox
+        .texts(&folder, 25_000_000, &all, &mut |path, _| {
+            zipped.push(path.to_string())
+        })
+        .expect("the zip of the folder");
+    let mut listed = Vec::new();
+    dropbox
+        .names(&folder, &all, &mut |path, folder| {
+            if !folder {
+                listed.push(path.to_string());
+            }
+        })
+        .expect("the list of the folder");
+    zipped.sort();
+    listed.sort();
+    println!(
+        "download_zip: {} files, list_folder: {} files",
+        zipped.len(),
+        listed.len()
+    );
+    // A plain assert, so that a failure shows no name either.
+    assert!(zipped == listed, "the zip and the list give other paths");
+}

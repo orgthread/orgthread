@@ -5,6 +5,7 @@
 //! refusal are the ones of the command.
 
 use crate::login::{Login, Refused};
+use crate::search;
 use crate::transfer::{self, Direction, Links, Taken};
 use crate::write::exit;
 use serde_json::{Value, json};
@@ -477,6 +478,40 @@ fn tools(remote: bool) -> Value {
                 "required": ["folders"],
             },
         },
+        {
+            "name": "search",
+            "description": "Finds a text in the files of one folder and all its folders. Plain \
+                text, case ignored. A hit is path:line: text, with the line cut at 300 \
+                characters. With names, it matches only the names of files and folders, and a \
+                hit is the path. 100 hits by default, max up to 1000, and the last line says \
+                how many more were found. Closed paths stay out, read-only hits are marked \
+                (read only), names that start with a dot are skipped, and files that are not \
+                text are skipped for content. No hits gives the answer \"no hits in\" and the \
+                folder.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The text to find, on one line"},
+                    "folder": {"type": "string", "description": "The full path of the folder. On a server, from the root of the Dropbox: /org/notes"},
+                    "names": {
+                        "type": "boolean",
+                        "description": "true matches only the names of files and folders",
+                    },
+                    "max": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": search::MOST,
+                        "description": "The most hits to show, from 1 to 1000: 100 by default",
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "true also searches the names that start with a dot",
+                    },
+                    "who": who,
+                },
+                "required": ["text", "folder", "who"],
+            },
+        },
     ]});
     if let Some(list) = tools["tools"].as_array_mut() {
         if remote {
@@ -717,6 +752,11 @@ fn call(params: &Value, exe: &Path, remote: Option<&Remote>) -> Result<Value, (i
         }
         Some("copy") => return run_pairs(params, exe, "copy", MAX_FILES),
         Some("move") => return run_pairs(params, exe, "move", MAX_MOVES),
+        Some("search") => {
+            let owned = search_args(params)?;
+            let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+            return Ok(result(name, start(exe, &args, None)));
+        }
         Some("list") => {
             let owned = list_args(params)?;
             let args: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -838,6 +878,46 @@ fn list_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
             .ok_or_else(|| wrong("each folder as text"))?;
         args.push(folder.to_string());
     }
+    Ok(args)
+}
+
+/// The command line of a search. The text and the folder come after `--`, so a
+/// text named like an option stays the text. `max` may come as a number or as a
+/// number in text, as some chats send every number as text. The messages never
+/// repeat the text.
+fn search_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
+    let wrong = |what: &str| (INVALID_PARAMS, format!("search needs {what}"));
+    let arguments = &params["arguments"];
+    let text_of = |key: &str| {
+        arguments[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| wrong(&format!("{key}, as text")))
+    };
+    let (text, folder, who) = (text_of("text")?, text_of("folder")?, text_of("who")?);
+    let mut args = vec!["search".to_string(), "--who".to_string(), who];
+    let most = search::MOST;
+    let max = match &arguments["max"] {
+        Value::Null => None,
+        Value::Number(n) => n.as_u64(),
+        Value::String(n) => n.trim().trim_matches('"').parse::<u64>().ok(),
+        _ => return Err(wrong(&format!("max as a number from 1 to {most}"))),
+    };
+    match (&arguments["max"], max) {
+        (Value::Null, _) => {}
+        (_, Some(n)) if (1..=most as u64).contains(&n) => {
+            args.extend(["--max".into(), n.to_string()]);
+        }
+        _ => return Err(wrong(&format!("max as a number from 1 to {most}"))),
+    }
+    for flag in ["names", "all"] {
+        match &arguments[flag] {
+            Value::Null | Value::Bool(false) => {}
+            Value::Bool(true) => args.push(format!("--{flag}")),
+            _ => return Err(wrong(&format!("{flag} as true or false"))),
+        }
+    }
+    args.extend(["--".into(), text, folder]);
     Ok(args)
 }
 

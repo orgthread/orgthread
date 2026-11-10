@@ -128,7 +128,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn it_greets_and_offers_the_eight_tools() {
+fn it_greets_and_offers_the_nine_tools() {
     let place = Place::new();
     let mut server = place.serve();
     let hello = server.ask("initialize", json!({"protocolVersion": "2025-03-26"}));
@@ -145,10 +145,14 @@ fn it_greets_and_offers_the_eight_tools() {
     assert_eq!(
         names,
         [
-            "read", "write", "patch", "delete", "copy", "move", "list", "version"
+            "read", "write", "patch", "delete", "copy", "move", "list", "search", "version"
         ]
     );
-    assert_eq!(tools[7]["inputSchema"]["properties"], json!({}));
+    assert_eq!(tools[8]["inputSchema"]["properties"], json!({}));
+    assert_eq!(
+        tools[7]["inputSchema"]["required"],
+        json!(["text", "folder", "who"])
+    );
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["file", "who"]));
     assert_eq!(
         tools[1]["inputSchema"]["required"],
@@ -186,7 +190,7 @@ fn the_version_tool_names_the_build_the_door_the_storage_and_the_tools() {
     let (text, refused) = server.tool("version", json!({}));
     assert!(!refused, "{text}");
     let want = format!(
-        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, copy, move, list, version\n",
+        "orgthread {}\ndoor: local\nstorage: local folder\ntools: read, write, patch, delete, copy, move, list, search, version\n",
         orgthread::VERSION
     );
     assert_eq!(text, want);
@@ -864,4 +868,105 @@ fn the_move_tool_takes_100_pairs_and_refuses_101() {
     }
     assert!(place.root.join("org/notes/100.md").exists());
     assert!(!place.root.join("x").exists());
+}
+
+/// Three invented notes with a hit each, for the search tool.
+fn search_place() -> (Place, String) {
+    let place = Place::new();
+    let notes = place.root.join("org/notes");
+    for (name, text) in [
+        ("a.md", "Blood pressure: 120/80\n"),
+        ("b.md", "blood pressure again\n"),
+        ("c.org", "* TODO blood pressure\n"),
+    ] {
+        fs::write(notes.join(name), text).unwrap();
+    }
+    let notes = notes.to_str().unwrap().to_string();
+    (place, notes)
+}
+
+#[test]
+fn the_search_tool_gives_the_text_of_the_command() {
+    let (place, notes) = search_place();
+    let mut server = place.serve();
+    let (said, refused) = server.tool(
+        "search",
+        json!({"text": "BLOOD", "folder": notes, "who": "chat"}),
+    );
+    assert!(!refused, "{said}");
+    let command = place
+        .command(&["search", "BLOOD", &notes, "--who", "chat"])
+        .output()
+        .unwrap();
+    assert_eq!(said, String::from_utf8(command.stdout).unwrap());
+    assert!(
+        said.starts_with(&format!("{notes}/a.md:1: Blood pressure: 120/80\n")),
+        "{said}"
+    );
+    let (said, _) = server.tool(
+        "search",
+        json!({"text": "c.ORG", "folder": notes, "who": "chat", "names": true}),
+    );
+    assert_eq!(said, format!("{notes}/c.org\n"));
+    let (said, refused) = server.tool(
+        "search",
+        json!({"text": "garden", "folder": notes, "who": "chat"}),
+    );
+    assert!(!refused);
+    assert_eq!(said, format!("no hits in {notes}\n"));
+    // The log has the folder and the number of files, never the text.
+    let log = fs::read_to_string(place.log()).unwrap();
+    assert!(!log.to_lowercase().contains("blood"), "{log}");
+    assert!(
+        log.contains("\tsearched\torg/notes\tchat\t-\t-\t3\n"),
+        "{log}"
+    );
+}
+
+#[test]
+fn the_search_tool_takes_max_as_a_number_or_as_text() {
+    let (place, notes) = search_place();
+    let mut server = place.serve();
+    let rest = "2 more hits not shown: search a smaller folder or a longer text\n";
+    for max in [json!(1), json!("1"), json!(" 1 ")] {
+        let (said, refused) = server.tool(
+            "search",
+            json!({"text": "blood", "folder": notes, "who": "chat", "max": max}),
+        );
+        assert!(!refused, "{max}: {said}");
+        assert_eq!(said.lines().count(), 2, "{max}: {said}");
+        assert!(said.ends_with(rest), "{max}: {said}");
+    }
+}
+
+#[test]
+fn wrong_search_fields_get_an_error_and_the_server_goes_on() {
+    let (place, notes) = search_place();
+    let mut server = place.serve();
+    for arguments in [
+        json!({"folder": notes, "who": "chat"}),
+        json!({"text": "blood", "who": "chat"}),
+        json!({"text": "blood", "folder": notes}),
+        json!({"text": 7, "folder": notes, "who": "chat"}),
+        json!({"text": "blood", "folder": notes, "who": "chat", "max": 0}),
+        json!({"text": "blood", "folder": notes, "who": "chat", "max": 1001}),
+        json!({"text": "blood", "folder": notes, "who": "chat", "max": "many"}),
+        json!({"text": "blood", "folder": notes, "who": "chat", "max": 1.5}),
+        json!({"text": "blood", "folder": notes, "who": "chat", "names": "yes"}),
+        json!({"text": "blood", "folder": notes, "who": "chat", "all": 1}),
+    ] {
+        let answer = server.ask(
+            "tools/call",
+            json!({"name": "search", "arguments": arguments}),
+        );
+        assert_eq!(answer["error"]["code"], -32602, "{arguments}");
+        assert!(!answer.to_string().contains("blood"), "{answer}");
+    }
+    // A text named like an option stays the text, and the server still answers.
+    let (said, refused) = server.tool(
+        "search",
+        json!({"text": "--help", "folder": notes, "who": "chat"}),
+    );
+    assert!(!refused, "{said}");
+    assert_eq!(said, format!("no hits in {notes}\n"));
 }

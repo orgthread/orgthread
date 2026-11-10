@@ -229,6 +229,35 @@ pub fn kind(dropbox: bool) -> &'static str {
     if dropbox { "Dropbox" } else { "local folder" }
 }
 
+/// How a walk of a folder for a search began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Walked {
+    /// The folder was there, and the walk went through it.
+    Done,
+    /// Nothing is at the path.
+    Missing,
+    /// The path names a file, and a search needs a folder.
+    NotFolder,
+}
+
+/// The test of a walk: a path from the walked folder, and true for a folder.
+/// False leaves the path out. For a folder, the walk may also leave out all it holds.
+pub type Keep<'a> = &'a dyn Fn(&str, bool) -> bool;
+
+/// True when `keep` takes `path` and each folder around it, inside the walked
+/// folder. A walk that cannot leave a folder out, such as a zip, asks this.
+pub fn kept(path: &str, folder: bool, keep: Keep) -> bool {
+    let mut end = 0;
+    while let Some(i) = path[end..].find('/') {
+        end += i;
+        if !keep(&path[..end], true) {
+            return false;
+        }
+        end += 1;
+    }
+    keep(path, folder)
+}
+
 pub trait Storage {
     /// The bytes of a file, or `None` when it does not exist.
     fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>>;
@@ -342,6 +371,41 @@ pub trait Storage {
             Some(bytes) => out.write_all(&bytes).map(|()| true),
             None => Ok(false),
         }
+    }
+
+    /// Each file and folder under `folder`, at any depth, that `keep` takes. The
+    /// path given to `found` is from `folder`, and true marks a folder. `folder`
+    /// is from the root, and empty for the root itself.
+    fn names(
+        &self,
+        folder: &str,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, bool),
+    ) -> io::Result<Walked> {
+        let _ = (folder, keep, found);
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "this storage cannot search a folder",
+        ))
+    }
+
+    /// The bytes of each file under `folder`, at any depth, that `keep` takes, one
+    /// file at a time. The path given to `found` is from `folder`. `limit` is the
+    /// most bytes to hold: a storage that fetches the whole folder at once refuses
+    /// a folder above it, with the error kind `FileTooLarge`. A storage that reads
+    /// one file at a time skips a file above it. Nothing goes to a disk.
+    fn texts(
+        &self,
+        folder: &str,
+        limit: u64,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, &[u8]),
+    ) -> io::Result<Walked> {
+        let _ = (folder, limit, keep, found);
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "this storage cannot search a folder",
+        ))
     }
 }
 
@@ -460,6 +524,63 @@ impl LocalFolder {
     }
 }
 
+impl LocalFolder {
+    /// The start of a walk: whether `folder` is a folder.
+    fn walk_start(&self, folder: &str) -> io::Result<Walked> {
+        match fs::metadata(self.full(folder)) {
+            Ok(meta) if meta.is_dir() => Ok(Walked::Done),
+            Ok(_) => Ok(Walked::NotFolder),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Walked::Missing),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Each entry under `folder` that `keep` takes, in the order of the names,
+    /// with its full path on the disk. A folder that `keep` refuses is not
+    /// entered. A link is left out, so a walk never leaves the root or runs in
+    /// a loop. A name that is not valid UTF-8 is left out too.
+    fn walk(
+        &self,
+        folder: &str,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, &Path, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut todo = vec![String::new()];
+        while let Some(inside) = todo.pop() {
+            let dir = self.full(folder).join(&inside);
+            let mut items = Vec::new();
+            for item in fs::read_dir(&dir)? {
+                let item = item?;
+                let Some(name) = item.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let kind = item.file_type()?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                items.push((name, kind.is_dir()));
+            }
+            items.sort();
+            // The folders go on the stack in reverse, so the first name comes first.
+            for (name, is_dir) in items.iter().rev() {
+                let path = if inside.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{inside}/{name}")
+                };
+                if !keep(&path, *is_dir) {
+                    continue;
+                }
+                found(&path, &dir.join(name), *is_dir)?;
+                if *is_dir {
+                    todo.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Storage for LocalFolder {
     fn exists(&self, path: &str) -> io::Result<bool> {
         match fs::symlink_metadata(self.full(path)) {
@@ -489,6 +610,54 @@ impl Storage for LocalFolder {
         };
         io::copy(&mut file, out)?;
         Ok(true)
+    }
+
+    fn names(
+        &self,
+        folder: &str,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, bool),
+    ) -> io::Result<Walked> {
+        let start = self.walk_start(folder)?;
+        if start == Walked::Done {
+            self.walk(folder, keep, &mut |path, _, is_dir| {
+                found(path, is_dir);
+                Ok(())
+            })?;
+        }
+        Ok(start)
+    }
+
+    /// Each file is read at the time of the search, and gone again after `found`.
+    fn texts(
+        &self,
+        folder: &str,
+        limit: u64,
+        keep: Keep,
+        found: &mut dyn FnMut(&str, &[u8]),
+    ) -> io::Result<Walked> {
+        let start = self.walk_start(folder)?;
+        if start == Walked::Done {
+            self.walk(folder, keep, &mut |path, full, is_dir| {
+                if is_dir {
+                    return Ok(());
+                }
+                match fs::metadata(full) {
+                    Ok(meta) if meta.len() > limit => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+                match fs::read(full) {
+                    Ok(bytes) => found(path, &bytes),
+                    // Gone since the folder was read: nothing to search.
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                Ok(())
+            })?;
+        }
+        Ok(start)
     }
 
     fn list(&self, path: &str, _max: usize) -> io::Result<Listing> {
