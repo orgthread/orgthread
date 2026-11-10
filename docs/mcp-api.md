@@ -24,7 +24,7 @@ The tools of both MCP servers, their refusals, and examples. To start a server a
 | `move` | `pairs` | A list of 1 to 100 pairs. Each pair has `from`, the full path of the file, and `to`, the full path of its new name. An optional `fingerprint` is the version the file must have |
 | | `who` | The name of this chat, the same one each time |
 | `list` | `folders` | A list of full paths of folders, at least one |
-| | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1 |
+| | `depth` | Optional: how many levels down, a number from 1, or `"all"`. The default is 1. A number in text, such as `"2"`, works too |
 | | `all` | Optional: `true` also shows the names that start with a dot. The default is `false` |
 | | `fingerprint` | Optional: `true` also shows the fingerprint of each file. The default is `false` |
 | `search` | `text` | The text to find, on one line. Plain text, and case does not count |

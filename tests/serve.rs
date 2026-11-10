@@ -970,3 +970,39 @@ fn wrong_search_fields_get_an_error_and_the_server_goes_on() {
     assert!(!refused, "{said}");
     assert_eq!(said, format!("no hits in {notes}\n"));
 }
+
+#[test]
+fn the_list_tool_takes_depth_as_a_number_as_text_or_all() {
+    let place = Place::new();
+    fs::create_dir_all(place.root.join("org/notes/drafts/old")).unwrap();
+    fs::write(place.root.join("org/notes/drafts/c.md"), "c").unwrap();
+    fs::write(place.root.join("org/notes/drafts/old/d.md"), "d").unwrap();
+    let notes = place.root.join("org/notes");
+    let notes = notes.to_str().unwrap();
+    let mut server = place.serve();
+    // Some chats send each number as text, or the word with its quotes in the text.
+    for depth in [json!(2), json!("2"), json!(" 2 "), json!(2.0)] {
+        let (said, refused) = server.tool("list", json!({"folders": [notes], "depth": depth}));
+        assert!(!refused, "{depth}: {said}");
+        assert!(said.contains("  c.md\n"), "{depth}: {said}");
+        assert!(
+            !said.contains("d.md"),
+            "{depth} goes two levels only: {said}"
+        );
+    }
+    for depth in [json!("all"), json!("\"all\"")] {
+        let (said, refused) = server.tool("list", json!({"folders": [notes], "depth": depth}));
+        assert!(!refused, "{depth}: {said}");
+        assert!(
+            said.contains("  d.md\n"),
+            "{depth} goes to the bottom: {said}"
+        );
+    }
+    for depth in [json!(0), json!("0"), json!(1.5), json!("deep"), json!(true)] {
+        let answer = server.ask(
+            "tools/call",
+            json!({"name": "list", "arguments": {"folders": [notes], "depth": depth}}),
+        );
+        assert_eq!(answer["error"]["code"], -32602, "{depth}");
+    }
+}

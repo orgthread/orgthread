@@ -853,13 +853,14 @@ fn list_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
         .filter(|f| !f.is_empty())
         .ok_or_else(|| wrong("folders, as a list of paths"))?;
     let mut args = vec!["list".to_string()];
-    match &arguments["depth"] {
-        Value::Null => {}
-        Value::String(all) if all == "all" => args.extend(["--depth".into(), "all".into()]),
-        Value::Number(n) if n.as_u64().is_some_and(|n| n >= 1) => {
-            args.extend(["--depth".into(), n.to_string()]);
+    if !arguments["depth"].is_null() {
+        match loose(&arguments["depth"]).as_deref() {
+            Some("all") => args.extend(["--depth".into(), "all".into()]),
+            Some(n) if n.parse::<u64>().is_ok_and(|n| n >= 1) => {
+                args.extend(["--depth".into(), n.to_string()]);
+            }
+            _ => return Err(wrong("depth as a number from 1, or \"all\"")),
         }
-        _ => return Err(wrong("depth as a number from 1, or \"all\"")),
     }
     match &arguments["all"] {
         Value::Null | Value::Bool(false) => {}
@@ -881,10 +882,25 @@ fn list_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
     Ok(args)
 }
 
+/// The plain value of a field that holds a number or a word, such as `depth`
+/// or `max`. Some chats send every number as text, `"2"`, or put the JSON of
+/// the value in the text, with its quotes: `"\"all\""`. Both count as the plain
+/// value. A whole number may also come as `2.0`. `None` for any other kind.
+fn loose(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(n) => n.as_u64().map(|n| n.to_string()).or_else(|| {
+            n.as_f64()
+                .filter(|f| f.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(f))
+                .map(|f| (f as u64).to_string())
+        }),
+        Value::String(text) => Some(text.trim().trim_matches('"').trim().to_string()),
+        _ => None,
+    }
+}
+
 /// The command line of a search. The text and the folder come after `--`, so a
 /// text named like an option stays the text. `max` may come as a number or as a
-/// number in text, as some chats send every number as text. The messages never
-/// repeat the text.
+/// number in text, through `loose`. The messages never repeat the text.
 fn search_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
     let wrong = |what: &str| (INVALID_PARAMS, format!("search needs {what}"));
     let arguments = &params["arguments"];
@@ -897,18 +913,13 @@ fn search_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
     let (text, folder, who) = (text_of("text")?, text_of("folder")?, text_of("who")?);
     let mut args = vec!["search".to_string(), "--who".to_string(), who];
     let most = search::MOST;
-    let max = match &arguments["max"] {
-        Value::Null => None,
-        Value::Number(n) => n.as_u64(),
-        Value::String(n) => n.trim().trim_matches('"').parse::<u64>().ok(),
-        _ => return Err(wrong(&format!("max as a number from 1 to {most}"))),
-    };
-    match (&arguments["max"], max) {
-        (Value::Null, _) => {}
-        (_, Some(n)) if (1..=most as u64).contains(&n) => {
-            args.extend(["--max".into(), n.to_string()]);
+    if !arguments["max"].is_null() {
+        match loose(&arguments["max"]).and_then(|n| n.parse::<u64>().ok()) {
+            Some(n) if (1..=most as u64).contains(&n) => {
+                args.extend(["--max".into(), n.to_string()]);
+            }
+            _ => return Err(wrong(&format!("max as a number from 1 to {most}"))),
         }
-        _ => return Err(wrong(&format!("max as a number from 1 to {most}"))),
     }
     for flag in ["names", "all"] {
         match &arguments[flag] {
