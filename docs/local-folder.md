@@ -137,7 +137,7 @@ A deny holds in every permission mode. Claude Code reads the file when a session
 
 ## 7. Keep a safety net
 
-orgthread has no undo command yet. So keep the notes folder in git:
+`orgthread watch` can undo one change: choose the newest write or patch of a file, press `r`, read the question, and press `y`. It writes the text from before that change back, only if the file is still as the change left it. The undo needs the copy of the old text in `state/versions`, so it works for 30 days. An agent cannot undo: only a key press in `watch` does. New files, deletes and moves have no undo there. So keep the notes folder in git too:
 
 ```
 cd ~/notes
@@ -151,5 +151,5 @@ Commit again at the end of each day. To see what changed since the last commit, 
 ## What is different from the server
 
 - The local door has no `download` and `upload`. It gives `read`, `write`, `patch`, `delete`, `copy`, `move`, `list`, `search` and `version`. `delete` works only in the folders of `ORGTHREAD_DELETE_ALLOW`, and keeps the last version in `state/versions` first. `copy` also reads the bytes of the source, so a picture with no extension stays out of the folders that are closed to such files. So does `move`. A `move` puts a hard link at the new name and then removes the old name, so Dropbox may see a new file and a deleted one, not a move. The way back from a move is a move back: `orgthread move <new> <old> --who <name>`. These tools work on text only.
-- `orgthread watch` shows the diff of each write. For this, each write keeps a copy of the old and the new text for 30 days in `state/versions`, beside the program. That folder is not in your notes and not in git. Delete it if the copies must not stay on the Mac.
+- `orgthread watch` shows the diff of each write, and `r` reverts the newest one. For this, each write keeps a copy of the old and the new text for 30 days in `state/versions`, beside the program. On the server, both come from the Dropbox history. That folder is not in your notes and not in git. Delete it if the copies must not stay on the Mac.
 - The log is `state/writes.log`, beside the program.
