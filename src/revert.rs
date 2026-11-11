@@ -269,6 +269,11 @@ pub fn revert(
 /// never goes stale while the screen stays open for hours.
 pub type OpenStorage = Arc<dyn Fn() -> Result<Box<dyn Storage>, String> + Send + Sync>;
 
+/// The limits of the door for a write, as `write::check_limits` gives them from
+/// `ORGTHREAD_ALLOW`, `ORGTHREAD_DENY` and `ORGTHREAD_READ_ONLY`. A revert is a
+/// write, so the same limits hold.
+pub type WriteLimits = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 /// What the screen calls on `y`.
 pub struct Reverter {
     open: OpenStorage,
@@ -280,6 +285,7 @@ pub struct Reverter {
     /// On a server the revert runs in a thread of its own, so that the screen
     /// never freezes. On the Mac it is one fast local write.
     background: bool,
+    limits: WriteLimits,
 }
 
 impl Reverter {
@@ -296,12 +302,30 @@ impl Reverter {
             log,
             versions,
             background,
+            limits: Arc::new(|_| Ok(())),
         }
+    }
+
+    /// The limits of the door. Without this call, every path is open.
+    pub fn with_limits(mut self, limits: WriteLimits) -> Reverter {
+        self.limits = limits;
+        self
+    }
+
+    /// The limits for `path`, with the words for the screen on a refusal.
+    pub fn check(&self, path: &str) -> Result<(), String> {
+        (self.limits)(path).map_err(|reason| format!("{reason}. {CANCELLED}"))
     }
 
     /// Starts one revert. The answer comes through the channel.
     pub fn start(&self, plan: Plan) -> mpsc::Receiver<Result<String, String>> {
         let (send, receive) = mpsc::channel();
+        // Checked again here, before the lock: a refused revert changes nothing
+        // and writes no log line.
+        if let Err(text) = self.check(&plan.path) {
+            let _ = send.send(Err(text));
+            return receive;
+        }
         let open = Arc::clone(&self.open);
         let log = self.log.clone();
         let who = self.who.clone();

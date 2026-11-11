@@ -137,7 +137,7 @@ A deny holds in every permission mode. Claude Code reads the file when a session
 
 ## 7. Keep a safety net
 
-`orgthread watch` can undo one change: choose the newest write or patch of a file, press `r`, read the question, and press `y`. It writes the text from before that change back, only if the file is still as the change left it. The undo needs the copy of the old text in `state/versions`, so it works for 30 days. An agent cannot undo: only a key press in `watch` does. New files, deletes and moves have no undo there. So keep the notes folder in git too:
+`orgthread watch` can undo one change: choose the newest write or patch of a file, press `r`, read the question, and press `y`. It writes the text from before that change back, only if the file is still as the change left it. The undo is a write, so the settings of step 3 hold for it too: a file under `ORGTHREAD_READ_ONLY` or `ORGTHREAD_DENY` gets no undo. The undo needs the copy of the old text in `state/versions`, so it works for 30 days. An agent cannot undo: only a key press in `watch` does. New files, deletes and moves have no undo there. So keep the notes folder in git too:
 
 ```
 cd ~/notes

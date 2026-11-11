@@ -888,6 +888,12 @@ impl Watch {
         if !revert::can_revert(entry) {
             return;
         }
+        // A revert is a write: the limits of the door hold, as for any write.
+        if let Some(reverter) = &self.reverter
+            && let Err(text) = reverter.check(&entry.path)
+        {
+            return self.say(&text, false);
+        }
         if revert::newer(entries, i).is_some() {
             return self.say(revert::NEWER, false);
         }
@@ -1875,6 +1881,114 @@ mod tests {
                     true,
                 )))
             }
+        }
+
+        /// The Mac, with the limits of a door: the lists of `ORGTHREAD_ALLOW`,
+        /// `ORGTHREAD_DENY` and `ORGTHREAD_READ_ONLY`.
+        fn limited(place: &Place, allow: &str, deny: &str, read_only: &str) -> Reverter {
+            let (allow, deny, read_only) =
+                (allow.to_string(), deny.to_string(), read_only.to_string());
+            Reverter::new(
+                place.open(),
+                WHO.to_string(),
+                place.log(),
+                Some(place.versions()),
+                false,
+            )
+            .with_limits(Arc::new(move |path: &str| {
+                crate::write::check_limits(path, true, &allow, &deny, &read_only)
+            }))
+        }
+
+        /// r on a path the door may not write: the refusal, and no question,
+        /// no write and no log line.
+        fn refused(name: &str, allow: &str, deny: &str, read_only: &str, words: &str) {
+            let place = Place::new(name);
+            place.add("patched", PATH, OLD, NEW);
+            let log = place.log_text();
+            let snap = place.snap();
+            let diffs = place.kept();
+            let mut w = Watch::new(Some(limited(&place, allow, deny, read_only)));
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            let screen = shown(&w, &snap);
+            assert!(!screen.contains("Revert this change?"), "{screen}");
+            let text = format!("{PATH} {words}. Nothing changed.");
+            assert!(screen.contains(&text), "{screen}");
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert_eq!(place.file(), NEW);
+            assert_eq!(place.log_text(), log, "no log line");
+        }
+
+        #[test]
+        fn r_on_a_read_only_path_is_refused() {
+            refused(
+                "read-only",
+                "",
+                "",
+                "org/notes",
+                "is read only for this door",
+            );
+        }
+
+        #[test]
+        fn r_on_a_closed_path_is_refused() {
+            refused("deny", "", "Org/Notes", "", "is closed to this door");
+        }
+
+        #[test]
+        fn r_outside_the_allowed_folders_is_refused() {
+            refused(
+                "allow",
+                "org/tasks",
+                "",
+                "",
+                "is outside the folders this door may touch",
+            );
+        }
+
+        #[test]
+        fn r_then_y_on_an_open_path_still_reverts_with_limits_set() {
+            let place = Place::new("open");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            let diffs = place.kept();
+            let mut w = Watch::new(Some(limited(&place, "org", "org/private", "org/tasks")));
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(shown(&w, &snap).contains("Revert this change?"));
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert_eq!(place.file(), OLD);
+            is_reverted_back(&place, OLD.len());
+        }
+
+        #[test]
+        fn the_write_checks_the_limits_again_before_the_lock() {
+            // The limits may close between r and y; the write itself checks too.
+            let place = Place::new("again");
+            place.add("patched", PATH, OLD, NEW);
+            let log = place.log_text();
+            let plan = rv::Plan {
+                path: PATH.to_string(),
+                before: fingerprint(OLD.as_bytes()),
+                after: fingerprint(NEW.as_bytes()),
+                old: OLD.as_bytes().to_vec(),
+            };
+            let answer = limited(&place, "", "", "org").start(plan).recv().unwrap();
+            assert_eq!(
+                answer,
+                Err(format!(
+                    "{PATH} is read only for this door. Nothing changed."
+                ))
+            );
+            assert_eq!(place.file(), NEW);
+            assert_eq!(place.log_text(), log, "no log line");
+            assert!(
+                !place
+                    .root()
+                    .join(".locks")
+                    .read_dir()
+                    .unwrap()
+                    .any(|_| true)
+            );
         }
 
         fn dropbox(fake: Fake) -> Diffs {

@@ -954,12 +954,23 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
     // Only the owner's r and y in this screen revert. A server keeps no copies
     // and writes in the background, so the screen never freezes.
     let who = orgthread::revert::who_of(env::var(orgthread::revert::OWNER).ok().as_deref())?;
+    // A revert is a write, so the limits of the door hold for it too.
+    let var = |name: &str| env::var(name).unwrap_or_default();
+    let (allow, deny, read_only) = (
+        var("ORGTHREAD_ALLOW"),
+        var("ORGTHREAD_DENY"),
+        var("ORGTHREAD_READ_ONLY"),
+    );
+    let limits: orgthread::revert::WriteLimits = std::sync::Arc::new(move |path: &str| {
+        write::check_limits(path, true, &allow, &deny, &read_only)
+    });
     let reverter = if settings.dropbox {
         let locks = locks.clone();
         let open: orgthread::revert::OpenStorage = std::sync::Arc::new(move || {
             Dropbox::new(&locks).map(|d| Box::new(d) as Box<dyn Storage>)
         });
         orgthread::revert::Reverter::new(open, who, settings.log.clone(), None, true)
+            .with_limits(limits)
     } else {
         let (root, locks) = (settings.root.clone(), locks.clone());
         let open: orgthread::revert::OpenStorage = std::sync::Arc::new(move || {
@@ -972,6 +983,7 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
             Some(settings.versions.clone()),
             false,
         )
+        .with_limits(limits)
     };
     let result = match args {
         [] => {
