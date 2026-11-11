@@ -1,7 +1,10 @@
-//! The read-only terminal screen: `orgthread watch`. It draws what `watch.rs`
-//! reads, and it has no way to change a file.
+//! The terminal screen: `orgthread watch`. It draws what `watch.rs` reads. It
+//! changes a file in one way only: `r`, then `y`, reverts the newest change of
+//! a file, through `revert.rs`.
 
+use crate::fingerprint::fingerprint;
 use crate::history::{self, Job, Remote, Step};
+use crate::revert::{self, Plan, Reverter};
 use crate::versions::Versions;
 use crate::watch::{self, Entry, Row, Snapshot, snapshot};
 use ratatui::Frame;
@@ -58,37 +61,71 @@ fn head_line(info: &Info) -> Line<'static> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled(title(info), bold),
-        Span::raw("   read only   ?: help"),
+        Span::raw("   r, then y: revert   ?: help"),
     ])
 }
 
-/// Which line is chosen. `None` follows the newest line, and a number stays on
-/// the same entry while new ones arrive.
+/// Which line is chosen. `None` follows the newest line. A chosen line is kept
+/// by its time, path, fingerprints and the rest of its fields, never by its
+/// place in the list, so neither a new line nor the end of the log window
+/// moves the choice to another line.
 #[derive(Default)]
-pub struct Choice(Option<usize>);
+pub struct Choice(Option<Pick>);
+
+struct Pick {
+    entry: Entry,
+    /// How many equal lines come before it, the oldest first.
+    nth: usize,
+}
 
 impl Choice {
+    /// The index of the chosen line in a list with the oldest first. A chosen
+    /// line that left the part of the log that is read gives the newest.
+    fn index(&self, entries: &[Entry]) -> Option<usize> {
+        let newest = entries.len().checked_sub(1)?;
+        let Some(pick) = &self.0 else {
+            return Some(newest);
+        };
+        let found = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e == pick.entry)
+            .nth(pick.nth);
+        Some(found.map_or(newest, |(i, _)| i))
+    }
+
     /// The place on the screen, where 0 is the newest line.
-    fn place(&self, count: usize) -> usize {
-        match self.0 {
-            Some(i) if i < count => count - 1 - i,
-            _ => 0,
+    fn place(&self, entries: &[Entry]) -> usize {
+        self.index(entries).map_or(0, |i| entries.len() - 1 - i)
+    }
+
+    /// Chooses the line at `index` and stays on it, also when it is the newest.
+    fn pin(&mut self, index: usize, entries: &[Entry]) {
+        self.0 = entries.get(index).map(|entry| Pick {
+            nth: entries[..index].iter().filter(|e| *e == entry).count(),
+            entry: entry.clone(),
+        });
+    }
+
+    fn set_place(&mut self, place: usize, entries: &[Entry]) {
+        let count = entries.len();
+        if place == 0 || place >= count {
+            self.0 = None;
+        } else {
+            self.pin(count - 1 - place, entries);
         }
     }
 
-    fn set_place(&mut self, place: usize, count: usize) {
-        self.0 = (place > 0 && place < count).then(|| count - 1 - place);
-    }
-
     /// Applies one key. True means quit.
-    pub fn key(&mut self, code: KeyCode, ctrl: bool, count: usize) -> bool {
-        let place = self.place(count);
+    pub fn key(&mut self, code: KeyCode, ctrl: bool, entries: &[Entry]) -> bool {
+        let count = entries.len();
+        let place = self.place(entries);
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('c') if ctrl => return true,
-            KeyCode::Up | KeyCode::Char('k') => self.set_place(place.saturating_sub(1), count),
+            KeyCode::Up | KeyCode::Char('k') => self.set_place(place.saturating_sub(1), entries),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.set_place((place + 1).min(count.saturating_sub(1)), count);
+                self.set_place((place + 1).min(count.saturating_sub(1)), entries);
             }
             KeyCode::Home | KeyCode::Char('g') => self.0 = None,
             _ => {}
@@ -236,19 +273,41 @@ fn row_of(entry: &Entry, width: usize) -> String {
 }
 
 pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice, info: &Info) {
+    draw_with(frame, snap, choice, info, None);
+}
+
+/// The keys of the main screen, for its last line. A narrow one gets fewer.
+fn list_keys(width: u16) -> &'static str {
+    if width >= 80 {
+        "up, down: line  h, l: same file  enter: diff  r: revert  ?: help  q: quit"
+    } else {
+        "up, down: line  enter: diff  ?: help  q: quit"
+    }
+}
+
+/// The main screen. `foot` takes the place of the keys on the last lines: a
+/// question, a wait or an answer.
+fn draw_with(
+    frame: &mut Frame,
+    snap: &Snapshot,
+    choice: &Choice,
+    info: &Info,
+    foot: Option<Vec<Line<'static>>>,
+) {
     let width = usize::from(frame.area().width.saturating_sub(2));
+    let foot = foot.unwrap_or_else(|| vec![Line::raw(list_keys(frame.area().width))]);
     let top = top_lines(snap, width);
     let count = snap.entries.len();
-    let place = choice.place(count);
+    let place = choice.place(&snap.entries);
     let chosen = snap.entries.iter().rev().nth(place);
     let detail = chosen.map_or_else(Vec::new, |e| details(e, width));
 
-    let [head, locks, list, below, foot] = Layout::vertical([
+    let [head, locks, list, below, foot_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length((top.len() as u16 + 2).min(10)),
         Constraint::Min(4),
         Constraint::Length(detail.len() as u16 + 2),
-        Constraint::Length(1),
+        Constraint::Length(foot.len() as u16),
     ])
     .areas(frame.area());
 
@@ -285,10 +344,7 @@ pub fn draw(frame: &mut Frame, snap: &Snapshot, choice: &Choice, info: &Info) {
         Paragraph::new(detail).block(Block::bordered().title("Chosen line")),
         below,
     );
-    frame.render_widget(
-        Line::raw("up, down: line  enter: diff  ?: help  q: quit"),
-        foot,
-    );
+    frame.render_widget(Paragraph::new(foot), foot_area);
 }
 
 /// The steps of a fetch that runs in the background.
@@ -450,11 +506,29 @@ fn diff_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
 }
 
 pub fn draw_diff(frame: &mut Frame, view: &DiffView, info: &Info) {
+    draw_diff_with(frame, view, info, None);
+}
+
+fn diff_keys(width: u16) -> &'static str {
+    if width >= 80 {
+        "up, down: scroll   h, l: same file   r: revert   Esc: back   ?: help   q: quit"
+    } else {
+        "up, down: scroll   Esc: back   ?: help   q: quit"
+    }
+}
+
+fn draw_diff_with(
+    frame: &mut Frame,
+    view: &DiffView,
+    info: &Info,
+    foot: Option<Vec<Line<'static>>>,
+) {
     let width = usize::from(frame.area().width.saturating_sub(2));
-    let [head, body, foot] = Layout::vertical([
+    let foot = foot.unwrap_or_else(|| vec![Line::raw(diff_keys(frame.area().width))]);
+    let [head, body, foot_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(foot.len() as u16),
     ])
     .areas(frame.area());
     let lines: Vec<Line> = match &view.body {
@@ -472,10 +546,7 @@ pub fn draw_diff(frame: &mut Frame, view: &DiffView, info: &Info) {
         Paragraph::new(shown).block(Block::bordered().title(view.title.clone())),
         body,
     );
-    frame.render_widget(
-        Line::raw("up, down: scroll   Esc: back   ?: help   q: quit"),
-        foot,
-    );
+    frame.render_widget(Paragraph::new(foot), foot_area);
 }
 
 /// The wait screen: the headline with a spinner and the seconds, then the steps.
@@ -508,13 +579,26 @@ fn wait_lines(wait: &Wait, now: Instant, width: usize) -> Vec<Line<'static>> {
 
 /// The keys of the screen, as `Watch::key`, `Choice::key` and `DiffView::key`
 /// read them.
-const KEYS: [(&str, &str); 9] = [
+const KEYS: [(&str, &str); 13] = [
     ("Up, k", "one line up, or scroll up in a diff"),
     ("Down, j", "one line down, or scroll down in a diff"),
     ("Home, g", "the newest line, or the top of a diff"),
     ("End, G", "the end of a diff"),
     ("PgUp, PgDn", "a page up or down in a diff, also Space"),
     ("Enter", "what changed in the chosen write"),
+    (
+        "h, Left",
+        "the next older change of the same file, also in a diff",
+    ),
+    (
+        "l, Right",
+        "the next newer change of the same file, also in a diff",
+    ),
+    ("r", "revert the chosen change, after a question"),
+    (
+        "y",
+        "yes, revert. Any other key cancels, and nothing changes",
+    ),
     ("Esc", "back from a diff, or close this help"),
     ("?", "open or close this help"),
     ("q, Ctrl+C", "quit"),
@@ -542,11 +626,12 @@ fn help_lines(info: &Info, width: usize) -> Vec<Line<'static>> {
     }
     lines.push(Line::raw(""));
     if info.dropbox {
-        let text = "On Dropbox, Enter gets the two versions of a write from the Dropbox history, in the background. Esc goes back at once. The versions stay in memory only, up to 25 MB, and are gone when watch quits.";
+        let text = "On Dropbox, Enter and r get the versions of a write from the Dropbox history, in the background. Esc goes back at once. The versions stay in memory only, up to 25 MB, and are gone when watch quits.";
         lines.extend(plain(text, width, Style::new()));
         lines.push(Line::raw(""));
     }
-    lines.push(Line::raw("The screen only reads. It cannot change a file."));
+    let text = "r works only on the newest change of a file with a before and an after: a write, a patch or a revert. After y, it writes the text from before that change, only if the file is still as the change left it. The log gets a reverted line, and r on it brings the change back.";
+    lines.extend(plain(text, width, Style::new()));
     lines
 }
 
@@ -569,15 +654,82 @@ pub fn draw_help(frame: &mut Frame, info: &Info) {
     );
 }
 
+/// A revert on its way: the old text from the Dropbox history, the question,
+/// or the write.
+enum Pending {
+    /// On Dropbox, the texts come from the history before the question.
+    Fetching {
+        entry: Box<Entry>,
+        job: Job,
+        steps_in: Receiver<Step>,
+        started: Instant,
+    },
+    /// The question waits for `y`.
+    Asking { plan: Plan, line: String },
+    /// The write runs, in the background on Dropbox.
+    Writing {
+        answer_in: Receiver<Result<String, String>>,
+        started: Instant,
+    },
+}
+
+/// A short answer on the last line, until the next key.
+struct Note {
+    text: String,
+    good: bool,
+}
+
 /// All that the screen holds between two keys.
-#[derive(Default)]
 pub struct Watch {
     choice: Choice,
     open: Option<DiffView>,
     help: bool,
+    /// `None` on a screen that cannot revert, as in a test of the drawing.
+    reverter: Option<Reverter>,
+    pending: Option<Pending>,
+    note: Option<Note>,
+    /// The zone of the times in the question.
+    zone: jiff::tz::TimeZone,
+}
+
+impl Default for Watch {
+    fn default() -> Watch {
+        Watch::new(None)
+    }
+}
+
+/// Why the old text of a revert did not come from the Dropbox history.
+fn fetch_refusal(job: &Job, text: &str) -> String {
+    if text == job.gone(true, true) || text == job.gone(true, false) {
+        revert::NO_COPY.to_string()
+    } else if text == job.gone(false, true) {
+        // The text after the change is the file now, unless it changed since.
+        revert::CHANGED.to_string()
+    } else {
+        format!("{text} Nothing changed.")
+    }
 }
 
 impl Watch {
+    pub fn new(reverter: Option<Reverter>) -> Watch {
+        Watch {
+            choice: Choice::default(),
+            open: None,
+            help: false,
+            reverter,
+            pending: None,
+            note: None,
+            zone: jiff::tz::TimeZone::system(),
+        }
+    }
+
+    fn say(&mut self, text: &str, good: bool) {
+        self.note = Some(Note {
+            text: text.to_string(),
+            good,
+        });
+    }
+
     /// Applies one key. True means quit.
     pub fn key(&mut self, code: KeyCode, ctrl: bool, snap: &Snapshot, diffs: &Diffs) -> bool {
         if code == KeyCode::Char('q') || (ctrl && code == KeyCode::Char('c')) {
@@ -589,41 +741,286 @@ impl Watch {
             }
             return false;
         }
-        if code == KeyCode::Char('?') {
-            self.help = true;
-        } else if let Some(view) = &mut self.open {
-            if code == KeyCode::Enter && view.retry {
-                self.open = Some(DiffView::open(&view.entry.clone(), diffs));
-            } else if view.key(code) {
-                // Back at once, also during a wait: the fetch goes on alone.
-                self.open = None;
+        // A question takes the next key: only y reverts, every other key cancels.
+        match self.pending.take() {
+            Some(Pending::Asking { plan, .. }) => {
+                if code == KeyCode::Char('y') {
+                    self.write(plan);
+                } else {
+                    self.say(revert::CANCELLED, false);
+                }
+                return false;
             }
-        } else if code == KeyCode::Enter {
-            let place = self.choice.place(snap.entries.len());
-            if let Some(entry) = snap.entries.iter().rev().nth(place) {
-                self.open = Some(DiffView::open(entry, diffs));
+            Some(Pending::Fetching { .. }) => {
+                // The fetch goes on alone, into the cache, but asks nothing.
+                self.say(revert::CANCELLED, false);
+                return false;
             }
-        } else {
-            self.choice.key(code, ctrl, snap.entries.len());
+            other => self.pending = other,
+        }
+        self.note = None;
+        let entries = &snap.entries;
+        match code {
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('r') => self.ask(entries, diffs),
+            KeyCode::Char('h') | KeyCode::Left => self.walk(true, entries, diffs),
+            KeyCode::Char('l') | KeyCode::Right => self.walk(false, entries, diffs),
+            _ => {
+                if let Some(view) = &mut self.open {
+                    if code == KeyCode::Enter && view.retry {
+                        self.open = Some(DiffView::open(&view.entry.clone(), diffs));
+                    } else if view.key(code) {
+                        // Back at once, also during a wait: the fetch goes on alone.
+                        self.open = None;
+                    }
+                } else if code == KeyCode::Enter {
+                    if let Some(i) = self.choice.index(entries) {
+                        // The diff and r name the same line, whatever arrives.
+                        self.choice.pin(i, entries);
+                        self.open = Some(DiffView::open(&entries[i], diffs));
+                    }
+                } else {
+                    self.choice.key(code, ctrl, entries);
+                }
+            }
         }
         false
     }
 
-    /// Takes in what a fetch in the background told. True while one runs.
+    /// `h` and `l`: the next older or newer change of the same path, in the
+    /// list and in an open diff. At both ends the choice stays.
+    fn walk(&mut self, older: bool, entries: &[Entry], diffs: &Diffs) {
+        let Some(i) = self.choice.index(entries) else {
+            return;
+        };
+        let next = if older {
+            revert::older(entries, i)
+        } else {
+            revert::newer(entries, i)
+        };
+        match next {
+            Some(j) => {
+                self.choice.pin(j, entries);
+                if self.open.is_some() {
+                    self.open = Some(DiffView::open(&entries[j], diffs));
+                }
+            }
+            None if older => self.say(revert::NO_OLDER, false),
+            None => self.say(revert::NO_NEWER, false),
+        }
+    }
+
+    /// `r`: the checks, then the old text, then the question. Nothing changes
+    /// before `y`.
+    fn ask(&mut self, entries: &[Entry], diffs: &Diffs) {
+        if matches!(self.pending, Some(Pending::Writing { .. })) {
+            return self.say(revert::BUSY, false);
+        }
+        let Some(i) = self.choice.index(entries) else {
+            return;
+        };
+        let entry = &entries[i];
+        // A new file, a delete, a refusal: r does nothing.
+        if !revert::can_revert(entry) {
+            return;
+        }
+        if revert::newer(entries, i).is_some() {
+            return self.say(revert::NEWER, false);
+        }
+        match diffs {
+            Diffs::Kept(versions) => {
+                let old = match versions.load(&entry.before) {
+                    Ok(Some(bytes))
+                        if versions.keeps_copies() && fingerprint(&bytes) == entry.before =>
+                    {
+                        bytes
+                    }
+                    Ok(_) => return self.say(revert::NO_COPY, false),
+                    Err(e) => {
+                        return self.say(
+                            &format!("Could not read the copy: {e}. Nothing changed."),
+                            false,
+                        );
+                    }
+                };
+                let new = versions.load(&entry.after).ok().flatten();
+                self.asking(entry, old, new.as_deref());
+            }
+            Diffs::Dropbox(remote) => {
+                let job = match Job::of(entry) {
+                    Ok(job) => job,
+                    Err(reason) => return self.say(&format!("{reason} Nothing changed."), false),
+                };
+                match remote.from_memory(&job) {
+                    Some((old, new)) => self.asking(entry, old.into_bytes(), Some(new.as_bytes())),
+                    None => {
+                        self.pending = Some(Pending::Fetching {
+                            entry: Box::new(entry.clone()),
+                            steps_in: remote.start(job.clone()),
+                            job,
+                            started: Instant::now(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn asking(&mut self, entry: &Entry, old: Vec<u8>, new: Option<&[u8]>) {
+        let counts = new.map(|new| {
+            revert::counts(
+                &String::from_utf8_lossy(&old),
+                &String::from_utf8_lossy(new),
+            )
+        });
+        let line = revert::question(entry, counts, &self.zone);
+        self.pending = Some(Pending::Asking {
+            plan: Plan {
+                path: entry.path.clone(),
+                before: entry.before.clone(),
+                after: entry.after.clone(),
+                old,
+            },
+            line,
+        });
+    }
+
+    /// `y`: the write, with its answer at once on the Mac.
+    fn write(&mut self, plan: Plan) {
+        let Some(reverter) = &self.reverter else {
+            return self.say("This screen cannot revert. Nothing changed.", false);
+        };
+        self.pending = Some(Pending::Writing {
+            answer_in: reverter.start(plan),
+            started: Instant::now(),
+        });
+        self.tick_pending(Instant::now());
+    }
+
+    /// Takes in what a revert in the background told, and stops waiting after
+    /// its limit.
+    fn tick_pending(&mut self, now: Instant) {
+        match self.pending.take() {
+            Some(Pending::Fetching {
+                entry,
+                job,
+                steps_in,
+                started,
+            }) => {
+                let mut done = None;
+                loop {
+                    match steps_in.try_recv() {
+                        Ok(Step::Done(result)) => {
+                            done = Some(result);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            done = Some(Err("The fetch stopped with no answer.".to_string()));
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(Ok((old, new))) => {
+                        self.asking(&entry, old.into_bytes(), Some(new.as_bytes()));
+                    }
+                    Some(Err(text)) => self.say(&fetch_refusal(&job, &text), false),
+                    None if now.saturating_duration_since(started) >= history::WAIT => self.say(
+                        "Dropbox did not answer in 20 seconds. Nothing changed. Press r to try again.",
+                        false,
+                    ),
+                    None => {
+                        self.pending = Some(Pending::Fetching {
+                            entry,
+                            job,
+                            steps_in,
+                            started,
+                        });
+                    }
+                }
+            }
+            Some(Pending::Writing { answer_in, started }) => match answer_in.try_recv() {
+                Ok(Ok(text)) => self.say(&text, true),
+                Ok(Err(text)) => self.say(&text, false),
+                Err(mpsc::TryRecvError::Disconnected) => self.say(
+                    "The revert stopped with no answer. The log shows what happened.",
+                    false,
+                ),
+                Err(mpsc::TryRecvError::Empty)
+                    if now.saturating_duration_since(started) >= revert::WAIT =>
+                {
+                    self.say(revert::TIMEOUT, false);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::Writing { answer_in, started });
+                }
+            },
+            other => self.pending = other,
+        }
+    }
+
+    /// Takes in what a fetch or a revert in the background told. True while
+    /// one runs.
     pub fn tick(&mut self, now: Instant) -> bool {
-        match &mut self.open {
+        self.tick_pending(now);
+        let view = match &mut self.open {
             Some(view) => {
                 view.tick(now);
                 view.waiting()
             }
             None => false,
-        }
+        };
+        view || matches!(
+            self.pending,
+            Some(Pending::Fetching { .. } | Pending::Writing { .. })
+        )
+    }
+
+    /// The last lines in place of the keys: the question, a wait or an answer.
+    fn foot(&self, width: u16, now: Instant) -> Option<Vec<Line<'static>>> {
+        let width = usize::from(width);
+        let spin = |started: &Instant| {
+            let gone = now.saturating_duration_since(*started);
+            let sign = SPINNER[(gone.as_millis() / SPIN.as_millis()) as usize % SPINNER.len()];
+            (sign, gone.as_secs())
+        };
+        let lines = match &self.pending {
+            Some(Pending::Asking { line, .. }) => plain(
+                line,
+                width,
+                Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ),
+            Some(Pending::Fetching { started, .. }) => {
+                let (sign, secs) = spin(started);
+                let text = format!(
+                    "{sign} Getting the old version from the Dropbox history   {secs} s   any key: cancel"
+                );
+                plain(&text, width, Style::new())
+            }
+            Some(Pending::Writing { started, .. }) => {
+                let (sign, secs) = spin(started);
+                let mut lines = plain(&format!("{sign} Reverting   {secs} s"), width, Style::new());
+                if let Some(note) = &self.note {
+                    lines.extend(plain(&note.text, width, Style::new().fg(ORANGE)));
+                }
+                lines
+            }
+            None => {
+                let note = self.note.as_ref()?;
+                let color = if note.good { BLUE } else { ORANGE };
+                plain(&note.text, width, Style::new().fg(color))
+            }
+        };
+        Some(lines)
     }
 
     pub fn draw(&self, frame: &mut Frame, snap: &Snapshot, info: &Info) {
+        let foot = self.foot(frame.area().width, Instant::now());
         match &self.open {
-            Some(view) => draw_diff(frame, view, info),
-            None => draw(frame, snap, &self.choice, info),
+            Some(view) => draw_diff_with(frame, view, info, foot),
+            None => draw_with(frame, snap, &self.choice, info, foot),
         }
         if self.help {
             draw_help(frame, info);
@@ -632,9 +1029,15 @@ impl Watch {
 }
 
 /// Runs the screen until a quit key.
-pub fn run(lock_dir: &Path, log: &Path, diffs: &Diffs, info: &Info) -> io::Result<()> {
+pub fn run(
+    lock_dir: &Path,
+    log: &Path,
+    diffs: &Diffs,
+    info: &Info,
+    reverter: Reverter,
+) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let mut watch = Watch::default();
+    let mut watch = Watch::new(Some(reverter));
     let mut snap = snapshot(lock_dir, log);
     let mut taken = Instant::now();
     let result = loop {
@@ -735,7 +1138,8 @@ mod tests {
     #[test]
     fn an_empty_screen_says_so() {
         let text = screen(&Snapshot::default(), &Choice::default());
-        assert!(text.contains("read only"));
+        assert!(!text.contains("read only"), "{text}");
+        assert!(text.contains("r, then y: revert"), "{text}");
         assert!(text.contains("none"));
         assert!(text.contains("No writes yet."));
     }
@@ -908,35 +1312,75 @@ mod tests {
         assert!(text.contains("left behind: org--notes--a.md.7.rescue"));
     }
 
+    fn three() -> Vec<Entry> {
+        vec![
+            entry("written", "a"),
+            entry("written", "b"),
+            entry("written", "c"),
+        ]
+    }
+
     #[test]
     fn the_keys_move_and_stay_inside() {
+        let list = three();
         let mut c = Choice::default();
-        assert!(!c.key(KeyCode::Up, false, 3));
-        assert_eq!(c.place(3), 0);
-        c.key(KeyCode::Down, false, 3);
-        c.key(KeyCode::Char('j'), false, 3);
-        c.key(KeyCode::Down, false, 3);
-        assert_eq!(c.place(3), 2);
-        c.key(KeyCode::Char('k'), false, 3);
-        assert_eq!(c.place(3), 1);
-        c.key(KeyCode::Home, false, 3);
-        assert_eq!(c.place(3), 0);
-        assert!(c.key(KeyCode::Char('q'), false, 3));
+        assert!(!c.key(KeyCode::Up, false, &list));
+        assert_eq!(c.place(&list), 0);
+        c.key(KeyCode::Down, false, &list);
+        c.key(KeyCode::Char('j'), false, &list);
+        c.key(KeyCode::Down, false, &list);
+        assert_eq!(c.place(&list), 2);
+        c.key(KeyCode::Char('k'), false, &list);
+        assert_eq!(c.place(&list), 1);
+        c.key(KeyCode::Home, false, &list);
+        assert_eq!(c.place(&list), 0);
+        assert!(c.key(KeyCode::Char('q'), false, &list));
         assert!(
-            !c.key(KeyCode::Esc, false, 3),
+            !c.key(KeyCode::Esc, false, &list),
             "Esc never leaves the main screen"
         );
-        assert!(c.key(KeyCode::Char('c'), true, 3));
-        assert!(!c.key(KeyCode::Char('c'), false, 3));
-        assert!(!c.key(KeyCode::Down, false, 0), "an empty list is safe");
+        assert!(c.key(KeyCode::Char('c'), true, &list));
+        assert!(!c.key(KeyCode::Char('c'), false, &list));
+        assert!(!c.key(KeyCode::Down, false, &[]), "an empty list is safe");
     }
 
     #[test]
     fn a_chosen_entry_stays_when_a_new_one_arrives() {
+        let mut list = three();
         let mut c = Choice::default();
-        c.key(KeyCode::Down, false, 3);
-        assert_eq!(c.place(3), 1);
-        assert_eq!(c.place(4), 2, "one line further down, the same entry");
+        c.key(KeyCode::Down, false, &list);
+        assert_eq!(c.place(&list), 1);
+        list.push(entry("written", "d"));
+        assert_eq!(c.place(&list), 2, "one line further down, the same entry");
+    }
+
+    #[test]
+    fn a_chosen_entry_stays_when_old_lines_leave_the_window() {
+        // The log is read from its last 256 KB: a new line pushes old ones out.
+        let mut list = three();
+        let mut c = Choice::default();
+        c.key(KeyCode::Down, false, &list);
+        let chosen = list[1].clone();
+        list.remove(0);
+        list.push(entry("written", "d"));
+        let place = c.place(&list);
+        assert_eq!(
+            list[list.len() - 1 - place],
+            chosen,
+            "the same line, at a new place"
+        );
+        // Two equal lines stay apart.
+        let twins = vec![
+            entry("written", "a"),
+            entry("written", "a"),
+            entry("written", "b"),
+        ];
+        let mut c = Choice::default();
+        c.key(KeyCode::Down, false, &twins);
+        c.key(KeyCode::Down, false, &twins);
+        assert_eq!(c.place(&twins), 2);
+        c.key(KeyCode::Up, false, &twins);
+        assert_eq!(c.place(&twins), 1);
     }
 
     #[test]
@@ -1243,6 +1687,463 @@ mod tests {
             let screen = text_of(&t);
             assert!(screen.contains("from the Dropbox"), "{screen}");
             assert!(screen.contains("25 MB"), "{screen}");
+        }
+    }
+
+    /// The rules of "What a done build shows" in the design note of the
+    /// revert, on invented files in a temporary folder.
+    mod revert {
+        use super::*;
+        use crate::fingerprint::fingerprint;
+        use crate::history::tests::Fake;
+        use crate::history::{History, Remote};
+        use crate::revert::{self as rv, OpenStorage, Reverter};
+        use crate::storage::{LocalFolder, Storage};
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+
+        const OLD: &str = "- buy apples\n- call Ana\n";
+        const NEW: &str = "- buy apples\n- call Ana\n- water the plants\n";
+        const PATH: &str = "org/notes/plan.md";
+
+        struct Place {
+            dir: PathBuf,
+        }
+
+        impl Drop for Place {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        impl Place {
+            fn new(name: &str) -> Place {
+                let dir = std::env::temp_dir().join(format!(
+                    "orgthread-screen-revert-{name}-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&dir);
+                fs::create_dir_all(dir.join("root/.locks")).unwrap();
+                fs::create_dir_all(dir.join("root/org/notes")).unwrap();
+                let place = Place { dir };
+                place.put(NEW);
+                place
+            }
+            fn root(&self) -> PathBuf {
+                self.dir.join("root")
+            }
+            fn log(&self) -> PathBuf {
+                self.dir.join("writes.log")
+            }
+            fn versions(&self) -> PathBuf {
+                self.dir.join("versions")
+            }
+            fn put(&self, text: &str) {
+                fs::write(self.root().join(PATH), text).unwrap();
+            }
+            fn file(&self) -> String {
+                fs::read_to_string(self.root().join(PATH)).unwrap()
+            }
+            fn log_text(&self) -> String {
+                fs::read_to_string(self.log()).unwrap_or_default()
+            }
+            /// A log line of a change from one text to the next. An empty
+            /// text stands for no file.
+            fn add(&self, outcome: &str, path: &str, before: &str, after: &str) {
+                let print = |t: &str| {
+                    if t.is_empty() {
+                        "-".to_string()
+                    } else {
+                        fingerprint(t.as_bytes())
+                    }
+                };
+                let line = format!(
+                    "2026-11-10 09:14:26Z\t{outcome}\t{path}\tinvented chat\t{}\t{}\t{}\n",
+                    print(before),
+                    print(after),
+                    after.len()
+                );
+                let mut log = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.log())
+                    .unwrap();
+                std::io::Write::write_all(&mut log, line.as_bytes()).unwrap();
+            }
+            fn snap(&self) -> Snapshot {
+                snapshot(&self.root().join(".locks"), &self.log())
+            }
+            fn kept(&self) -> Diffs {
+                let v = Versions::new(self.versions());
+                v.save(OLD.as_bytes()).unwrap();
+                v.save(NEW.as_bytes()).unwrap();
+                Diffs::Kept(v)
+            }
+            fn open(&self) -> OpenStorage {
+                let root = self.root();
+                Arc::new(
+                    move || Ok(Box::new(LocalFolder::new(&root, ".locks")) as Box<dyn Storage>),
+                )
+            }
+            /// The Mac: one local write, with copies for the diff screen.
+            fn mac(&self) -> Watch {
+                Watch::new(Some(Reverter::new(
+                    self.open(),
+                    self.log(),
+                    Some(self.versions()),
+                    false,
+                )))
+            }
+            /// The server: a write in the background, and no copies.
+            fn server(&self) -> Watch {
+                Watch::new(Some(Reverter::new(self.open(), self.log(), None, true)))
+            }
+        }
+
+        fn dropbox(fake: Fake) -> Diffs {
+            let fake: Arc<dyn History> = Arc::new(fake);
+            Diffs::Dropbox(Remote::new(Arc::new(move || Ok(Arc::clone(&fake)))))
+        }
+
+        fn settle(w: &mut Watch) {
+            for _ in 0..500 {
+                if !w.tick(Instant::now()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the wait never ended");
+        }
+
+        fn shown(w: &Watch, snap: &Snapshot) -> String {
+            let mut t = Terminal::new(TestBackend::new(110, 30)).unwrap();
+            t.draw(|f| w.draw(f, snap, &local())).unwrap();
+            text_of(&t)
+        }
+
+        fn last_line(place: &Place) -> Entry {
+            parse_line(place.log_text().lines().last().unwrap()).unwrap()
+        }
+
+        fn is_reverted_back(place: &Place, size: usize) {
+            let line = last_line(place);
+            assert_eq!(line.outcome, "reverted");
+            assert_eq!(line.path, PATH);
+            assert_eq!(line.who, "silviu (watch)");
+            assert_eq!(line.before, fingerprint(NEW.as_bytes()), "the old after");
+            assert_eq!(line.after, fingerprint(OLD.as_bytes()), "the old before");
+            assert_eq!(line.size, size.to_string());
+        }
+
+        #[test]
+        fn r_then_y_on_the_newest_patch_writes_the_old_text_back_on_the_mac() {
+            let place = Place::new("mac");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            // Only the old text is kept here: the size of the diff is then unknown.
+            Versions::new(place.versions())
+                .save(OLD.as_bytes())
+                .unwrap();
+            let diffs = Diffs::Kept(Versions::new(place.versions()));
+            let mut w = place.mac();
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            let screen = shown(&w, &snap);
+            assert!(
+                screen.contains(&format!("Revert {PATH} to before 2026-11-10")),
+                "{screen}"
+            );
+            assert!(screen.contains("(invented chat)? y/n"), "{screen}");
+            assert_eq!(place.file(), NEW, "nothing before y");
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert_eq!(place.file(), OLD);
+            is_reverted_back(&place, OLD.len());
+            let screen = shown(&w, &snap);
+            assert!(screen.contains(&format!("Reverted {PATH}.")), "{screen}");
+            // Both texts are kept, as with a write.
+            let v = Versions::new(place.versions());
+            assert!(v.load(&fingerprint(NEW.as_bytes())).unwrap().is_some());
+            assert!(v.load(&fingerprint(OLD.as_bytes())).unwrap().is_some());
+        }
+
+        #[test]
+        fn r_then_y_on_dropbox_gets_the_old_text_from_the_history_and_writes_it_in_the_background()
+        {
+            let place = Place::new("dropbox");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            let diffs = dropbox(Fake::with(&[OLD, NEW]));
+            let mut w = place.server();
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(w.tick(Instant::now()) || matches!(w.pending, Some(Pending::Asking { .. })));
+            settle(&mut w);
+            let screen = shown(&w, &snap);
+            assert!(screen.contains("-1 +0 lines)? y/n"), "{screen}");
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert!(
+                matches!(w.pending, Some(Pending::Writing { .. })),
+                "in the background"
+            );
+            settle(&mut w);
+            assert_eq!(place.file(), OLD);
+            is_reverted_back(&place, OLD.len());
+            assert!(
+                !place.versions().exists(),
+                "a server keeps no copy on its disk"
+            );
+            assert!(shown(&w, &snap).contains("Reverted"));
+        }
+
+        #[test]
+        fn the_question_shows_the_path_the_time_the_who_and_the_size_of_the_diff() {
+            let place = Place::new("question");
+            place.add("written", PATH, OLD, NEW);
+            let (snap, diffs) = (place.snap(), place.kept());
+            let mut w = place.mac();
+            w.zone = jiff::tz::TimeZone::get("Europe/Vienna").unwrap();
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            let screen = shown(&w, &snap);
+            assert!(
+                screen.contains(&format!(
+                    "Revert {PATH} to before 2026-11-10 10:14 (invented chat, -1 +0 lines)? y/n"
+                )),
+                "{screen}"
+            );
+        }
+
+        #[test]
+        fn r_then_n_or_esc_or_any_other_key_changes_nothing_and_logs_nothing() {
+            for key in [
+                KeyCode::Char('n'),
+                KeyCode::Esc,
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+            ] {
+                let place = Place::new("cancel");
+                place.add("patched", PATH, OLD, NEW);
+                let (snap, diffs) = (place.snap(), place.kept());
+                let before = place.log_text();
+                let mut w = place.mac();
+                w.key(KeyCode::Char('r'), false, &snap, &diffs);
+                assert!(matches!(w.pending, Some(Pending::Asking { .. })));
+                assert!(!w.key(key, false, &snap, &diffs));
+                assert!(w.pending.is_none(), "{key:?}");
+                assert!(w.open.is_none(), "{key:?} only cancels");
+                assert_eq!(place.file(), NEW, "{key:?}");
+                assert_eq!(place.log_text(), before, "{key:?}");
+                assert!(shown(&w, &snap).contains("Nothing changed."), "{key:?}");
+            }
+        }
+
+        #[test]
+        fn r_on_an_older_change_shows_the_newer_change_and_l_goes_to_it() {
+            let place = Place::new("older");
+            let third = "- water the plants\n";
+            place.add("patched", PATH, OLD, NEW);
+            place.add("patched", PATH, NEW, third);
+            place.add("written", "org/notes/other.md", "", "x\n");
+            place.put(third);
+            let (snap, diffs) = (place.snap(), place.kept());
+            let mut w = place.mac();
+            // Down twice: the older patch.
+            w.key(KeyCode::Down, false, &snap, &diffs);
+            w.key(KeyCode::Down, false, &snap, &diffs);
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(w.pending.is_none(), "no question");
+            assert!(shown(&w, &snap).contains(rv::NEWER));
+            assert_eq!(place.file(), third);
+            w.key(KeyCode::Char('l'), false, &snap, &diffs);
+            assert_eq!(w.choice.index(&snap.entries), Some(1));
+        }
+
+        #[test]
+        fn a_file_changed_outside_orgthread_is_refused_and_stays_as_it_is() {
+            for server in [false, true] {
+                let place = Place::new("outside");
+                place.add("patched", PATH, OLD, NEW);
+                let snap = place.snap();
+                let (mut w, diffs) = if server {
+                    (place.server(), dropbox(Fake::with(&[OLD, NEW])))
+                } else {
+                    (place.mac(), place.kept())
+                };
+                w.key(KeyCode::Char('r'), false, &snap, &diffs);
+                settle(&mut w);
+                // An edit by hand, or on the other door, after the question.
+                place.put("- edited by hand\n");
+                w.key(KeyCode::Char('y'), false, &snap, &diffs);
+                settle(&mut w);
+                assert_eq!(place.file(), "- edited by hand\n");
+                assert!(shown(&w, &snap).contains(rv::CHANGED), "{server}");
+                let line = last_line(&place);
+                assert_eq!(line.outcome, "changed", "a refusal is logged as one");
+                assert!(!place.log_text().contains("\treverted\t"));
+            }
+        }
+
+        #[test]
+        fn no_kept_copy_is_refused_with_its_message() {
+            let place = Place::new("nocopy");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            // The Mac, with no copy kept.
+            let empty = Diffs::Kept(Versions::new(place.versions()));
+            let mut w = place.mac();
+            w.key(KeyCode::Char('r'), false, &snap, &empty);
+            assert!(w.pending.is_none());
+            assert!(shown(&w, &snap).contains(rv::NO_COPY));
+            // A copy with a wrong text counts as none.
+            fs::create_dir_all(place.versions()).unwrap();
+            fs::write(
+                place.versions().join(fingerprint(OLD.as_bytes())),
+                "other\n",
+            )
+            .unwrap();
+            w.key(KeyCode::Char('r'), false, &snap, &empty);
+            assert!(shown(&w, &snap).contains(rv::NO_COPY));
+            // Dropbox, where the history lost the old version.
+            let mut w = place.server();
+            let gone = dropbox(Fake::with(&[NEW]));
+            w.key(KeyCode::Char('r'), false, &snap, &gone);
+            settle(&mut w);
+            assert!(w.pending.is_none());
+            assert!(shown(&w, &snap).contains(rv::NO_COPY));
+            assert_eq!(place.file(), NEW);
+            assert!(!place.log_text().contains("silviu (watch)"));
+        }
+
+        #[test]
+        fn r_on_a_reverted_line_brings_the_change_back() {
+            let place = Place::new("redo");
+            place.add("patched", PATH, OLD, NEW);
+            let diffs = place.kept();
+            let mut w = place.mac();
+            let snap = place.snap();
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert_eq!(place.file(), OLD);
+            // The new snapshot has the reverted line as the newest.
+            let snap = place.snap();
+            assert_eq!(snap.entries.last().unwrap().outcome, "reverted");
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(shown(&w, &snap).contains("silviu (watch), -0 +1 lines)? y/n"));
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert_eq!(place.file(), NEW, "the change is back");
+            let line = last_line(&place);
+            assert_eq!(line.outcome, "reverted");
+            assert_eq!(line.before, fingerprint(OLD.as_bytes()));
+            assert_eq!(line.after, fingerprint(NEW.as_bytes()));
+            assert_eq!(place.log_text().matches("\treverted\t").count(), 2);
+        }
+
+        #[test]
+        fn r_on_a_new_file_or_a_delete_does_nothing() {
+            for (outcome, before, after) in [("written", "", NEW), ("deleted", NEW, "")] {
+                let place = Place::new("nothing");
+                place.add(outcome, PATH, before, after);
+                let (snap, diffs) = (place.snap(), place.kept());
+                let log = place.log_text();
+                let mut w = place.mac();
+                let quiet = shown(&w, &snap);
+                w.key(KeyCode::Char('r'), false, &snap, &diffs);
+                assert!(w.pending.is_none() && w.note.is_none(), "{outcome}");
+                assert_eq!(shown(&w, &snap), quiet, "{outcome}");
+                assert_eq!(place.log_text(), log);
+                assert_eq!(place.file(), NEW);
+            }
+        }
+
+        #[test]
+        fn h_l_left_and_right_walk_only_one_path_and_stop_at_both_ends() {
+            let place = Place::new("walk");
+            place.add("written", "org/a.md", "", "a1\n");
+            place.add("written", "org/b.md", "", "b1\n");
+            place.add("changed", "org/a.md", "a0\n", "a1\n");
+            place.add("patched", "org/a.md", "a1\n", "a2\n");
+            place.add("written", "org/b.md", "b1\n", "b2\n");
+            let snap = place.snap();
+            let diffs = Diffs::Kept(Versions::none());
+            let mut w = place.mac();
+            let at = |w: &Watch| w.choice.index(&snap.entries).unwrap();
+            assert_eq!(at(&w), 4);
+            w.key(KeyCode::Char('h'), false, &snap, &diffs);
+            assert_eq!(at(&w), 1, "the older b, past the lines of a");
+            w.key(KeyCode::Left, false, &snap, &diffs);
+            assert_eq!(at(&w), 1, "it stops at the oldest");
+            assert!(shown(&w, &snap).contains(rv::NO_OLDER));
+            w.key(KeyCode::Right, false, &snap, &diffs);
+            assert_eq!(at(&w), 4);
+            w.key(KeyCode::Char('l'), false, &snap, &diffs);
+            assert_eq!(at(&w), 4, "it stops at the newest");
+            assert!(shown(&w, &snap).contains(rv::NO_NEWER));
+            // In an open diff, the diff follows, and the refusal is skipped.
+            w.key(KeyCode::Down, false, &snap, &diffs);
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            assert_eq!(w.open.as_ref().unwrap().entry, snap.entries[3]);
+            w.key(KeyCode::Char('h'), false, &snap, &diffs);
+            assert_eq!(w.open.as_ref().unwrap().entry, snap.entries[0]);
+            w.key(KeyCode::Left, false, &snap, &diffs);
+            assert_eq!(w.open.as_ref().unwrap().entry, snap.entries[0]);
+            w.key(KeyCode::Right, false, &snap, &diffs);
+            assert_eq!(w.open.as_ref().unwrap().entry, snap.entries[3]);
+            w.key(KeyCode::Esc, false, &snap, &diffs);
+            assert!(w.open.is_none());
+            assert_eq!(at(&w), 3, "back on the line of the diff");
+        }
+
+        #[test]
+        fn a_revert_on_dropbox_stops_waiting_after_its_time_limit() {
+            let place = Place::new("slow");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            let diffs = dropbox(Fake::with(&[OLD, NEW]));
+            let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+            let gate = Mutex::new(gate);
+            let open: OpenStorage = Arc::new(move || {
+                let _ = gate.lock().unwrap().recv();
+                Err("no answer".to_string())
+            });
+            let mut w = Watch::new(Some(Reverter::new(open, place.log(), None, true)));
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            settle(&mut w);
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert!(w.tick(Instant::now()), "the write waits at its gate");
+            assert!(shown(&w, &snap).contains("Reverting"));
+            // Keys still work while it waits.
+            w.key(KeyCode::Char('?'), false, &snap, &diffs);
+            w.key(KeyCode::Esc, false, &snap, &diffs);
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(shown(&w, &snap).contains(rv::BUSY));
+            assert!(!w.tick(Instant::now() + rv::WAIT));
+            assert!(shown(&w, &snap).contains("did not answer in 60 seconds"));
+            open_gate.send(()).unwrap();
+            assert_eq!(place.file(), NEW);
+        }
+
+        #[test]
+        fn the_head_and_the_help_say_that_r_reverts_after_y() {
+            let mut w = Watch::default();
+            let snap = Snapshot::default();
+            let head = shown(&w, &snap);
+            assert!(
+                head.lines().next().unwrap().contains("r, then y: revert"),
+                "{head}"
+            );
+            assert!(!head.contains("read only"));
+            w.key(
+                KeyCode::Char('?'),
+                false,
+                &snap,
+                &Diffs::Kept(Versions::none()),
+            );
+            let mut t = Terminal::new(TestBackend::new(72, 60)).unwrap();
+            t.draw(|f| w.draw(f, &snap, &local())).unwrap();
+            let help = text_of(&t);
+            for key in ["h, Left", "l, Right", "r ", "y "] {
+                assert!(help.contains(key), "{key}: {help}");
+            }
+            assert!(help.contains("reverted line"), "{help}");
+            assert!(!help.contains("only reads"), "{help}");
         }
     }
 }

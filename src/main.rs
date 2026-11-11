@@ -54,7 +54,7 @@ For a chat with no shell:
 
 For a person:
 
-  orgthread watch                                the read-only screen; Enter shows a diff, Esc goes back
+  orgthread watch                                the screen; Enter shows a diff, r reverts after y
   orgthread watch --once                         the same screen, as plain text
   orgthread fingerprint <file>                   the content hash Dropbox reports
   orgthread serve [--http <address>]             the MCP tools, for a chat with no shell
@@ -949,12 +949,32 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
         screen::Diffs::Kept(Versions::new(&settings.versions))
     };
     let info = screen::Info::new(settings.dropbox, &settings.log);
+    // Only the owner's r and y in this screen revert. A server keeps no copies
+    // and writes in the background, so the screen never freezes.
+    let reverter = if settings.dropbox {
+        let locks = locks.clone();
+        let open: orgthread::revert::OpenStorage = std::sync::Arc::new(move || {
+            Dropbox::new(&locks).map(|d| Box::new(d) as Box<dyn Storage>)
+        });
+        orgthread::revert::Reverter::new(open, settings.log.clone(), None, true)
+    } else {
+        let (root, locks) = (settings.root.clone(), locks.clone());
+        let open: orgthread::revert::OpenStorage = std::sync::Arc::new(move || {
+            Ok(Box::new(LocalFolder::new(&root, &locks)) as Box<dyn Storage>)
+        });
+        orgthread::revert::Reverter::new(
+            open,
+            settings.log.clone(),
+            Some(settings.versions.clone()),
+            false,
+        )
+    };
     let result = match args {
         [] => {
             if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Err("watch needs a terminal. For plain text, use watch --once".into());
             }
-            screen::run(locks, &settings.log, &diffs, &info)
+            screen::run(locks, &settings.log, &diffs, &info, reverter)
         }
         [flag] if flag == "--once" => {
             screen::once(locks, &settings.log, &info, 110, 30).map(|text| {
@@ -1824,12 +1844,7 @@ fn finish(
             // In Dropbox mode, on a server, no text may stay on the disk.
             if !settings.dropbox && !matches!(kind, Kind::Upload { binary: true }) {
                 let versions = Versions::new(&settings.versions);
-                versions.tidy();
-                let kept = match old_text {
-                    Some(old) => versions.save(old),
-                    None => Ok(()),
-                };
-                if let Err(e) = kept.and_then(|()| versions.save(new_text)) {
+                if let Err(e) = versions.keep(old_text.as_deref(), new_text) {
                     say(format!("could not keep a copy for the diff screen: {e}"));
                 }
             }

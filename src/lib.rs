@@ -20,6 +20,7 @@ pub mod login;
 pub mod mv;
 pub mod patch;
 pub mod reads;
+pub mod revert;
 pub mod screen;
 pub mod search;
 pub mod serve;

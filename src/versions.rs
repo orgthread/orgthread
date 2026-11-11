@@ -51,6 +51,10 @@ impl Versions {
         self.make_dir()?;
         let path = self.dir.join(fingerprint(bytes));
         if path.exists() {
+            // A text that comes back, as after a revert, stays 30 days from now.
+            if let Ok(file) = fs::File::options().write(true).open(&path) {
+                let _ = file.set_modified(std::time::SystemTime::now());
+            }
             return Ok(());
         }
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -58,6 +62,16 @@ impl Versions {
         fs::rename(&temp, &path).inspect_err(|_| {
             let _ = fs::remove_file(&temp);
         })
+    }
+
+    /// Keeps the old and the new text of a change, after the copies older than
+    /// 30 days are gone. A write and a revert of watch share this step.
+    pub fn keep(&self, old: Option<&[u8]>, new: &[u8]) -> io::Result<()> {
+        self.tidy();
+        if let Some(old) = old {
+            self.save(old)?;
+        }
+        self.save(new)
     }
 
     pub fn load(&self, print: &str) -> io::Result<Option<Vec<u8>>> {
@@ -136,6 +150,25 @@ mod tests {
         v.tidy();
         assert_eq!(v.load(&fingerprint(b"old")).unwrap(), None);
         assert!(v.load(&fingerprint(b"new")).unwrap().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_text_saved_again_stays_another_30_days() {
+        let dir = place("again");
+        let v = Versions::new(&dir);
+        v.save(b"back").unwrap();
+        let file = File::options()
+            .write(true)
+            .open(dir.join(fingerprint(b"back")))
+            .unwrap();
+        file.set_modified(SystemTime::now() - KEEP - Duration::from_secs(60))
+            .unwrap();
+        v.save(b"back").unwrap();
+        v.tidy();
+        assert!(v.load(&fingerprint(b"back")).unwrap().is_some());
+        v.keep(Some(b"back"), b"other").unwrap();
+        assert!(v.load(&fingerprint(b"other")).unwrap().is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,5 +1,5 @@
-//! What the read-only screen shows: the locks and the log. This part only
-//! reads, and it knows nothing about the terminal.
+//! What the screen shows: the locks and the log. This part only reads, and it
+//! knows nothing about the terminal. The revert is in `revert.rs`.
 
 use crate::versions::Versions;
 use similar::{ChangeTag, TextDiff};
@@ -192,9 +192,9 @@ pub fn ago(time: &str) -> String {
     }
 }
 
-/// True for an outcome that wrote what was asked.
+/// True for an outcome that wrote a new text: a write, a patch or a revert.
 pub fn is_written(outcome: &str) -> bool {
-    outcome == "written" || outcome == "patched"
+    outcome == "written" || outcome == "patched" || outcome == crate::revert::WORD
 }
 
 /// The reason in plain words, for this entry: a delete, a copy and a move have
@@ -291,6 +291,9 @@ pub fn why(outcome: &str) -> &'static str {
         "changed" => "The file changed after this chat read it. Nothing was written.",
         "exists" => "A new file was asked for, but a file is there. Nothing was written.",
         "missing" => "This chat expected a file, but none is there. Nothing was written.",
+        "reverted" => {
+            "The file got its text from before an earlier change back, after r and y in watch. Every byte matches. r on this line brings that change back."
+        }
         "restored" => "The check after the write failed. The old state is back.",
         "not-restored" => "The check failed and the old state is NOT back. Look at this file now.",
         "failed" => "The write failed, and the file is unchanged.",
@@ -541,6 +544,27 @@ mod tests {
         let e = diff_of(&written("-", "abc"), &Versions::none()).unwrap_err();
         assert!(e.contains("keeps no copies"), "{e}");
         assert!(!e.contains("30 days"), "{e}");
+    }
+
+    #[test]
+    fn a_reverted_line_says_why_and_has_a_diff() {
+        use crate::fingerprint::fingerprint;
+        let e = parse_line("2026-11-11 08:00:00Z\treverted\torg/a.md\tsilviu (watch)\tbb\taa\t3")
+            .unwrap();
+        assert!(why_of(&e).contains("r on this line brings that change back"));
+        assert_ne!(
+            why("reverted"),
+            why("restored"),
+            "restored stays the rollback"
+        );
+        let dir = std::env::temp_dir().join(format!("orgthread-reverted-{}", std::process::id()));
+        let v = Versions::new(&dir);
+        v.save(b"new\n").unwrap();
+        v.save(b"old\n").unwrap();
+        let mut e = written(&fingerprint(b"new\n"), &fingerprint(b"old\n"));
+        e.outcome = "reverted".into();
+        assert!(diff_of(&e, &v).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
