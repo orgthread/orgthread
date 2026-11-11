@@ -1706,6 +1706,8 @@ mod tests {
         const OLD: &str = "- buy apples\n- call Ana\n";
         const NEW: &str = "- buy apples\n- call Ana\n- water the plants\n";
         const PATH: &str = "org/notes/plan.md";
+        /// An invented owner, as `ORGTHREAD_OWNER=Ana` gives it.
+        const WHO: &str = "Ana (watch)";
 
         struct Place {
             dir: PathBuf,
@@ -1790,6 +1792,7 @@ mod tests {
             fn mac(&self) -> Watch {
                 Watch::new(Some(Reverter::new(
                     self.open(),
+                    WHO.to_string(),
                     self.log(),
                     Some(self.versions()),
                     false,
@@ -1797,7 +1800,13 @@ mod tests {
             }
             /// The server: a write in the background, and no copies.
             fn server(&self) -> Watch {
-                Watch::new(Some(Reverter::new(self.open(), self.log(), None, true)))
+                Watch::new(Some(Reverter::new(
+                    self.open(),
+                    WHO.to_string(),
+                    self.log(),
+                    None,
+                    true,
+                )))
             }
         }
 
@@ -1830,7 +1839,7 @@ mod tests {
             let line = last_line(place);
             assert_eq!(line.outcome, "reverted");
             assert_eq!(line.path, PATH);
-            assert_eq!(line.who, "silviu (watch)");
+            assert_eq!(line.who, WHO);
             assert_eq!(line.before, fingerprint(NEW.as_bytes()), "the old after");
             assert_eq!(line.after, fingerprint(OLD.as_bytes()), "the old before");
             assert_eq!(line.size, size.to_string());
@@ -2009,7 +2018,7 @@ mod tests {
             assert!(w.pending.is_none());
             assert!(shown(&w, &snap).contains(rv::NO_COPY));
             assert_eq!(place.file(), NEW);
-            assert!(!place.log_text().contains("silviu (watch)"));
+            assert!(!place.log_text().contains(WHO));
         }
 
         #[test]
@@ -2026,7 +2035,7 @@ mod tests {
             let snap = place.snap();
             assert_eq!(snap.entries.last().unwrap().outcome, "reverted");
             w.key(KeyCode::Char('r'), false, &snap, &diffs);
-            assert!(shown(&w, &snap).contains("silviu (watch), -0 +1 lines)? y/n"));
+            assert!(shown(&w, &snap).contains("Ana (watch), -0 +1 lines)? y/n"));
             w.key(KeyCode::Char('y'), false, &snap, &diffs);
             assert_eq!(place.file(), NEW, "the change is back");
             let line = last_line(&place);
@@ -2103,7 +2112,13 @@ mod tests {
                 let _ = gate.lock().unwrap().recv();
                 Err("no answer".to_string())
             });
-            let mut w = Watch::new(Some(Reverter::new(open, place.log(), None, true)));
+            let mut w = Watch::new(Some(Reverter::new(
+                open,
+                WHO.to_string(),
+                place.log(),
+                None,
+                true,
+            )));
             w.key(KeyCode::Char('r'), false, &snap, &diffs);
             settle(&mut w);
             w.key(KeyCode::Char('y'), false, &snap, &diffs);

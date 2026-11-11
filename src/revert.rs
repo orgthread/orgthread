@@ -18,8 +18,22 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-/// The "who" of every revert in the log.
-pub const WHO: &str = "silviu (watch)";
+/// The setting that names the owner, as `user.name` does for git. A revert is
+/// logged as `<owner> (watch)`.
+pub const OWNER: &str = "ORGTHREAD_OWNER";
+/// The owner when the setting is not there.
+pub const DEFAULT_OWNER: &str = "owner";
+
+/// The "who" of a revert in the log: the owner and `(watch)`. A name on more
+/// than one line, or with a tab, would break the log, so it is refused.
+pub fn who_of(owner: Option<&str>) -> Result<String, String> {
+    let owner = owner.map(str::trim).filter(|o| !o.is_empty());
+    let owner = owner.unwrap_or(DEFAULT_OWNER);
+    if owner.chars().any(char::is_control) {
+        return Err(format!("{OWNER} must be a name on one line"));
+    }
+    Ok(format!("{owner} (watch)"))
+}
 /// The log word of a revert. `restored` stays the rollback inside a write.
 pub const WORD: &str = "reverted";
 
@@ -140,6 +154,7 @@ pub struct Plan {
 pub fn revert(
     storage: &dyn Storage,
     plan: &Plan,
+    who: &str,
     log_file: &Path,
     versions: Option<&Versions>,
 ) -> Result<String, String> {
@@ -148,7 +163,7 @@ pub fn revert(
         return Err(NO_COPY.to_string());
     }
     let now = log::utc_now();
-    let lock_line = format!("orgthread {WHO} {now} pid {}", std::process::id());
+    let lock_line = format!("orgthread {who} {now} pid {}", std::process::id());
     let report = write::write_into(
         storage,
         &plan.path,
@@ -170,7 +185,7 @@ pub fn revert(
         }
         other => (other.word(), String::new(), String::new(), String::new()),
     };
-    let line = log::line(&[&now, word, &plan.path, WHO, &before, &after, &size]);
+    let line = log::line(&[&now, word, &plan.path, who, &before, &after, &size]);
     // First the log, as for every write.
     let logged = log::append(log_file, &line);
     let path = &plan.path;
@@ -237,6 +252,8 @@ pub type OpenStorage = Arc<dyn Fn() -> Result<Box<dyn Storage>, String> + Send +
 /// What the screen calls on `y`.
 pub struct Reverter {
     open: OpenStorage,
+    /// The "who" of the log lines, from `who_of`.
+    who: String,
     log: PathBuf,
     /// The folder of the copies on the Mac. A server keeps none.
     versions: Option<PathBuf>,
@@ -248,12 +265,14 @@ pub struct Reverter {
 impl Reverter {
     pub fn new(
         open: OpenStorage,
+        who: String,
         log: PathBuf,
         versions: Option<PathBuf>,
         background: bool,
     ) -> Reverter {
         Reverter {
             open,
+            who,
             log,
             versions,
             background,
@@ -265,12 +284,14 @@ impl Reverter {
         let (send, receive) = mpsc::channel();
         let open = Arc::clone(&self.open);
         let log = self.log.clone();
+        let who = self.who.clone();
         let versions = self.versions.clone();
         let work = move || {
             let result = match open() {
                 Ok(storage) => revert(
                     storage.as_ref(),
                     &plan,
+                    &who,
                     &log,
                     versions.map(Versions::new).as_ref(),
                 ),
@@ -368,6 +389,15 @@ mod tests {
         assert!(question(&e, None, &vienna).contains("before 2026-11-10 10:14 (invented chat)?"));
     }
 
+    #[test]
+    fn the_owner_comes_from_its_setting_and_has_a_default() {
+        assert_eq!(who_of(None).unwrap(), "owner (watch)");
+        assert_eq!(who_of(Some("  ")).unwrap(), "owner (watch)");
+        assert_eq!(who_of(Some(" Ana ")).unwrap(), "Ana (watch)");
+        assert!(who_of(Some("Ana\tB")).is_err());
+        assert!(who_of(Some("Ana\nB")).is_err());
+    }
+
     fn place(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("orgthread-revert-{name}-{}", std::process::id()));
@@ -389,7 +419,10 @@ mod tests {
             old: b"other\n".to_vec(),
         };
         let log = dir.join("writes.log");
-        assert_eq!(revert(&storage, &plan, &log, None).unwrap_err(), NO_COPY);
+        assert_eq!(
+            revert(&storage, &plan, "owner (watch)", &log, None).unwrap_err(),
+            NO_COPY
+        );
         assert_eq!(
             fs::read_to_string(dir.join("root/org/a.md")).unwrap(),
             "new\n"

@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn a_reverted_line_says_why_and_has_a_diff() {
         use crate::fingerprint::fingerprint;
-        let e = parse_line("2026-11-11 08:00:00Z\treverted\torg/a.md\tsilviu (watch)\tbb\taa\t3")
+        let e = parse_line("2026-11-11 08:00:00Z\treverted\torg/a.md\towner (watch)\tbb\taa\t3")
             .unwrap();
         assert!(why_of(&e).contains("r on this line brings that change back"));
         assert_ne!(

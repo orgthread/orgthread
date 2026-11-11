@@ -172,6 +172,8 @@ Settings, from the environment:
                       the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
   ORGTHREAD_SEARCH_MB the largest zip of a search with Dropbox, in MB, and with a local
                       folder the largest file a search reads (default: 25)
+  ORGTHREAD_OWNER     your name, for the log lines of a revert in watch: <name> (watch)
+                      (default: owner)
   ORGTHREAD_LISTEN_ANYWHERE
                       yes: let serve --http listen on an address that others can reach, with
                       no encryption (default: only 127.0.0.1, [::1] and localhost)
@@ -951,12 +953,13 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
     let info = screen::Info::new(settings.dropbox, &settings.log);
     // Only the owner's r and y in this screen revert. A server keeps no copies
     // and writes in the background, so the screen never freezes.
+    let who = orgthread::revert::who_of(env::var(orgthread::revert::OWNER).ok().as_deref())?;
     let reverter = if settings.dropbox {
         let locks = locks.clone();
         let open: orgthread::revert::OpenStorage = std::sync::Arc::new(move || {
             Dropbox::new(&locks).map(|d| Box::new(d) as Box<dyn Storage>)
         });
-        orgthread::revert::Reverter::new(open, settings.log.clone(), None, true)
+        orgthread::revert::Reverter::new(open, who, settings.log.clone(), None, true)
     } else {
         let (root, locks) = (settings.root.clone(), locks.clone());
         let open: orgthread::revert::OpenStorage = std::sync::Arc::new(move || {
@@ -964,6 +967,7 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
         });
         orgthread::revert::Reverter::new(
             open,
+            who,
             settings.log.clone(),
             Some(settings.versions.clone()),
             false,

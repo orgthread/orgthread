@@ -118,6 +118,7 @@ Each setting comes from the environment. A file `.env` beside the program, with 
 | `ORGTHREAD_LOGINS` | The file of the logins | `state/logins.json` beside the program |
 | `ORGTHREAD_BINARY_ALLOW` | Comma-separated folders where an upload of a file that is not text may go | None |
 | `ORGTHREAD_DELETE_ALLOW` | Comma-separated folders where `delete` may remove a file | None, so every delete is refused |
+| `ORGTHREAD_OWNER` | Your name, for the log lines of a revert in `orgthread watch`: `<name> (watch)` | `owner` |
 | `ORGTHREAD_MOVE_ALLOW` | Comma-separated folders. When set, `move` needs both the old and the new name in them | Not set, so `move` has only the limits above |
 | `ORGTHREAD_FIXED_FOLDERS` | Comma-separated folders. No new folder may appear directly inside them, for `write`, `upload`, `copy` and `move`, with code 2. Deeper new folders are fine. `/` stands for the root | Not set, so any new folder is made |
 | `ORGTHREAD_DOWNLOAD_MB` | The largest download, in MB of 1,000,000 bytes | 250 |
