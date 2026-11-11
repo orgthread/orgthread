@@ -4,7 +4,7 @@
 
 use crate::fingerprint::fingerprint;
 use crate::history::{self, Job, Remote, Step};
-use crate::revert::{self, Plan, Reverter};
+use crate::revert::{self, Plan, Question, Reverter};
 use crate::versions::Versions;
 use crate::watch::{self, Entry, Row, Snapshot, snapshot};
 use ratatui::Frame;
@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph};
 use std::cell::Cell;
 use std::io;
 use std::path::Path;
@@ -635,11 +635,17 @@ fn help_lines(info: &Info, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// The help panel, over the middle of the screen.
-pub fn draw_help(frame: &mut Frame, info: &Info) {
+/// A panel over the middle of the screen, at most `most` columns wide. `lines`
+/// gets the width inside the border.
+fn draw_panel(
+    frame: &mut Frame,
+    most: u16,
+    block: Block<'static>,
+    lines: impl FnOnce(usize) -> Vec<Line<'static>>,
+) {
     let area = frame.area();
-    let width = area.width.min(72);
-    let lines = help_lines(info, usize::from(width.saturating_sub(2)));
+    let width = area.width.min(most);
+    let lines = lines(usize::from(width.saturating_sub(2)));
     let height = (lines.len() as u16 + 2).min(area.height);
     let place = Rect::new(
         area.x + (area.width - width) / 2,
@@ -648,10 +654,68 @@ pub fn draw_help(frame: &mut Frame, info: &Info) {
         height,
     );
     frame.render_widget(Clear, place);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("Help   ?, Esc: close")),
-        place,
+    frame.render_widget(Paragraph::new(lines).block(block), place);
+}
+
+/// The help panel, over the middle of the screen.
+pub fn draw_help(frame: &mut Frame, info: &Info) {
+    let block = Block::bordered().title("Help   ?, Esc: close");
+    draw_panel(frame, 72, block, |width| help_lines(info, width));
+}
+
+/// The lines of the revert question: what changes, then the two answers.
+fn question_lines(q: &Question, width: usize) -> Vec<Line<'static>> {
+    let change = format!("{} on {} by {}", q.outcome, q.time, q.who);
+    let mut lines = vec![Line::raw("")];
+    lines.extend(labelled("File", &q.path, width));
+    lines.extend(labelled("Change", &change, width));
+    lines.extend(labelled("Undo", &q.size(), width));
+    lines.push(Line::raw(""));
+    lines.extend(plain(
+        "The file gets its text from before this change back.",
+        width,
+        Style::new(),
+    ));
+    lines.push(Line::raw(""));
+    let bold = Modifier::BOLD;
+    let answers = vec![
+        Span::styled("y", Style::new().fg(ORANGE).add_modifier(bold)),
+        Span::styled(": revert", Style::new().fg(ORANGE)),
+        Span::raw("      "),
+        Span::styled("any other key", Style::new().fg(BLUE).add_modifier(bold)),
+        Span::styled(": cancel", Style::new().fg(BLUE)),
+    ];
+    let fits = answers
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>()
+        <= width;
+    if fits {
+        lines.push(Line::from(answers));
+    } else {
+        lines.push(Line::styled(
+            "y: revert",
+            Style::new().fg(ORANGE).add_modifier(bold),
+        ));
+        lines.push(Line::styled("any other key: cancel", Style::new().fg(BLUE)));
+    }
+    lines
+}
+
+/// The revert question, as a popup over the list or the diff.
+fn draw_question(frame: &mut Frame, q: &Question) {
+    let title = Span::styled(
+        " Revert this change? ",
+        Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
     );
+    let block = Block::bordered()
+        .border_style(Style::new().fg(ORANGE))
+        .padding(Padding::horizontal(1))
+        .title(title);
+    // The padding takes one column on each side.
+    draw_panel(frame, 64, block, |width| {
+        question_lines(q, width.saturating_sub(2))
+    });
 }
 
 /// A revert on its way: the old text from the Dropbox history, the question,
@@ -665,7 +729,7 @@ enum Pending {
         started: Instant,
     },
     /// The question waits for `y`.
-    Asking { plan: Plan, line: String },
+    Asking { plan: Plan, question: Question },
     /// The write runs, in the background on Dropbox.
     Writing {
         answer_in: Receiver<Result<String, String>>,
@@ -873,7 +937,7 @@ impl Watch {
                 &String::from_utf8_lossy(new),
             )
         });
-        let line = revert::question(entry, counts, &self.zone);
+        let question = revert::question(entry, counts, &self.zone);
         self.pending = Some(Pending::Asking {
             plan: Plan {
                 path: entry.path.clone(),
@@ -881,7 +945,7 @@ impl Watch {
                 after: entry.after.clone(),
                 old,
             },
-            line,
+            question,
         });
     }
 
@@ -987,8 +1051,8 @@ impl Watch {
             (sign, gone.as_secs())
         };
         let lines = match &self.pending {
-            Some(Pending::Asking { line, .. }) => plain(
-                line,
+            Some(Pending::Asking { .. }) => plain(
+                "y: revert   any other key: cancel",
                 width,
                 Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
             ),
@@ -1021,6 +1085,9 @@ impl Watch {
         match &self.open {
             Some(view) => draw_diff_with(frame, view, info, foot),
             None => draw_with(frame, snap, &self.choice, info, foot),
+        }
+        if let Some(Pending::Asking { question, .. }) = &self.pending {
+            draw_question(frame, question);
         }
         if self.help {
             draw_help(frame, info);
@@ -1858,11 +1925,9 @@ mod tests {
             let mut w = place.mac();
             w.key(KeyCode::Char('r'), false, &snap, &diffs);
             let screen = shown(&w, &snap);
-            assert!(
-                screen.contains(&format!("Revert {PATH} to before 2026-11-10")),
-                "{screen}"
-            );
-            assert!(screen.contains("(invented chat)? y/n"), "{screen}");
+            assert!(screen.contains("Revert this change?"), "{screen}");
+            assert!(screen.contains(&format!("File      {PATH}")), "{screen}");
+            assert!(screen.contains("Undo      not known"), "{screen}");
             assert_eq!(place.file(), NEW, "nothing before y");
             w.key(KeyCode::Char('y'), false, &snap, &diffs);
             assert_eq!(place.file(), OLD);
@@ -1887,7 +1952,7 @@ mod tests {
             assert!(w.tick(Instant::now()) || matches!(w.pending, Some(Pending::Asking { .. })));
             settle(&mut w);
             let screen = shown(&w, &snap);
-            assert!(screen.contains("-1 +0 lines)? y/n"), "{screen}");
+            assert!(screen.contains("Undo      -1 +0 lines"), "{screen}");
             w.key(KeyCode::Char('y'), false, &snap, &diffs);
             assert!(
                 matches!(w.pending, Some(Pending::Writing { .. })),
@@ -1912,12 +1977,35 @@ mod tests {
             w.zone = jiff::tz::TimeZone::get("Europe/Vienna").unwrap();
             w.key(KeyCode::Char('r'), false, &snap, &diffs);
             let screen = shown(&w, &snap);
+            assert!(screen.contains("Revert this change?"), "{screen}");
+            assert!(screen.contains(&format!("File      {PATH}")), "{screen}");
             assert!(
-                screen.contains(&format!(
-                    "Revert {PATH} to before 2026-11-10 10:14 (invented chat, -1 +0 lines)? y/n"
-                )),
+                screen.contains("Change    written on 2026-11-10 10:14 by invented chat"),
                 "{screen}"
             );
+            assert!(screen.contains("Undo      -1 +0 lines"), "{screen}");
+            assert!(
+                screen.contains("y: revert      any other key: cancel"),
+                "{screen}"
+            );
+            // The popup sits over the list, which stays below it.
+            assert!(screen.contains("Latest writes and refusals"), "{screen}");
+            // A cancel takes the popup away.
+            w.key(KeyCode::Char('n'), false, &snap, &diffs);
+            assert!(!shown(&w, &snap).contains("Revert this change?"));
+            // In a diff, the popup shows over the diff.
+            w.key(KeyCode::Enter, false, &snap, &diffs);
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            let screen = shown(&w, &snap);
+            assert!(screen.contains("Revert this change?"), "{screen}");
+            assert!(screen.contains("- buy apples"), "{screen}");
+            // A narrow terminal keeps every part.
+            let mut t = Terminal::new(TestBackend::new(40, 30)).unwrap();
+            t.draw(|f| w.draw(f, &snap, &local())).unwrap();
+            let narrow = text_of(&t);
+            assert!(narrow.contains("invented chat"), "{narrow}");
+            assert!(narrow.contains("-1 +0 lines"), "{narrow}");
+            assert!(narrow.contains("cancel"), "{narrow}");
         }
 
         #[test]
@@ -2035,7 +2123,9 @@ mod tests {
             let snap = place.snap();
             assert_eq!(snap.entries.last().unwrap().outcome, "reverted");
             w.key(KeyCode::Char('r'), false, &snap, &diffs);
-            assert!(shown(&w, &snap).contains("Ana (watch), -0 +1 lines)? y/n"));
+            let screen = shown(&w, &snap);
+            assert!(screen.contains("by Ana (watch)"), "{screen}");
+            assert!(screen.contains("Undo      -0 +1 lines"), "{screen}");
             w.key(KeyCode::Char('y'), false, &snap, &diffs);
             assert_eq!(place.file(), NEW, "the change is back");
             let line = last_line(&place);

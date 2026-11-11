@@ -117,23 +117,43 @@ pub fn local_time(time: &str, zone: &jiff::tz::TimeZone) -> String {
         .unwrap_or_else(|| time.to_string())
 }
 
-/// The one line that asks before anything changes. `counts` are the lines the
-/// revert takes away and puts back, when both texts are known.
+/// What the revert question shows before anything changes, as a popup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Question {
+    pub path: String,
+    /// The word of the change: written, patched or reverted.
+    pub outcome: String,
+    /// When the change was made, in the local zone.
+    pub time: String,
+    /// Who made the change: the "who" of its log line.
+    pub who: String,
+    /// The lines the revert takes away and puts back, when both texts are known.
+    pub counts: Option<(usize, usize)>,
+}
+
+impl Question {
+    /// The size of the revert in plain words.
+    pub fn size(&self) -> String {
+        match self.counts {
+            Some((removed, added)) => format!("-{removed} +{added} lines"),
+            None => "not known: the copy of the newer text is gone".to_string(),
+        }
+    }
+}
+
+/// The question for a line.
 pub fn question(
     entry: &Entry,
     counts: Option<(usize, usize)>,
     zone: &jiff::tz::TimeZone,
-) -> String {
-    let size = match counts {
-        Some((removed, added)) => format!(", -{removed} +{added} lines"),
-        None => String::new(),
-    };
-    format!(
-        "Revert {} to before {} ({}{size})? y/n",
-        entry.path,
-        local_time(&entry.time, zone),
-        entry.who
-    )
+) -> Question {
+    Question {
+        path: entry.path.clone(),
+        outcome: entry.outcome.clone(),
+        time: local_time(&entry.time, zone),
+        who: entry.who.clone(),
+        counts,
+    }
 }
 
 /// What one `y` writes: the text before the change, where the text after it
@@ -381,12 +401,15 @@ mod tests {
             "bb",
         );
         let q = question(&e, Some((3, 1)), &jiff::tz::TimeZone::UTC);
-        assert_eq!(
-            q,
-            "Revert org/health/log.md to before 2026-11-10 09:14 (invented chat, -3 +1 lines)? y/n"
-        );
+        assert_eq!(q.path, "org/health/log.md");
+        assert_eq!(q.outcome, "patched");
+        assert_eq!(q.time, "2026-11-10 09:14");
+        assert_eq!(q.who, "invented chat");
+        assert_eq!(q.size(), "-3 +1 lines");
         let vienna = jiff::tz::TimeZone::get("Europe/Vienna").unwrap();
-        assert!(question(&e, None, &vienna).contains("before 2026-11-10 10:14 (invented chat)?"));
+        let q = question(&e, None, &vienna);
+        assert_eq!(q.time, "2026-11-10 10:14", "the local zone");
+        assert!(q.size().starts_with("not known"));
     }
 
     #[test]
