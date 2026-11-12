@@ -172,7 +172,7 @@ fn right_values_in_env_work_as_before() {
 }
 
 #[test]
-fn the_check_lists_every_setting_and_where_it_comes_from() {
+fn the_check_lists_the_settings_of_its_door_and_where_they_come_from() {
     let p = Place::new(&format!(
         "{GOOD}ORGTHREAD_DROPBOX_TOKEN=invented-token-55aa\nORGTHREAD_OWNR=typo\n"
     ));
@@ -187,18 +187,25 @@ fn the_check_lists_every_setting_and_where_it_comes_from() {
         "ORGTHREAD_ROOT",
         "ORGTHREAD_LOCK_DIR",
         "ORGTHREAD_SEARCH_MB",
-        "ORGTHREAD_DROPBOX_API",
         "ORGTHREAD_LOGIN_HASH",
     ] {
         assert!(text.contains(name), "{name}: {text}");
     }
+    // A local door shows no Dropbox setting, and counts the one that is set.
+    assert!(!text.contains("ORGTHREAD_DROPBOX"), "{text}");
+    assert!(
+        text.contains("1 Dropbox setting is set but not used with local"),
+        "{text}"
+    );
     assert!(text.contains("Ana  (.env)"), "{text}");
     assert!(text.contains("30  (environment)"), "{text}");
     assert!(text.contains("250  (default)"), "{text}");
-    assert!(text.contains("secret: set  (.env)"), "{text}");
     assert!(!text.contains("invented-token"), "{text}");
     assert!(text.contains("ORGTHREAD_OWNR"), "{text}");
-    assert!(text.ends_with("All 27 settings are fine.\n"), "{text}");
+    assert!(
+        text.ends_with("All settings of this door are fine.\n"),
+        "{text}"
+    );
     // It changes nothing.
     assert!(
         p.env_text()
@@ -212,6 +219,38 @@ fn the_check_lists_every_setting_and_where_it_comes_from() {
         names.iter().all(|n| !n.starts_with(".env.")),
         "no copy: {names:?}"
     );
+}
+
+/// Decision 5: a wrong value of the other door stops no command, and the
+/// check names it as a warning, with code 0.
+#[test]
+fn a_wrong_value_of_the_other_door_stops_nothing() {
+    let p = Place::new(&format!("{GOOD}ORGTHREAD_DROPBOX_API=ftp://invented\n"));
+    let o = p.run(&["write", &p.note(), "--who", "chat"], b"new\n");
+    assert_eq!(code(&o), 0, "{o:?}");
+    let o = p.run(&["config", "--check"], b"");
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(
+        out(&o).contains("warning: ORGTHREAD_DROPBOX_API needs an address"),
+        "{}",
+        out(&o)
+    );
+    // With dropbox, the same value stops every command.
+    p.write_env(
+        "ORGTHREAD_STORAGE=dropbox\nORGTHREAD_DROPBOX_API=ftp://invented\nORGTHREAD_ROOT=\n",
+    );
+    let o = p.run(&["list", "/org"], b"");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(
+        err(&o).contains("ORGTHREAD_DROPBOX_API needs an address"),
+        "{}",
+        err(&o)
+    );
+    // And the empty root of the local door is only a warning there.
+    assert!(!err(&o).contains("ORGTHREAD_ROOT"), "{}", err(&o));
+    let o = p.run(&["config", "--check"], b"");
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(out(&o).contains("warning: ORGTHREAD_ROOT"), "{}", out(&o));
 }
 
 #[test]

@@ -74,6 +74,16 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The fixed values of a kind, chosen with up and down in place of typing.
+    /// Empty for a kind that is typed.
+    pub fn choices(self) -> &'static [&'static str] {
+        match self {
+            Kind::Storage => &["local", "dropbox"],
+            Kind::YesNo => &["yes", "no"],
+            _ => &[],
+        }
+    }
+
     /// What a right value looks like, in a few words.
     pub fn rule(self) -> &'static str {
         match self {
@@ -101,6 +111,16 @@ pub enum Doors {
 }
 
 impl Doors {
+    /// True when a door with this storage reads the setting: `dropbox` is the
+    /// value of `ORGTHREAD_STORAGE` in effect.
+    pub fn fits(self, dropbox: bool) -> bool {
+        match self {
+            Doors::Both => true,
+            Doors::Local => !dropbox,
+            Doors::Dropbox => dropbox,
+        }
+    }
+
     pub fn words(self) -> &'static str {
         match self {
             Doors::Both => "both",
@@ -113,6 +133,7 @@ impl Doors {
 /// The groups of the screen, in their order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
+    Basics,
     FoldersAndLogs,
     Limits,
     Sizes,
@@ -122,7 +143,8 @@ pub enum Group {
 }
 
 impl Group {
-    pub const ALL: [Group; 6] = [
+    pub const ALL: [Group; 7] = [
+        Group::Basics,
         Group::FoldersAndLogs,
         Group::Limits,
         Group::Sizes,
@@ -133,6 +155,7 @@ impl Group {
 
     pub fn title(self) -> &'static str {
         match self {
+            Group::Basics => "Basics",
             Group::FoldersAndLogs => "Folders and logs",
             Group::Limits => "Limits",
             Group::Sizes => "Sizes",
@@ -190,10 +213,26 @@ const fn secret(name: &'static str, kind: Kind, doors: Doors, help: &'static str
 }
 
 use Doors::{Both, Dropbox as DropboxDoor, Local};
-use Group::{Dropbox as DropboxGroup, FoldersAndLogs, Limits, Server, Sizes};
+use Group::{Basics, Dropbox as DropboxGroup, FoldersAndLogs, Limits, Server, Sizes};
 
 /// Every setting, in the order of the screen.
 pub const ALL: [Setting; 27] = [
+    setting(
+        OWNER,
+        Kind::Name,
+        "owner",
+        Both,
+        Basics,
+        "Your name, for the log lines of a revert in watch and of a change in config: <name> (watch), <name> (config).",
+    ),
+    setting(
+        STORAGE,
+        Kind::Storage,
+        "local",
+        Both,
+        Basics,
+        "dropbox: use the Dropbox API, with paths from its root, such as /org/a.md. It keeps no copies on the disk. local: a folder on this machine.",
+    ),
     setting(
         ROOT,
         Kind::Path,
@@ -233,14 +272,6 @@ pub const ALL: [Setting; 27] = [
         Local,
         FoldersAndLogs,
         "A copy of each version written, for 30 days, for the diff screen and the revert of watch.",
-    ),
-    setting(
-        OWNER,
-        Kind::Name,
-        "owner",
-        Both,
-        FoldersAndLogs,
-        "Your name, for the log lines of a revert in watch and of a change in config: <name> (watch), <name> (config).",
     ),
     setting(
         ALLOW,
@@ -323,22 +354,6 @@ pub const ALL: [Setting; 27] = [
         "With Dropbox, the largest zip of a search, in MB. With a local folder, the largest file that a search reads.",
     ),
     setting(
-        STORAGE,
-        Kind::Storage,
-        "local",
-        Both,
-        DropboxGroup,
-        "dropbox: use the Dropbox API, with paths from its root, such as /org/a.md. It keeps no copies on the disk. local: a folder on this machine.",
-    ),
-    setting(
-        DROPBOX_APP_KEY,
-        Kind::Text,
-        "none",
-        DropboxDoor,
-        DropboxGroup,
-        "The app key. With ORGTHREAD_DROPBOX_REFRESH and ORGTHREAD_DROPBOX_APP_SECRET, it gets a fresh token for each command.",
-    ),
-    setting(
         DROPBOX_API,
         Kind::Address,
         "https://api.dropboxapi.com",
@@ -389,6 +404,12 @@ pub const ALL: [Setting; 27] = [
         Kind::Text,
         DropboxDoor,
         "The refresh token of the Dropbox app.",
+    ),
+    secret(
+        DROPBOX_APP_KEY,
+        Kind::Text,
+        DropboxDoor,
+        "The app key of the Dropbox app. With ORGTHREAD_DROPBOX_REFRESH and ORGTHREAD_DROPBOX_APP_SECRET, it gets a fresh token for each command.",
     ),
     secret(
         DROPBOX_APP_SECRET,
@@ -690,13 +711,23 @@ pub fn check(setting: &Setting, value: &OsStr) -> Result<(), String> {
     })
 }
 
-/// Each setting whose value in effect is wrong, with the reason.
+/// Each setting of this door whose value in effect is wrong, with the reason.
+/// A setting of the other door has no effect here, so it stops nothing.
 pub fn problems() -> Vec<String> {
-    problems_from(&env_get)
+    problems_from(&env_get, true)
 }
 
-fn problems_from(get: Get) -> Vec<String> {
+/// Each setting of the other door whose value is wrong: a warning only.
+pub fn warnings() -> Vec<String> {
+    problems_from(&env_get, false)
+}
+
+/// The wrong values of the settings that this door reads, or with `used`
+/// false, of those it does not read.
+fn problems_from(get: Get, used: bool) -> Vec<String> {
+    let dropbox = dropbox_from(get);
     ALL.iter()
+        .filter(|s| s.doors.fits(dropbox) == used)
         .filter_map(|s| get(s.name).and_then(|value| check(s, &value).err()))
         .collect()
 }
@@ -807,7 +838,12 @@ pub fn help() -> String {
     for group in Group::ALL {
         out.push_str(&format!("\n  {}:\n", group.title()));
         for s in ALL.iter().filter(|s| s.group == group) {
-            let text = format!("{} (default: {})", s.help, s.default);
+            let text = format!(
+                "{} (default: {}; door: {})",
+                s.help,
+                s.default,
+                s.doors.words()
+            );
             let rows = wrap(&text, WIDTH - NAME);
             let head = format!("  {}", s.name);
             let mut rows = rows.into_iter();
@@ -834,7 +870,7 @@ This file is made from the list in `src/settings.rs`. A test fails when it is ou
 
 Each setting is a line `ORGTHREAD_<NAME>=<value>`. It comes from the environment, or from the file `.env` beside the program. A name that the environment holds wins over `.env`. Write a value with no quotes, as quotes count as part of it. A line that starts with `#` is a comment.
 
-A wrong value stops every command with code 2, wrong use, and the message names the setting. For example, `ORGTHREAD_UPLOAD_MB=abc` gives `ORGTHREAD_UPLOAD_MB needs a whole number of MB, not abc`. Only `orgthread config`, `--help` and `--version` still run.
+A wrong value stops every command with code 2, wrong use, and the message names the setting. For example, `ORGTHREAD_UPLOAD_MB=abc` gives `ORGTHREAD_UPLOAD_MB needs a whole number of MB, not abc`. Only `orgthread config`, `--help` and `--version` still run. A setting of the other door has no effect, so its wrong value stops nothing: `config --check` names it as a warning.
 
 ## Change the settings
 
@@ -843,12 +879,15 @@ A wrong value stops every command with code 2, wrong use, and the message names 
 | Key | What it does |
 |---|---|
 | `j`, `k` or the arrows | Choose a setting |
-| Enter | Change the value. Enter again keeps it, Esc goes back. An empty value is the default |
+| Enter | Change the value, in a popup. Enter keeps it, Esc goes back. An empty value is the default. For `ORGTHREAD_STORAGE` and `ORGTHREAD_LISTEN_ANYWHERE`, up and down choose |
 | `d` | Back to the default: the line goes from `.env` |
 | `s` | Save |
 | `?` | Help |
 | `q` | Quit. With a change not saved, it asks first |
 
+- The screen shows the settings of the door that `ORGTHREAD_STORAGE` names, and those of both doors. With `local`, the Dropbox settings are hidden. With `dropbox`, the settings of the local folder are hidden. A change of `ORGTHREAD_STORAGE` changes the rows at once, before the save. There is no key to show all: switch `ORGTHREAD_STORAGE` to see the other door.
+- A hidden setting that is set stays in `.env`, untouched. One line at the bottom counts them, for example `2 Dropbox settings are set but not used with local`.
+- Every change happens in a popup over the list, with an orange border: the name, the help line, the value now and the default, the field, and the keys. A wrong value keeps the popup open and says why.
 - A secret shows only as `secret: set` or `secret: not set`. Enter replaces it. The typing shows nothing, not even its length. The old value is never shown, never logged and never listed.
 - A setting that the environment holds shows as `from the environment`, with the value in effect, and cannot be changed on the screen.
 - A line that names no setting of the list, such as a typo `ORGTHREAD_OWNR`, shows at the bottom as `not used`. Such lines and the comments stay in place.
@@ -856,11 +895,11 @@ A wrong value stops every command with code 2, wrong use, and the message names 
 - The screen shows the restart command, and does not run it. On a server: `systemctl --user restart orgthread.service`. On a Mac, each command reads `.env` again, and the local MCP server of the desktop app needs a restart of the app.
 - The way back is the copy `.env.before-config-<date>-<time>`, by hand. The copies stay until you remove them.
 
-`orgthread config --check` lists every setting with its value and where it comes from, and secrets as `set` or `not set`. It changes nothing and works without a terminal. It ends with code 2 when a value is wrong, else 0.
+`orgthread config --check` lists the settings of this door in the order of the screen, with the value and where it comes from, and secrets as `set` or `not set`. It adds the line on hidden settings that are set, and a warning for each wrong one. It changes nothing and works without a terminal. It ends with code 2 when a value of this door is wrong, else 0.
 
 ## The list
 
-The doors: `local folder` is the door on a Mac, which reads a folder on the disk. `Dropbox` is the door on a server, with `ORGTHREAD_STORAGE=dropbox`. `both` is both.
+The list holds all settings, of both doors. The doors: `local folder` is the door on a Mac, which reads a folder on the disk. `Dropbox` is the door on a server, with `ORGTHREAD_STORAGE=dropbox`. `both` is both.
 ",
     );
     for group in Group::ALL {
@@ -915,13 +954,14 @@ mod tests {
     }
 
     #[test]
-    fn four_settings_are_secrets_and_all_sit_in_the_group_secrets() {
+    fn five_settings_are_secrets_and_all_sit_in_the_group_secrets() {
         let secrets: Vec<&str> = ALL.iter().filter(|s| s.secret).map(|s| s.name).collect();
         assert_eq!(
             secrets,
             [
                 DROPBOX_TOKEN,
                 DROPBOX_REFRESH,
+                DROPBOX_APP_KEY,
                 DROPBOX_APP_SECRET,
                 LOGIN_HASH
             ]
@@ -929,10 +969,72 @@ mod tests {
         for s in &ALL {
             assert_eq!(s.secret, s.group == Group::Secrets, "{}", s.name);
         }
+        // The app key is a secret of the Dropbox door: hidden with local.
+        let key = find(DROPBOX_APP_KEY).unwrap();
+        assert!(key.secret && key.doors == Doors::Dropbox);
+        // Its wrong value never shows.
+        let reason = check(key, OsStr::new("invented\tkey")).unwrap_err();
+        assert!(!reason.contains("invented"), "{reason}");
     }
 
-    /// Every name in the code of `src/` is in the list, and no file outside
-    /// this one reads a setting from the environment.
+    #[test]
+    fn the_owner_and_the_storage_come_first_in_the_group_basics() {
+        assert_eq!(Group::ALL[0], Group::Basics);
+        assert_eq!((ALL[0].name, ALL[1].name), (OWNER, STORAGE));
+        assert!(ALL[..2].iter().all(|s| s.group == Group::Basics));
+        assert!(ALL[2..].iter().all(|s| s.group != Group::Basics));
+    }
+
+    #[test]
+    fn the_doors_of_each_setting_are_as_in_the_spec() {
+        let local: Vec<&str> = ALL
+            .iter()
+            .filter(|s| s.doors == Doors::Local)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(local, [ROOT, VERSIONS]);
+        let dropbox = ALL.iter().filter(|s| s.doors == Doors::Dropbox).count();
+        assert_eq!(dropbox, 6);
+        for s in &ALL {
+            assert_eq!(s.doors.fits(false), s.doors != Doors::Dropbox, "{}", s.name);
+            assert_eq!(s.doors.fits(true), s.doors != Doors::Local, "{}", s.name);
+        }
+    }
+
+    #[test]
+    fn a_wrong_value_of_the_other_door_stops_nothing_and_is_a_warning() {
+        let local = lookup(&[(DROPBOX_API, "ftp://invented"), (UPLOAD_MB, "abc")]);
+        let problems = problems_from(&local, true);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with(UPLOAD_MB), "{problems:?}");
+        let warnings = problems_from(&local, false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with(DROPBOX_API), "{warnings:?}");
+        // With dropbox, the same value stops, and a wrong root does not.
+        let dropbox = lookup(&[(STORAGE, "dropbox"), (DROPBOX_API, "ftp://x"), (ROOT, "")]);
+        let problems = problems_from(&dropbox, true);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with(DROPBOX_API), "{problems:?}");
+        assert!(problems_from(&dropbox, false)[0].starts_with(ROOT));
+    }
+
+    #[test]
+    fn storage_and_listen_anywhere_offer_their_choices() {
+        assert_eq!(Kind::Storage.choices(), ["local", "dropbox"]);
+        assert_eq!(Kind::YesNo.choices(), ["yes", "no"]);
+        for s in &ALL {
+            for choice in s.kind.choices() {
+                assert_eq!(check(s, OsStr::new(choice)), Ok(()), "{}", s.name);
+            }
+        }
+        let with_choices: Vec<&str> = ALL
+            .iter()
+            .filter(|s| !s.kind.choices().is_empty())
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(with_choices, [STORAGE, LISTEN_ANYWHERE]);
+    }
+
     #[test]
     fn only_this_file_reads_the_environment() {
         let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1283,10 +1385,10 @@ mod tests {
     fn the_problems_are_the_wrong_values_in_effect() {
         let get = lookup(&[(UPLOAD_MB, "abc"), (OWNER, "Ana"), ("ORGTHREAD_OWNR", "x")]);
         assert_eq!(
-            problems_from(&get),
+            problems_from(&get, true),
             ["ORGTHREAD_UPLOAD_MB needs a whole number of MB, not abc"]
         );
-        assert!(problems_from(&|_| None).is_empty());
+        assert!(problems_from(&|_| None, true).is_empty());
     }
 
     #[test]
@@ -1313,13 +1415,23 @@ mod tests {
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         for s in &ALL {
             assert!(help.contains(&format!("  {}", s.name)), "{}", s.name);
-            let default = format!("(default: {})", s.default);
+            let default = format!("(default: {}; door: {})", s.default, s.doors.words());
             assert!(flat.contains(&default), "{}", s.name);
         }
         for line in help.lines() {
             assert!(line.chars().count() <= 100, "{line}");
         }
         assert!(help.contains("orgthread config --check"));
+        // All 27, in the order of the list, each with its door.
+        let mut at = 0;
+        for s in &ALL {
+            let found = help[at..].find(&format!("  {}", s.name));
+            at += found.unwrap_or_else(|| panic!("{} is out of order", s.name));
+            let door = format!("door: {})", s.doors.words());
+            let flat_from: String = help[at..].split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat_from.contains(&door), "{}", s.name);
+        }
+        assert!(help.find("Basics:") < help.find("Folders and logs:"));
     }
 
     /// docs/settings.md is made from the list. To make it again:

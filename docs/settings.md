@@ -4,7 +4,7 @@ This file is made from the list in `src/settings.rs`. A test fails when it is ou
 
 Each setting is a line `ORGTHREAD_<NAME>=<value>`. It comes from the environment, or from the file `.env` beside the program. A name that the environment holds wins over `.env`. Write a value with no quotes, as quotes count as part of it. A line that starts with `#` is a comment.
 
-A wrong value stops every command with code 2, wrong use, and the message names the setting. For example, `ORGTHREAD_UPLOAD_MB=abc` gives `ORGTHREAD_UPLOAD_MB needs a whole number of MB, not abc`. Only `orgthread config`, `--help` and `--version` still run.
+A wrong value stops every command with code 2, wrong use, and the message names the setting. For example, `ORGTHREAD_UPLOAD_MB=abc` gives `ORGTHREAD_UPLOAD_MB needs a whole number of MB, not abc`. Only `orgthread config`, `--help` and `--version` still run. A setting of the other door has no effect, so its wrong value stops nothing: `config --check` names it as a warning.
 
 ## Change the settings
 
@@ -13,12 +13,15 @@ A wrong value stops every command with code 2, wrong use, and the message names 
 | Key | What it does |
 |---|---|
 | `j`, `k` or the arrows | Choose a setting |
-| Enter | Change the value. Enter again keeps it, Esc goes back. An empty value is the default |
+| Enter | Change the value, in a popup. Enter keeps it, Esc goes back. An empty value is the default. For `ORGTHREAD_STORAGE` and `ORGTHREAD_LISTEN_ANYWHERE`, up and down choose |
 | `d` | Back to the default: the line goes from `.env` |
 | `s` | Save |
 | `?` | Help |
 | `q` | Quit. With a change not saved, it asks first |
 
+- The screen shows the settings of the door that `ORGTHREAD_STORAGE` names, and those of both doors. With `local`, the Dropbox settings are hidden. With `dropbox`, the settings of the local folder are hidden. A change of `ORGTHREAD_STORAGE` changes the rows at once, before the save. There is no key to show all: switch `ORGTHREAD_STORAGE` to see the other door.
+- A hidden setting that is set stays in `.env`, untouched. One line at the bottom counts them, for example `2 Dropbox settings are set but not used with local`.
+- Every change happens in a popup over the list, with an orange border: the name, the help line, the value now and the default, the field, and the keys. A wrong value keeps the popup open and says why.
 - A secret shows only as `secret: set` or `secret: not set`. Enter replaces it. The typing shows nothing, not even its length. The old value is never shown, never logged and never listed.
 - A setting that the environment holds shows as `from the environment`, with the value in effect, and cannot be changed on the screen.
 - A line that names no setting of the list, such as a typo `ORGTHREAD_OWNR`, shows at the bottom as `not used`. Such lines and the comments stay in place.
@@ -26,11 +29,18 @@ A wrong value stops every command with code 2, wrong use, and the message names 
 - The screen shows the restart command, and does not run it. On a server: `systemctl --user restart orgthread.service`. On a Mac, each command reads `.env` again, and the local MCP server of the desktop app needs a restart of the app.
 - The way back is the copy `.env.before-config-<date>-<time>`, by hand. The copies stay until you remove them.
 
-`orgthread config --check` lists every setting with its value and where it comes from, and secrets as `set` or `not set`. It changes nothing and works without a terminal. It ends with code 2 when a value is wrong, else 0.
+`orgthread config --check` lists the settings of this door in the order of the screen, with the value and where it comes from, and secrets as `set` or `not set`. It adds the line on hidden settings that are set, and a warning for each wrong one. It changes nothing and works without a terminal. It ends with code 2 when a value of this door is wrong, else 0.
 
 ## The list
 
-The doors: `local folder` is the door on a Mac, which reads a folder on the disk. `Dropbox` is the door on a server, with `ORGTHREAD_STORAGE=dropbox`. `both` is both.
+The list holds all settings, of both doors. The doors: `local folder` is the door on a Mac, which reads a folder on the disk. `Dropbox` is the door on a server, with `ORGTHREAD_STORAGE=dropbox`. `both` is both.
+
+### Basics
+
+| Setting | What it does | A right value | Default | Doors |
+|---|---|---|---|---|
+| `ORGTHREAD_OWNER` | Your name, for the log lines of a revert in watch and of a change in config: <name> (watch), <name> (config). | a name on one line | owner | both |
+| `ORGTHREAD_STORAGE` | dropbox: use the Dropbox API, with paths from its root, such as /org/a.md. It keeps no copies on the disk. local: a folder on this machine. | dropbox or local | local | both |
 
 ### Folders and logs
 
@@ -41,7 +51,6 @@ The doors: `local folder` is the door on a Mac, which reads a folder on the disk
 | `ORGTHREAD_LOG` | The log file: one line per write, refusal and change of a setting, never a text. | a path, not empty | state/writes.log beside the program | both |
 | `ORGTHREAD_READS` | The notes of what each name read. | a path, not empty | state/reads beside the program | both |
 | `ORGTHREAD_VERSIONS` | A copy of each version written, for 30 days, for the diff screen and the revert of watch. | a path, not empty | state/versions beside the program | local folder |
-| `ORGTHREAD_OWNER` | Your name, for the log lines of a revert in watch and of a change in config: <name> (watch), <name> (config). | a name on one line | owner | both |
 
 ### Limits
 
@@ -67,8 +76,6 @@ The doors: `local folder` is the door on a Mac, which reads a folder on the disk
 
 | Setting | What it does | A right value | Default | Doors |
 |---|---|---|---|---|
-| `ORGTHREAD_STORAGE` | dropbox: use the Dropbox API, with paths from its root, such as /org/a.md. It keeps no copies on the disk. local: a folder on this machine. | dropbox or local | local | both |
-| `ORGTHREAD_DROPBOX_APP_KEY` | The app key. With ORGTHREAD_DROPBOX_REFRESH and ORGTHREAD_DROPBOX_APP_SECRET, it gets a fresh token for each command. | text on one line | none | Dropbox |
 | `ORGTHREAD_DROPBOX_API` | The address of the Dropbox API. Change it only for a test. | an address that starts with http:// or https:// | https://api.dropboxapi.com | Dropbox |
 | `ORGTHREAD_DROPBOX_CONTENT` | The address of the Dropbox content API. Change it only for a test. | an address that starts with http:// or https:// | https://content.dropboxapi.com | Dropbox |
 
@@ -86,5 +93,6 @@ The doors: `local folder` is the door on a Mac, which reads a folder on the disk
 |---|---|---|---|---|
 | `ORGTHREAD_DROPBOX_TOKEN` | A Dropbox token. With none, ORGTHREAD_DROPBOX_REFRESH, ORGTHREAD_DROPBOX_APP_KEY and ORGTHREAD_DROPBOX_APP_SECRET get a fresh one for each command. | text on one line | none | Dropbox |
 | `ORGTHREAD_DROPBOX_REFRESH` | The refresh token of the Dropbox app. | text on one line | none | Dropbox |
+| `ORGTHREAD_DROPBOX_APP_KEY` | The app key of the Dropbox app. With ORGTHREAD_DROPBOX_REFRESH and ORGTHREAD_DROPBOX_APP_SECRET, it gets a fresh token for each command. | text on one line | none | Dropbox |
 | `ORGTHREAD_DROPBOX_APP_SECRET` | The app secret of the Dropbox app. | text on one line | none | Dropbox |
 | `ORGTHREAD_LOGIN_HASH` | The hash of the password of serve --http, from orgthread password-hash. | the 64 signs of orgthread password-hash | none | both |

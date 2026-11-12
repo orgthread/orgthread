@@ -95,7 +95,47 @@ fn row_value(s: &Setting, source: &Source) -> String {
     }
 }
 
-/// The text of `orgthread config --check`, and true when every value is right.
+/// True when `ORGTHREAD_STORAGE` in effect names the Dropbox API, as the
+/// reader of the door reads it.
+pub fn dropbox_of(file: &EnvFile, env: &[(String, OsString)]) -> bool {
+    let storage = settings::find(settings::STORAGE).expect("STORAGE is in the list");
+    match source_of(storage, file, env) {
+        Source::Environment(value) => value == "dropbox",
+        Source::File(value) => value == "dropbox",
+        Source::Default => false,
+    }
+}
+
+/// The settings of the other door that have a value: hidden, and untouched.
+pub fn hidden_set(file: &EnvFile, env: &[(String, OsString)]) -> Vec<&'static Setting> {
+    let dropbox = dropbox_of(file, env);
+    ALL.iter()
+        .filter(|s| !s.doors.fits(dropbox) && source_of(s, file, env) != Source::Default)
+        .collect()
+}
+
+/// The quiet line on the hidden settings that are set, for example
+/// "2 Dropbox settings are set but not used with local".
+pub fn hidden_line(count: usize, dropbox: bool) -> Option<String> {
+    let (other, storage) = if dropbox {
+        ("local folder", "dropbox")
+    } else {
+        ("Dropbox", "local")
+    };
+    match count {
+        0 => None,
+        1 => Some(format!(
+            "1 {other} setting is set but not used with {storage}"
+        )),
+        n => Some(format!(
+            "{n} {other} settings are set but not used with {storage}"
+        )),
+    }
+}
+
+/// The text of `orgthread config --check`, and true when every value of this
+/// door is right. It shows the settings of the door that `ORGTHREAD_STORAGE`
+/// names, as the screen does. A wrong value of the other door is a warning.
 pub fn check(file: &EnvFile, env: &[(String, OsString)], env_path: &Path) -> (String, bool) {
     const NAME: usize = 30;
     let mut out = format!(
@@ -103,10 +143,18 @@ pub fn check(file: &EnvFile, env: &[(String, OsString)], env_path: &Path) -> (St
         crate::VERSION,
         env_path.display()
     );
+    let dropbox = dropbox_of(file, env);
     let mut wrong = 0;
     for group in Group::ALL {
+        let rows: Vec<&Setting> = ALL
+            .iter()
+            .filter(|s| s.group == group && s.doors.fits(dropbox))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
         out.push_str(&format!("\n{}\n", group.title()));
-        for s in ALL.iter().filter(|s| s.group == group) {
+        for s in rows {
             let source = source_of(s, file, env);
             out.push_str(&format!(
                 "  {:<NAME$} {}  ({})\n",
@@ -127,9 +175,21 @@ pub fn check(file: &EnvFile, env: &[(String, OsString)], env_path: &Path) -> (St
             out.push_str(&format!("  {:<NAME$} {}\n", u.name, unused_words(u)));
         }
     }
+    let hidden = hidden_set(file, env);
+    if let Some(line) = hidden_line(hidden.len(), dropbox) {
+        out.push_str(&format!("\n{line}\n"));
+    }
+    for s in hidden {
+        if let Some(reason) = problem_of(s, &source_of(s, file, env)) {
+            let storage = if dropbox { "dropbox" } else { "local" };
+            out.push_str(&format!(
+                "warning: {reason}. It is not used with {storage}, so it stops nothing\n"
+            ));
+        }
+    }
     out.push('\n');
     if wrong == 0 {
-        out.push_str(&format!("All {} settings are fine.\n", ALL.len()));
+        out.push_str("All settings of this door are fine.\n");
     } else {
         out.push_str(&format!(
             "{wrong} wrong. Every command but config stops with code 2 until it is fixed.\n"
@@ -156,8 +216,10 @@ pub struct Paths {
 
 enum Mode {
     List,
-    /// The new value, as typed so far.
+    /// The popup of a typed value, with the value as typed so far.
     Edit(String),
+    /// The popup of a value with fixed choices, with the place of the choice.
+    Choose(usize),
     Help,
     /// The question before a quit with changes not saved.
     Quit,
@@ -218,6 +280,29 @@ impl Config {
         self.note = Some(Note(vec![(text.to_string(), good)]));
     }
 
+    /// True when the file on the screen names the Dropbox API. A change of
+    /// `ORGTHREAD_STORAGE` changes the rows at once, before the save.
+    fn dropbox(&self) -> bool {
+        dropbox_of(&self.file, &self.env)
+    }
+
+    /// The indexes in `ALL` of the settings of this door, in their order.
+    fn visible(&self) -> Vec<usize> {
+        let dropbox = self.dropbox();
+        (0..ALL.len())
+            .filter(|&i| ALL[i].doors.fits(dropbox))
+            .collect()
+    }
+
+    /// Moves the choice by `by` rows among the settings of this door, and
+    /// stays inside the list.
+    fn step(&mut self, by: isize) {
+        let visible = self.visible();
+        let place = visible.iter().position(|&i| i == self.chosen).unwrap_or(0) as isize;
+        let next = (place + by).clamp(0, visible.len() as isize - 1);
+        self.chosen = visible[next as usize];
+    }
+
     /// The settings changed and not saved yet.
     pub fn unsaved(&self) -> Vec<&'static str> {
         self.file.changed(&self.loaded)
@@ -247,18 +332,20 @@ impl Config {
                 self.edit_key(code, ctrl);
                 return false;
             }
+            Mode::Choose(_) => {
+                self.choose_key(code, ctrl);
+                return false;
+            }
             Mode::List => {}
         }
         self.note = None;
         match code {
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('c') if ctrl => return self.quit(),
-            KeyCode::Up | KeyCode::Char('k') => self.chosen = self.chosen.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.chosen = (self.chosen + 1).min(ALL.len() - 1)
-            }
-            KeyCode::Home | KeyCode::Char('g') => self.chosen = 0,
-            KeyCode::End | KeyCode::Char('G') => self.chosen = ALL.len() - 1,
+            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::Home | KeyCode::Char('g') => self.step(-(ALL.len() as isize)),
+            KeyCode::End | KeyCode::Char('G') => self.step(ALL.len() as isize),
             KeyCode::Enter => self.edit(),
             KeyCode::Char('d') => self.reset(),
             KeyCode::Char('s') => self.save(),
@@ -290,6 +377,44 @@ impl Config {
         }
     }
 
+    /// A key in the popup of choices: up and down choose, Enter keeps.
+    fn choose_key(&mut self, code: KeyCode, ctrl: bool) {
+        let count = self.setting().kind.choices().len();
+        let Mode::Choose(place) = &mut self.mode else {
+            return;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => *place = place.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *place = (*place + 1).min(count - 1),
+            KeyCode::Enter => {
+                let place = *place;
+                self.keep_choice(place);
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+                self.say("Nothing changed.", true);
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.mode = Mode::List;
+                self.say("Nothing changed.", true);
+            }
+            _ => {}
+        }
+    }
+
+    /// Enter on a choice. The value that holds already changes nothing, so
+    /// the default stays a missing line.
+    fn keep_choice(&mut self, place: usize) {
+        let s = self.setting();
+        let value = s.kind.choices()[place];
+        let now = self.file.value(s.name).unwrap_or(default_choice(s));
+        if value != now {
+            self.file.set(s.name, value);
+        }
+        self.mode = Mode::List;
+        self.note = None;
+    }
+
     fn quit(&mut self) -> bool {
         if self.unsaved().is_empty() {
             return true;
@@ -317,6 +442,14 @@ impl Config {
             return;
         }
         let s = self.setting();
+        let choices = s.kind.choices();
+        if !choices.is_empty() {
+            let now = self.file.value(s.name).unwrap_or(default_choice(s));
+            let place = choices.iter().position(|c| *c == now);
+            let place = place.or_else(|| choices.iter().position(|c| *c == default_choice(s)));
+            self.mode = Mode::Choose(place.unwrap_or(0));
+            return;
+        }
         let start = if s.secret {
             String::new()
         } else {
@@ -382,8 +515,14 @@ impl Config {
             stamp: &stamp,
             now: &now,
         };
+        // A setting that the environment holds, or that the door does not
+        // read, stays as it is and is not checked.
         let env = &self.env;
-        let skip = |name: &str| env.iter().any(|(n, _)| n == name);
+        let dropbox = self.dropbox();
+        let skip = |name: &str| {
+            env.iter().any(|(n, _)| n == name)
+                || settings::find(name).is_some_and(|s| !s.doors.fits(dropbox))
+        };
         match envfile::save(&place, &self.loaded, &self.file, &skip) {
             Ok(saved) => {
                 self.loaded = self.file.clone();
@@ -426,9 +565,18 @@ impl Config {
         let changed = self.unsaved();
         let mut items = Vec::new();
         let mut chosen_row = 0;
+        let dropbox = self.dropbox();
         for group in Group::ALL {
+            let rows: Vec<(usize, &Setting)> = ALL
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.group == group && s.doors.fits(dropbox))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
             items.push(ListItem::new(Line::styled(group.title().to_string(), bold)));
-            for (i, s) in ALL.iter().enumerate().filter(|(_, s)| s.group == group) {
+            for (i, s) in rows {
                 if i == self.chosen {
                     chosen_row = items.len();
                 }
@@ -476,6 +624,10 @@ impl Config {
                 items.push(ListItem::new(Text::from(lines)).style(Style::new().fg(ORANGE)));
             }
         }
+        let hidden = hidden_set(&self.file, &self.env).len();
+        if let Some(line) = hidden_line(hidden, dropbox) {
+            items.push(ListItem::new(Text::from(plain(&line, width, Style::new()))));
+        }
         (items, chosen_row)
     }
 
@@ -507,23 +659,13 @@ impl Config {
         lines
     }
 
-    /// The last lines: the typing, an answer, or the keys.
+    /// The last lines: an answer, or the keys.
     fn foot(&self, width: u16) -> Vec<Line<'static>> {
         let w = usize::from(width);
         let mut lines = Vec::new();
-        if let Mode::Edit(typed) = &self.mode {
-            let s = self.setting();
-            // A secret shows nothing while it is typed or pasted, not even
-            // its length: the line stays the same for every sign.
-            let shown = if s.secret { "" } else { typed.as_str() };
-            let bold = Style::new().add_modifier(Modifier::BOLD);
-            lines.extend(plain(&format!("New value: {shown}_"), w, bold));
-            let keys = if s.secret {
-                "enter: keep  esc: back. The typing is hidden."
-            } else {
-                "enter: keep  esc: back  empty: default"
-            };
-            lines.extend(plain(keys, w, Style::new()));
+        // In the popup, its own lines hold the answer and the keys.
+        if matches!(self.mode, Mode::Edit(_) | Mode::Choose(_)) {
+            return lines;
         }
         if let Some(Note(notes)) = &self.note {
             for (text, good) in notes {
@@ -593,8 +735,71 @@ impl Config {
                 draw_panel(frame, 72, block, |width| self.help_lines(width));
             }
             Mode::Quit => self.draw_quit(frame),
-            _ => {}
+            Mode::Edit(_) | Mode::Choose(_) => self.draw_edit(frame),
+            Mode::List => {}
         }
+    }
+
+    /// The lines of the edit popup: what the setting is, its value now, the
+    /// field or the choices, why a value is wrong, and the keys.
+    fn edit_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let s = self.setting();
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let mut lines = plain(s.name, width, bold);
+        lines.extend(plain(s.help, width, Style::new()));
+        lines.extend(labelled("Now", &row_value(s, &self.source(s)), width));
+        lines.extend(labelled("Default", s.default, width));
+        lines.push(Line::raw(""));
+        let keys = match &self.mode {
+            Mode::Choose(place) => {
+                for (i, choice) in s.kind.choices().iter().enumerate() {
+                    if i == *place {
+                        let style = Style::new().fg(ORANGE).add_modifier(Modifier::BOLD);
+                        lines.extend(plain(&format!("> {choice}"), width, style));
+                    } else {
+                        lines.extend(plain(&format!("  {choice}"), width, Style::new()));
+                    }
+                }
+                "up, down: choose  enter: keep  esc: back"
+            }
+            Mode::Edit(typed) => {
+                // A secret shows nothing while it is typed or pasted, not even
+                // its length: the field stays the same for every sign.
+                let shown = if s.secret { "" } else { typed.as_str() };
+                lines.extend(plain(&format!("> {shown}_"), width, bold));
+                if s.secret {
+                    "enter: keep  esc: back"
+                } else {
+                    "enter: keep  esc: back  empty: default"
+                }
+            }
+            _ => "",
+        };
+        if let Some(Note(notes)) = &self.note {
+            for (text, _) in notes {
+                lines.extend(plain(text, width, Style::new().fg(ORANGE)));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.extend(plain(keys, width, Style::new()));
+        lines
+    }
+
+    /// The edit popup, centered over the list, with an orange border, as the
+    /// revert question of watch.
+    fn draw_edit(&self, frame: &mut Frame) {
+        let title = Span::styled(
+            " Change a setting ",
+            Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
+        );
+        let block = Block::bordered()
+            .border_style(Style::new().fg(ORANGE))
+            .padding(Padding::horizontal(1))
+            .title(title);
+        // The padding takes one column on each side.
+        draw_panel(frame, 64, block, |width| {
+            self.edit_lines(width.saturating_sub(2))
+        });
     }
 
     fn help_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -663,12 +868,20 @@ impl Config {
     }
 }
 
+/// The choice that holds when the setting has no line.
+fn default_choice(s: &Setting) -> &'static str {
+    match s.kind {
+        settings::Kind::YesNo => "no",
+        _ => s.kind.choices().first().copied().unwrap_or(""),
+    }
+}
+
 const KEYS: [(&str, &str); 7] = [
     ("up, k", "the setting above"),
     ("down, j", "the setting below"),
     (
         "Enter",
-        "change the value. Enter again keeps it, Esc goes back. An empty value is the default",
+        "change the value in a popup. Enter keeps it, Esc goes back. An empty value is the default. Up and down choose for a setting with fixed choices",
     ),
     ("d", "back to the default: the line goes from .env"),
     (
@@ -679,7 +892,8 @@ const KEYS: [(&str, &str); 7] = [
     ("q, Ctrl+C", "quit. With a change not saved, it asks first"),
 ];
 
-const HELP: [&str; 4] = [
+const HELP: [&str; 5] = [
+    "The screen shows the settings of the door that ORGTHREAD_STORAGE names, and those of both doors. Change ORGTHREAD_STORAGE to see the rows of the other door. A hidden setting that is set stays in .env, untouched, and a line at the bottom counts it.",
     "A secret shows only as set or not set. Enter replaces it. The typing shows nothing, not even its length. The old value is never shown, never logged and never listed.",
     "A setting that the environment holds wins over .env, and cannot be changed here. A name of .env that no setting has, such as a typo, shows at the bottom as not used. Such lines and the comments stay in place.",
     "s keeps the old file as .env.before-config-<date>-<time>, the way back by hand. Then it writes the new file in one step, with the rights 600, and logs one configured line per changed name, never a value.",
@@ -712,7 +926,10 @@ pub fn run(mut config: Config) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::screen::text_of;
-    use crate::settings::{DENY, DROPBOX_TOKEN, LOGIN_HASH, OWNER, ROOT, STORAGE, UPLOAD_MB};
+    use crate::settings::{
+        DENY, DROPBOX_API, DROPBOX_APP_KEY, DROPBOX_TOKEN, LISTEN_ANYWHERE, LOGIN_HASH, OWNER,
+        ROOT, STORAGE, UPLOAD_MB, VERSIONS,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
 
@@ -764,11 +981,16 @@ mod tests {
         }
     }
 
+    /// Chooses the row of `name`, which must be shown.
     fn choose(c: &mut Config, name: &str) {
         c.key(KeyCode::Char('g'), false);
-        while c.setting().name != name {
+        for _ in 0..ALL.len() {
+            if c.setting().name == name {
+                return;
+            }
             c.key(KeyCode::Char('j'), false);
         }
+        panic!("{name} is not shown");
     }
 
     fn type_value(c: &mut Config, name: &str, value: &str) {
@@ -782,36 +1004,292 @@ mod tests {
         c.key(KeyCode::Enter, false);
     }
 
+    /// A local door, with a Dropbox token that this door does not read.
     const FILE: &str = "# invented door\nORGTHREAD_OWNER=Ana\nORGTHREAD_OWNR=typo\nORGTHREAD_DROPBOX_TOKEN=invented-secret-token-91f2\n";
+    /// A Dropbox door, with two Dropbox secrets.
+    const DROPBOX: &str = "ORGTHREAD_STORAGE=dropbox\nORGTHREAD_DROPBOX_TOKEN=invented-secret-token-91f2\nORGTHREAD_DROPBOX_APP_KEY=invented-app-key-77c1\n";
 
+    fn dropbox_names() -> Vec<&'static str> {
+        ALL.iter()
+            .filter(|s| s.doors == settings::Doors::Dropbox)
+            .map(|s| s.name)
+            .collect()
+    }
+
+    /// Decisions 1 and 2: Basics first, then the groups, with only the rows of
+    /// the door that ORGTHREAD_STORAGE names.
     #[test]
-    fn the_screen_shows_every_setting_in_its_group() {
+    fn the_screen_shows_the_rows_of_its_door_in_their_groups() {
         let f = Folder::new("groups");
-        let c = f.config(FILE, &[]);
-        let text = screen(&c, 110, 80);
-        let mut at = 0;
-        for group in Group::ALL {
-            let found = text[at..]
-                .find(group.title())
-                .unwrap_or_else(|| panic!("{}", group.title()));
-            at += found;
-            for s in ALL.iter().filter(|s| s.group == group) {
-                assert!(
-                    text[at..].contains(s.name),
-                    "{} in {}",
-                    s.name,
-                    group.title()
-                );
+        for (text, dropbox) in [(FILE, false), (DROPBOX, true)] {
+            let c = f.config(text, &[]);
+            let shown = screen(&c, 110, 80);
+            let mut at = 0;
+            for group in Group::ALL {
+                let rows: Vec<&Setting> = ALL
+                    .iter()
+                    .filter(|s| s.group == group && s.doors.fits(dropbox))
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                at += shown[at..]
+                    .find(group.title())
+                    .unwrap_or_else(|| panic!("{}: {shown}", group.title()));
+                for s in rows {
+                    at += shown[at..]
+                        .find(s.name)
+                        .unwrap_or_else(|| panic!("{} out of order: {shown}", s.name));
+                }
+            }
+            let first = shown.find("Basics").unwrap();
+            assert!(first < shown.find("ORGTHREAD_OWNER").unwrap());
+            assert!(shown.find("ORGTHREAD_OWNER") < shown.find("ORGTHREAD_STORAGE"));
+            assert!(shown.find("ORGTHREAD_STORAGE") < shown.find("Folders and logs"));
+            if dropbox {
+                for name in [ROOT, VERSIONS] {
+                    assert!(!shown.contains(name), "{name}: {shown}");
+                }
+                assert!(shown.contains(DROPBOX_API), "{shown}");
+            } else {
+                for name in dropbox_names() {
+                    assert!(!shown.contains(name), "{name}: {shown}");
+                }
+                assert!(!shown.contains("\nDropbox\n") && !shown.contains("│Dropbox "));
+                assert!(shown.contains(ROOT), "{shown}");
             }
         }
-        assert!(text.contains("20 (default)"), "{text}");
-        assert!(text.contains("Ana"), "{text}");
+    }
+
+    /// Decision 3: a change of ORGTHREAD_STORAGE changes the rows at once,
+    /// before the save.
+    #[test]
+    fn a_change_of_storage_changes_the_rows_before_the_save() {
+        let f = Folder::new("switch");
+        let mut c = f.config("ORGTHREAD_OWNER=Ana\n", &[]);
+        assert!(!screen(&c, 110, 80).contains(DROPBOX_API));
+        choose(&mut c, STORAGE);
+        c.key(KeyCode::Enter, false);
+        c.key(KeyCode::Down, false);
+        c.key(KeyCode::Enter, false);
+        let shown = screen(&c, 110, 80);
+        assert!(shown.contains(DROPBOX_API), "{shown}");
+        assert!(!shown.contains(ROOT), "{shown}");
+        assert_eq!(f.env_text(), "ORGTHREAD_OWNER=Ana\n", "nothing saved yet");
+        // The new rows can be filled in the same visit.
+        type_value(&mut c, DROPBOX_API, "https://api.example.com");
+        c.key(KeyCode::Char('s'), false);
+        assert_eq!(
+            f.env_text(),
+            "ORGTHREAD_OWNER=Ana\nORGTHREAD_STORAGE=dropbox\nORGTHREAD_DROPBOX_API=https://api.example.com\n"
+        );
+    }
+
+    /// Decision 4: a hidden setting that is set stays untouched, and one quiet
+    /// line counts it.
+    #[test]
+    fn a_hidden_setting_that_is_set_stays_and_a_line_counts_it() {
+        let f = Folder::new("hidden");
+        let text = "ORGTHREAD_DROPBOX_API=https://api.example.com\nORGTHREAD_OWNER=Ana\nORGTHREAD_DROPBOX_TOKEN=invented-token\n";
+        let mut c = f.config(text, &[]);
+        let shown = screen(&c, 110, 80);
+        assert!(
+            shown.contains("2 Dropbox settings are set but not used with local"),
+            "{shown}"
+        );
+        type_value(&mut c, OWNER, "Bo");
+        c.key(KeyCode::Char('s'), false);
+        assert_eq!(
+            f.env_text(),
+            "ORGTHREAD_DROPBOX_API=https://api.example.com\nORGTHREAD_OWNER=Bo\nORGTHREAD_DROPBOX_TOKEN=invented-token\n"
+        );
+        let c = f.config(
+            "ORGTHREAD_STORAGE=dropbox\nORGTHREAD_ROOT=/srv/invented\n",
+            &[],
+        );
+        let shown = screen(&c, 110, 80);
+        assert!(
+            shown.contains("1 local folder setting is set but not used with dropbox"),
+            "{shown}"
+        );
+        let c = f.config("ORGTHREAD_OWNER=Ana\n", &[]);
+        assert!(!screen(&c, 110, 80).contains("but not used"));
+    }
+
+    /// Decision 5: a wrong value of the other door blocks no save.
+    #[test]
+    fn a_wrong_hidden_value_blocks_no_save() {
+        let f = Folder::new("hidden-wrong");
+        let mut c = f.config("ORGTHREAD_DROPBOX_API=ftp://invented\n", &[]);
+        type_value(&mut c, OWNER, "Bo");
+        c.key(KeyCode::Char('s'), false);
+        assert_eq!(
+            f.env_text(),
+            "ORGTHREAD_DROPBOX_API=ftp://invented\nORGTHREAD_OWNER=Bo\n"
+        );
+    }
+
+    /// Decision 8: no key shows the rows of the other door.
+    #[test]
+    fn no_key_shows_the_rows_of_the_other_door() {
+        let f = Folder::new("no-key");
+        let mut c = f.config(FILE, &[]);
+        let mut codes: Vec<KeyCode> = ('!'..='~')
+            .filter(|c| *c != 'q')
+            .map(KeyCode::Char)
+            .collect();
+        codes.extend([
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Insert,
+            KeyCode::F(1),
+            KeyCode::F(2),
+        ]);
+        for code in codes {
+            for ctrl in [false, true] {
+                if ctrl && code == KeyCode::Char('c') {
+                    continue;
+                }
+                c.key(code, ctrl);
+                let shown = screen(&c, 110, 80);
+                for name in dropbox_names() {
+                    assert!(!shown.contains(name), "{code:?} shows {name}: {shown}");
+                }
+                if !matches!(c.mode, Mode::List) {
+                    c.key(KeyCode::Esc, false);
+                }
+            }
+        }
+    }
+
+    /// Decision 9: the app key is a secret, hidden with local, and never in
+    /// clear with dropbox.
+    #[test]
+    fn the_app_key_is_a_secret() {
+        let f = Folder::new("app-key");
+        let mut c = f.config(DROPBOX, &[]);
+        for width in [110, 40] {
+            let shown = screen(&c, width, 200);
+            assert!(!shown.contains("invented-app-key"), "{shown}");
+            assert!(shown.contains(DROPBOX_APP_KEY), "{shown}");
+        }
+        let at = screen(&c, 110, 200).find("Secrets").unwrap();
+        assert!(screen(&c, 110, 200)[at..].contains(DROPBOX_APP_KEY));
+        choose(&mut c, DROPBOX_APP_KEY);
+        let shown = screen(&c, 110, 80);
+        assert!(shown.contains("secret: set"), "{shown}");
+        c.key(KeyCode::Enter, false);
+        let shown = screen(&c, 110, 80);
+        assert!(!shown.contains("invented-app-key"), "{shown}");
+        let (text, _) = check(&EnvFile::parse(DROPBOX), &[], Path::new("/invented/.env"));
+        assert!(!text.contains("invented-app-key"), "{text}");
+        let c = f.config("ORGTHREAD_DROPBOX_APP_KEY=invented-app-key-77c1\n", &[]);
+        assert!(!screen(&c, 110, 80).contains(DROPBOX_APP_KEY));
+    }
+
+    /// True when the screen has a corner of a border drawn in orange.
+    fn orange_border(c: &Config, width: u16, height: u16) -> bool {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+        t.draw(|f| c.draw(f)).unwrap();
+        t.backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "┌" && cell.fg == ORANGE)
+    }
+
+    /// Decision 10: Enter opens a centered popup with an orange border: the
+    /// name, the help line, the value now and the default, the field, and
+    /// the keys.
+    #[test]
+    fn every_edit_happens_in_a_popup() {
+        let f = Folder::new("popup");
+        let mut c = f.config(FILE, &[]);
+        assert!(!orange_border(&c, 110, 60));
+        choose(&mut c, OWNER);
+        c.key(KeyCode::Enter, false);
+        assert!(orange_border(&c, 110, 60));
+        let shown = screen(&c, 110, 60);
+        let owner = settings::find(OWNER).unwrap();
+        for part in [
+            "Change a setting",
+            "Now       Ana",
+            "Default   owner",
+            "> Ana_",
+            "enter: keep  esc: back  empty: default",
+        ] {
+            assert!(shown.contains(part), "{part}: {shown}");
+        }
+        assert!(shown.contains(&owner.help[..30]), "{shown}");
+        // No typing line at the foot: the popup holds it.
+        assert!(!shown.contains("New value"), "{shown}");
+        c.key(KeyCode::Esc, false);
+        assert!(!orange_border(&c, 110, 60));
+        // A secret: the field stays empty.
+        choose(&mut c, LOGIN_HASH);
+        c.key(KeyCode::Enter, false);
+        keys(&mut c, "invented");
+        let shown = screen(&c, 110, 60);
+        assert!(shown.contains("> _"), "{shown}");
+        assert!(shown.contains("enter: keep  esc: back"), "{shown}");
+        // A wrong value keeps the popup open and says why.
+        c.key(KeyCode::Enter, false);
+        let shown = screen(&c, 110, 60);
+        assert!(matches!(c.mode, Mode::Edit(_)));
+        assert!(shown.contains("Change a setting"), "{shown}");
+        assert!(
+            shown.contains("ORGTHREAD_LOGIN_HASH needs the 64 signs"),
+            "{shown}"
+        );
+        c.key(KeyCode::Esc, false);
+        assert!(c.unsaved().is_empty());
+    }
+
+    /// Decision 10: STORAGE and LISTEN_ANYWHERE offer their choices with up
+    /// and down. The choice that holds already adds no line.
+    #[test]
+    fn storage_and_listen_anywhere_choose_with_up_and_down() {
+        let f = Folder::new("choices");
+        let mut c = f.config("", &[]);
+        choose(&mut c, STORAGE);
+        c.key(KeyCode::Enter, false);
+        assert!(matches!(c.mode, Mode::Choose(0)));
+        let shown = screen(&c, 110, 60);
+        assert!(
+            shown.contains("> local") && shown.contains("  dropbox"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("up, down: choose  enter: keep  esc: back"),
+            "{shown}"
+        );
+        c.key(KeyCode::Up, false);
+        c.key(KeyCode::Enter, false);
+        assert!(c.unsaved().is_empty(), "local holds already: no line");
+        choose(&mut c, LISTEN_ANYWHERE);
+        c.key(KeyCode::Enter, false);
+        let shown = screen(&c, 110, 60);
+        assert!(shown.contains("> no") && shown.contains("  yes"), "{shown}");
+        c.key(KeyCode::Char('k'), false);
+        assert!(screen(&c, 110, 60).contains("> yes"));
+        c.key(KeyCode::Enter, false);
+        c.key(KeyCode::Char('s'), false);
+        assert_eq!(f.env_text(), "ORGTHREAD_LISTEN_ANYWHERE=yes\n");
+        // Esc goes back and changes nothing.
+        c.key(KeyCode::Enter, false);
+        c.key(KeyCode::Down, false);
+        c.key(KeyCode::Esc, false);
+        assert!(c.unsaved().is_empty());
     }
 
     #[test]
     fn a_secret_shows_only_as_set_or_not_set() {
         let f = Folder::new("secret");
-        let mut c = f.config(FILE, &[(LOGIN_HASH, &"ab".repeat(32))]);
+        let mut c = f.config(DROPBOX, &[(LOGIN_HASH, &"ab".repeat(32))]);
         for width in [110, 40] {
             let text = screen(&c, width, 200);
             assert!(!text.contains(TOKEN) && !text.contains("abab"), "{text}");
@@ -822,7 +1300,7 @@ mod tests {
         choose(&mut c, DROPBOX_TOKEN);
         c.key(KeyCode::Enter, false);
         let text = screen(&c, 110, 80);
-        assert!(text.contains("New value: _"), "{text}");
+        assert!(text.contains("> _"), "{text}");
         keys(&mut c, "new-invented-token");
         let text = screen(&c, 110, 80);
         assert!(!text.contains("new-invented"), "{text}");
@@ -850,7 +1328,7 @@ mod tests {
     fn the_typing_of_a_secret_shows_nothing_not_even_its_length() {
         let f = Folder::new("secret-typing");
         for width in [110, 40] {
-            let mut c = f.config("", &[]);
+            let mut c = f.config("ORGTHREAD_STORAGE=dropbox\n", &[]);
             choose(&mut c, DROPBOX_TOKEN);
             c.key(KeyCode::Enter, false);
             let empty = screen(&c, width, 60);
@@ -877,7 +1355,7 @@ mod tests {
     #[test]
     fn an_empty_enter_on_a_secret_keeps_it() {
         let f = Folder::new("secret-empty");
-        let mut c = f.config(FILE, &[]);
+        let mut c = f.config(DROPBOX, &[]);
         choose(&mut c, DROPBOX_TOKEN);
         c.key(KeyCode::Enter, false);
         c.key(KeyCode::Enter, false);
@@ -987,6 +1465,8 @@ mod tests {
         let text = screen(&c, 110, 80);
         assert!(text.contains("From Env (from the environment)"), "{text}");
         assert!(text.contains("dropbox (from the environment)"), "{text}");
+        // The environment names the door: the Dropbox rows show.
+        assert!(text.contains(DROPBOX_API), "{text}");
         choose(&mut c, OWNER);
         c.key(KeyCode::Enter, false);
         assert!(matches!(c.mode, Mode::List));
@@ -1027,17 +1507,19 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_move_and_stay_inside_the_list() {
+    fn the_keys_move_and_stay_inside_the_rows_of_the_door() {
         let f = Folder::new("move");
         let mut c = f.config("", &[]);
+        let visible = c.visible();
         c.key(KeyCode::Up, false);
-        assert_eq!(c.chosen, 0);
+        assert_eq!(c.chosen, visible[0]);
         for _ in 0..100 {
             c.key(KeyCode::Down, false);
+            assert!(visible.contains(&c.chosen), "{}", c.setting().name);
         }
-        assert_eq!(c.chosen, ALL.len() - 1);
+        assert_eq!(c.chosen, visible[visible.len() - 1]);
         c.key(KeyCode::Char('k'), false);
-        assert_eq!(c.chosen, ALL.len() - 2);
+        assert_eq!(c.chosen, visible[visible.len() - 2]);
         c.key(KeyCode::Char('?'), false);
         assert!(screen(&c, 110, 60).contains("Help"));
         c.key(KeyCode::Esc, false);
@@ -1045,41 +1527,77 @@ mod tests {
     }
 
     /// A narrow terminal, as for the popup of watch: the list, the details,
-    /// the typing, the help and the quit question all fit at 40 columns, and
-    /// no word is lost at the edge.
+    /// the edit popup, the choices, the help and the quit question all fit
+    /// at 40 columns, and no word is lost at the edge.
     #[test]
-    fn the_screen_fits_40_columns() {
+    fn the_screen_and_the_popup_fit_40_columns() {
         let f = Folder::new("narrow");
         let mut c = f.config(FILE, &[]);
+        let fits = |text: &str| {
+            for line in text.lines() {
+                assert!(line.chars().count() <= 40, "{line}");
+            }
+        };
         let text = screen(&c, 40, 30);
+        fits(&text);
         assert!(text.contains("ORGTHREAD_ROOT"), "{text}");
         assert!(
             text.contains("enter: change  s: save  ?: help  q: quit"),
             "{text}"
         );
-        for line in text.lines() {
-            assert!(line.chars().count() <= 40, "{line}");
-        }
-        // Each setting has its full name on the screen when chosen.
-        for s in &ALL {
-            choose(&mut c, s.name);
+        // Each setting of the door has its full name on the screen when chosen.
+        for i in c.visible() {
+            choose(&mut c, ALL[i].name);
             let text = screen(&c, 40, 30);
-            assert!(text.contains(s.name), "{}: {text}", s.name);
+            assert!(text.contains(ALL[i].name), "{}: {text}", ALL[i].name);
         }
         type_value(&mut c, UPLOAD_MB, "50");
+        // The popup of a typed value.
         choose(&mut c, OWNER);
         c.key(KeyCode::Enter, false);
         let text = screen(&c, 40, 30);
-        assert!(text.contains("New value: Ana_"), "{text}");
-        assert!(text.contains("enter: keep  esc: back  empty:"), "{text}");
+        fits(&text);
+        assert!(orange_border(&c, 40, 30));
+        for part in [
+            "Change a setting",
+            "ORGTHREAD_OWNER",
+            "> Ana_",
+            "enter: keep  esc: back",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        // A wrong value says why, inside the popup.
+        c.key(KeyCode::Esc, false);
+        type_value(&mut c, UPLOAD_MB, "abc");
+        let text = screen(&c, 40, 30);
+        fits(&text);
+        assert!(text.contains("ORGTHREAD_UPLOAD_MB"), "{text}");
+        assert!(text.contains("number of MB, not abc"), "{text}");
+        c.key(KeyCode::Esc, false);
+        // The popup of choices.
+        choose(&mut c, STORAGE);
+        c.key(KeyCode::Enter, false);
+        let text = screen(&c, 40, 30);
+        fits(&text);
+        assert!(
+            text.contains("> local") && text.contains("dropbox"),
+            "{text}"
+        );
+        assert!(
+            text.contains("up, down: choose  enter: keep  esc:"),
+            "{text}"
+        );
+        assert!(text.contains("│ back"), "{text}");
         c.key(KeyCode::Esc, false);
         c.key(KeyCode::Char('?'), false);
         let text = screen(&c, 40, 60);
+        fits(&text);
         assert!(text.contains("Help"), "{text}");
         assert!(text.contains("q, Ctrl+C"), "{text}");
         c.key(KeyCode::Esc, false);
         c.key(KeyCode::Char('q'), false);
         let text = screen(&c, 40, 30);
+        fits(&text);
         assert!(text.contains("Quit without saving?"), "{text}");
         assert!(text.contains("y: quit, and the"), "{text}");
         assert!(text.contains("any other key: stay"), "{text}");
@@ -1093,27 +1611,51 @@ mod tests {
         screen(&c, 10, 4);
         c.key(KeyCode::Char('?'), false);
         screen(&c, 10, 4);
+        c.key(KeyCode::Esc, false);
+        c.key(KeyCode::Enter, false);
+        screen(&c, 10, 4);
     }
 
+    /// Decision 6: the check has the order and the filter of the screen, and
+    /// the quiet line. A wrong value of the other door is a warning only.
     #[test]
-    fn the_check_lists_every_setting_and_hides_the_secrets() {
+    fn the_check_lists_the_rows_of_its_door_and_hides_the_secrets() {
         let file = EnvFile::parse(FILE);
         let env = vec![(UPLOAD_MB.to_string(), OsString::from("30"))];
         let (text, fine) = check(&file, &env, Path::new("/invented/.env"));
         assert!(fine, "{text}");
-        for s in &ALL {
-            assert!(text.contains(s.name), "{}", s.name);
+        let mut at = 0;
+        for s in ALL.iter().filter(|s| s.doors.fits(false)) {
+            at += text[at..]
+                .find(s.name)
+                .unwrap_or_else(|| panic!("{} out of order: {text}", s.name));
         }
+        for name in dropbox_names() {
+            assert!(!text.contains(name), "{name}: {text}");
+        }
+        assert!(text.find("\nBasics\n") < text.find("\nFolders and logs\n"));
         assert!(!text.contains(TOKEN), "{text}");
-        assert!(text.contains("ORGTHREAD_DROPBOX_TOKEN"), "{text}");
-        assert!(text.contains("secret: set  (.env)"), "{text}");
         assert!(text.contains("30  (environment)"), "{text}");
         assert!(text.contains("Ana  (.env)"), "{text}");
         assert!(text.contains("250  (default)"), "{text}");
         assert!(text.contains("ORGTHREAD_OWNR"), "{text}");
-        assert!(text.ends_with("All 27 settings are fine.\n"), "{text}");
+        assert!(
+            text.contains("1 Dropbox setting is set but not used with local"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("All settings of this door are fine.\n"),
+            "{text}"
+        );
 
-        let file = EnvFile::parse("ORGTHREAD_UPLOAD_MB=abc\nORGTHREAD_LOGIN_HASH=invented-wrong\n");
+        let (text, _) = check(&EnvFile::parse(DROPBOX), &[], Path::new("/invented/.env"));
+        assert!(!text.contains(ROOT) && !text.contains(VERSIONS), "{text}");
+        assert!(text.contains("secret: set  (.env)"), "{text}");
+        assert!(!text.contains(TOKEN), "{text}");
+
+        let file = EnvFile::parse(
+            "ORGTHREAD_UPLOAD_MB=abc\nORGTHREAD_LOGIN_HASH=invented-wrong\nORGTHREAD_DROPBOX_API=ftp://invented\n",
+        );
         let (text, fine) = check(&file, &[], Path::new("/invented/.env"));
         assert!(!fine);
         assert!(
@@ -1122,5 +1664,14 @@ mod tests {
         );
         assert!(text.contains("wrong: ORGTHREAD_LOGIN_HASH"), "{text}");
         assert!(!text.contains("invented-wrong"), "{text}");
+        assert!(
+            text.contains("warning: ORGTHREAD_DROPBOX_API needs an address"),
+            "{text}"
+        );
+        // A wrong value of the other door alone ends with 0.
+        let file = EnvFile::parse("ORGTHREAD_DROPBOX_API=ftp://invented\n");
+        let (text, fine) = check(&file, &[], Path::new("/invented/.env"));
+        assert!(fine, "{text}");
+        assert!(text.contains("warning: ORGTHREAD_DROPBOX_API"), "{text}");
     }
 }
