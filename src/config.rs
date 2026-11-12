@@ -1389,7 +1389,14 @@ mod tests {
             log.contains("\tconfigured\tORGTHREAD_UPLOAD_MB\tAna (config)\t"),
             "{log}"
         );
-        assert!(!log.contains("50"), "{log}");
+        // The value never shows. Each line starts with the time, which may hold
+        // "50" itself, so only the fields after the time are checked.
+        for line in log.lines() {
+            assert!(
+                line.split('\t').skip(1).all(|field| !field.contains("50")),
+                "{line}"
+            );
+        }
         let text = screen(&c, 110, 80);
         assert!(text.contains("Saved: ORGTHREAD_UPLOAD_MB."), "{text}");
         assert!(text.contains(&copies[0]), "{text}");
