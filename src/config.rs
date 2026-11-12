@@ -513,11 +513,9 @@ impl Config {
         let mut lines = Vec::new();
         if let Mode::Edit(typed) = &self.mode {
             let s = self.setting();
-            let shown = if s.secret {
-                "*".repeat(typed.chars().count())
-            } else {
-                typed.clone()
-            };
+            // A secret shows nothing while it is typed or pasted, not even
+            // its length: the line stays the same for every sign.
+            let shown = if s.secret { "" } else { typed.as_str() };
             let bold = Style::new().add_modifier(Modifier::BOLD);
             lines.extend(plain(&format!("New value: {shown}_"), w, bold));
             let keys = if s.secret {
@@ -682,7 +680,7 @@ const KEYS: [(&str, &str); 7] = [
 ];
 
 const HELP: [&str; 4] = [
-    "A secret shows only as set or not set. Enter replaces it, with hidden typing. The old value is never shown, never logged and never listed.",
+    "A secret shows only as set or not set. Enter replaces it. The typing shows nothing, not even its length. The old value is never shown, never logged and never listed.",
     "A setting that the environment holds wins over .env, and cannot be changed here. A name of .env that no setting has, such as a typo, shows at the bottom as not used. Such lines and the comments stay in place.",
     "s keeps the old file as .env.before-config-<date>-<time>, the way back by hand. Then it writes the new file in one step, with the rights 600, and logs one configured line per changed name, never a value.",
     "The screen shows how to restart, and never restarts anything itself.",
@@ -828,7 +826,6 @@ mod tests {
         keys(&mut c, "new-invented-token");
         let text = screen(&c, 110, 80);
         assert!(!text.contains("new-invented"), "{text}");
-        assert!(text.contains(&"*".repeat(18)), "{text}");
         c.key(KeyCode::Enter, false);
         c.key(KeyCode::Char('s'), false);
         assert!(
@@ -845,6 +842,36 @@ mod tests {
             log.contains("ORGTHREAD_DROPBOX_TOKEN") && !log.contains("invented-token"),
             "{log}"
         );
+    }
+
+    /// While a secret is typed or pasted, the screen shows nothing of it: no
+    /// sign, no `*`, and nothing that changes with its length.
+    #[test]
+    fn the_typing_of_a_secret_shows_nothing_not_even_its_length() {
+        let f = Folder::new("secret-typing");
+        for width in [110, 40] {
+            let mut c = f.config("", &[]);
+            choose(&mut c, DROPBOX_TOKEN);
+            c.key(KeyCode::Enter, false);
+            let empty = screen(&c, width, 60);
+            assert!(!empty.contains('*'), "{empty}");
+            for typed in ["Z", "invented-token-of-24-sig", &"p".repeat(64)] {
+                keys(&mut c, typed);
+                let text = screen(&c, width, 60);
+                assert!(!text.contains('*'), "{text}");
+                assert!(!text.contains(typed), "{text}");
+                assert_eq!(text, empty, "the screen changed with {} signs", typed.len());
+                for _ in 0..typed.len() {
+                    c.key(KeyCode::Backspace, false);
+                }
+            }
+            // After Enter, the row says set, and still shows nothing more.
+            keys(&mut c, "invented-token");
+            c.key(KeyCode::Enter, false);
+            let text = screen(&c, width, 200);
+            assert!(text.contains("secret: set"), "{text}");
+            assert!(!text.contains("invented-token"), "{text}");
+        }
     }
 
     #[test]

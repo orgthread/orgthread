@@ -849,7 +849,7 @@ A wrong value stops every command with code 2, wrong use, and the message names 
 | `?` | Help |
 | `q` | Quit. With a change not saved, it asks first |
 
-- A secret shows only as `secret: set` or `secret: not set`. Enter replaces it, with hidden typing. The old value is never shown, never logged and never listed.
+- A secret shows only as `secret: set` or `secret: not set`. Enter replaces it. The typing shows nothing, not even its length. The old value is never shown, never logged and never listed.
 - A setting that the environment holds shows as `from the environment`, with the value in effect, and cannot be changed on the screen.
 - A line that names no setting of the list, such as a typo `ORGTHREAD_OWNR`, shows at the bottom as `not used`. Such lines and the comments stay in place.
 - `s` checks every value first: a wrong one saves nothing. If `.env` changed on the disk since the screen read it, it saves nothing either. Then it keeps the old file as `.env.before-config-<date>-<time>`, writes the new `.env` in one step, a temporary file and then a rename, and sets its rights to 600, so only the owner can read it. A new setting goes at the end. The log gets one line `configured` per changed setting, by `<owner> (config)`, with the name only, never the value.
