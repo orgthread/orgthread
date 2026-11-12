@@ -65,7 +65,7 @@ ORGTHREAD_READ_ONLY=archive
 ORGTHREAD_DENY=private
 ```
 
-With these, an agent may read `archive` but not change it, and it cannot see `private` at all. All settings are in [mcp.md](mcp.md#settings).
+With these, an agent may read `archive` but not change it, and it cannot see `private` at all. All settings are in [settings.md](settings.md). `orgthread config` changes them on a screen in a terminal, and `orgthread config --check` lists them and checks each value.
 
 ## 4. Check it
 

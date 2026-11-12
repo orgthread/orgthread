@@ -107,30 +107,7 @@ A file that is not text may be uploaded only into the folders of `ORGTHREAD_BINA
 
 Each setting comes from the environment. A file `.env` beside the program, with lines `ORGTHREAD_NAME=value`, fills in each setting that the environment does not hold. Write a value with no quotes, as quotes count as part of it.
 
-| Setting | What it does | Default |
-|---|---|---|
-| `ORGTHREAD_ROOT` | The folder all paths live in | `~/Library/CloudStorage/Dropbox` |
-| `ORGTHREAD_ALLOW` | Comma-separated folders or files that the tools may touch | All |
-| `ORGTHREAD_DENY` | Folders or files that the tools may not touch | None |
-| `ORGTHREAD_READ_ONLY` | Folders or files that the tools may only read | None |
-| `ORGTHREAD_PUBLIC_URL` | The public address of the remote server | None, required by it |
-| `ORGTHREAD_LOGIN_HASH` | The hash of its password | None, required by it |
-| `ORGTHREAD_LOGINS` | The file of the logins | `state/logins.json` beside the program |
-| `ORGTHREAD_BINARY_ALLOW` | Comma-separated folders where an upload of a file that is not text may go | None |
-| `ORGTHREAD_DELETE_ALLOW` | Comma-separated folders where `delete` may remove a file | None, so every delete is refused |
-| `ORGTHREAD_OWNER` | Your name, for the log lines of a revert in `orgthread watch`: `<name> (watch)` | `owner` |
-| `ORGTHREAD_MOVE_ALLOW` | Comma-separated folders. When set, `move` needs both the old and the new name in them | Not set, so `move` has only the limits above |
-| `ORGTHREAD_FIXED_FOLDERS` | Comma-separated folders. No new folder may appear directly inside them, for `write`, `upload`, `copy` and `move`, with code 2. Deeper new folders are fine. `/` stands for the root | Not set, so any new folder is made |
-| `ORGTHREAD_DOWNLOAD_MB` | The largest download, in MB of 1,000,000 bytes | 250 |
-| `ORGTHREAD_UPLOAD_MB` | The largest upload, in MB of 1,000,000 bytes | 20 |
-| `ORGTHREAD_LISTEN_ANYWHERE` | `yes` lets the remote server listen on an address that others can reach, with no encryption | Only `127.0.0.1`, `[::1]` and `localhost` |
-| `ORGTHREAD_LOCK_DIR` | The locks. For a local folder, keep them on the same disk as the root | `.locks` beside the program |
-| `ORGTHREAD_LOG` | The log file | `state/writes.log` beside the program |
-| `ORGTHREAD_READS` | The notes of what each name read | `state/reads` beside the program |
-| `ORGTHREAD_VERSIONS` | A copy of each version written, for 30 days, for the diff screen | `state/versions` beside the program |
-| `ORGTHREAD_STORAGE` | `dropbox` uses the Dropbox API in place of a folder. It keeps no copies on the disk: `orgthread watch` gets each diff from the Dropbox history | A local folder |
-| `ORGTHREAD_DROPBOX_TOKEN` | The Dropbox token | None |
-| `ORGTHREAD_DROPBOX_REFRESH`, `ORGTHREAD_DROPBOX_APP_KEY`, `ORGTHREAD_DROPBOX_APP_SECRET` | In place of a token: these three get a fresh short-lived token for each command | None |
+Every setting, with its default and the doors that use it, is in [settings.md](settings.md). `orgthread config` changes them on a screen in a terminal, and `orgthread config --check` lists them. A wrong value stops every command and tool with code 2, and names the setting.
 
 The limits use paths from the root, such as `notes/drafts`, and capitals do not count. They guard against a confused chat, not against a thief. Messages call a server "this door".
 
