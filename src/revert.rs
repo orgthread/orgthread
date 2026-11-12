@@ -20,19 +20,12 @@ use std::time::Duration;
 
 /// The setting that names the owner, as `user.name` does for git. A revert is
 /// logged as `<owner> (watch)`.
-pub const OWNER: &str = "ORGTHREAD_OWNER";
-/// The owner when the setting is not there.
-pub const DEFAULT_OWNER: &str = "owner";
+pub use crate::settings::OWNER;
 
 /// The "who" of a revert in the log: the owner and `(watch)`. A name on more
 /// than one line, or with a tab, would break the log, so it is refused.
 pub fn who_of(owner: Option<&str>) -> Result<String, String> {
-    let owner = owner.map(str::trim).filter(|o| !o.is_empty());
-    let owner = owner.unwrap_or(DEFAULT_OWNER);
-    if owner.chars().any(char::is_control) {
-        return Err(format!("{OWNER} must be a name on one line"));
-    }
-    Ok(format!("{owner} (watch)"))
+    Ok(format!("{} (watch)", crate::settings::name_of(owner)?))
 }
 /// The log word of a revert. `restored` stays the rollback inside a write.
 pub const WORD: &str = "reverted";

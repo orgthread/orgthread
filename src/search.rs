@@ -20,12 +20,12 @@ pub const MOST: usize = 1000;
 /// A hit line is cut after this many characters, with `…` at the end.
 pub const CUT: usize = 300;
 /// The setting of the largest zip of a search on a server, in MB.
-pub const SEARCH_MB: &str = "ORGTHREAD_SEARCH_MB";
+pub use crate::settings::SEARCH_MB;
 
 /// The largest zip of a content search on a server, in bytes: 25 MB unless the
 /// settings say otherwise. A local folder skips a single file above it.
 pub fn zip_limit() -> Result<u64, String> {
-    crate::transfer::limit(SEARCH_MB, 25)
+    crate::settings::megabytes(SEARCH_MB)
 }
 
 /// What to look for, and how.

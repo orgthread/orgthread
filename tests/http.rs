@@ -434,8 +434,23 @@ fn a_name_does_not_pass_for_looking_local() {
 
 #[test]
 fn only_the_setting_with_yes_allows_a_network_address() {
-    for value in ["", "no", "true", "YES"] {
+    for value in ["", "no"] {
         assert_refused("0.0.0.0:0", Some(value));
+    }
+    // Any other word is a wrong value: the check at start stops the program
+    // with code 2 before it listens, and names the setting.
+    for value in ["true", "YES"] {
+        let o = serve_at("0.0.0.0:0", Some(value))
+            .wait_with_output()
+            .unwrap();
+        let message = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{value}: {message}");
+        assert!(
+            message.contains(&format!(
+                "ORGTHREAD_LISTEN_ANYWHERE needs yes or no, not {value}"
+            )),
+            "{value}: {message}"
+        );
     }
     let port = free_port();
     assert_listens(

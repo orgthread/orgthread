@@ -19,8 +19,8 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-const BLUE: Color = Color::Rgb(0x22, 0x6D, 0xBD);
-const ORANGE: Color = Color::Rgb(0xE8, 0x74, 0x0C);
+pub(crate) const BLUE: Color = Color::Rgb(0x22, 0x6D, 0xBD);
+pub(crate) const ORANGE: Color = Color::Rgb(0xE8, 0x74, 0x0C);
 const REFRESH: Duration = Duration::from_secs(1);
 /// How often the wait screen moves its spinner.
 const SPIN: Duration = Duration::from_millis(100);
@@ -135,7 +135,7 @@ impl Choice {
 }
 
 fn color_of(outcome: &str) -> Color {
-    if watch::is_written(outcome) || outcome == "copied" || outcome == "moved" {
+    if watch::is_written(outcome) || matches!(outcome, "copied" | "moved" | "configured") {
         BLUE
     } else {
         ORANGE
@@ -144,7 +144,7 @@ fn color_of(outcome: &str) -> Color {
 
 /// Breaks text at spaces to fit the width. A longer word is cut, so nothing is
 /// ever lost at the edge of a narrow terminal.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut row = String::new();
@@ -171,7 +171,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 const LABEL: usize = 10;
 
 /// A label in bold, and its value in a column that wraps under itself.
-fn labelled(label: &str, value: &str, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn labelled(label: &str, value: &str, width: usize) -> Vec<Line<'static>> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     wrap(value, width.saturating_sub(LABEL))
         .into_iter()
@@ -186,7 +186,7 @@ fn labelled(label: &str, value: &str, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn plain(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+pub(crate) fn plain(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     wrap(text, width)
         .into_iter()
         .map(|row| Line::styled(row, style))
@@ -243,7 +243,7 @@ fn top_lines(snap: &Snapshot, width: usize) -> Vec<Line<'static>> {
 }
 
 /// The end of a path matters most, so a long one loses its start.
-fn tail_of(path: &str, room: usize) -> String {
+pub(crate) fn tail_of(path: &str, room: usize) -> String {
     let count = path.chars().count();
     if count <= room {
         return path.to_string();
@@ -637,7 +637,7 @@ fn help_lines(info: &Info, width: usize) -> Vec<Line<'static>> {
 
 /// A panel over the middle of the screen, at most `most` columns wide. `lines`
 /// gets the width inside the border.
-fn draw_panel(
+pub(crate) fn draw_panel(
     frame: &mut Frame,
     most: u16,
     block: Block<'static>,
@@ -1163,7 +1163,7 @@ pub fn once(
     Ok(text_of(&terminal))
 }
 
-fn text_of(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+pub(crate) fn text_of(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buffer = terminal.backend().buffer();
     let width = buffer.area.width as usize;
     let mut out = String::new();

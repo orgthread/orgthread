@@ -9,6 +9,7 @@
 //! The locks are small local files beside the program: a lock costs no web call.
 //! Between writers elsewhere, Dropbox's own version check decides.
 
+use crate::settings;
 use crate::storage::{
     Copied, CopyError, Entry, Expect, Keep, Listing, LocalFolder, Moved, RemoveError, Removed,
     Revision, Storage, Walked, WriteError, kept, new_folders,
@@ -19,13 +20,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-pub const TOKEN: &str = "ORGTHREAD_DROPBOX_TOKEN";
+pub use crate::settings::DROPBOX_TOKEN as TOKEN;
 /// For a service: these three get a fresh short-lived token for each command.
-pub const REFRESH: [&str; 3] = [
-    "ORGTHREAD_DROPBOX_REFRESH",
-    "ORGTHREAD_DROPBOX_APP_KEY",
-    "ORGTHREAD_DROPBOX_APP_SECRET",
-];
+pub use crate::settings::REFRESH;
 
 pub struct Dropbox {
     token: String,
@@ -386,17 +383,13 @@ fn refused(reply: &Reply) -> io::Error {
 
 impl Dropbox {
     pub fn new(lock_dir: &Path) -> Result<Self, String> {
-        let url = |name: &str, default: &str| std::env::var(name).unwrap_or(default.to_string());
         let mut dropbox = Dropbox {
             token: String::new(),
-            api: url("ORGTHREAD_DROPBOX_API", "https://api.dropboxapi.com"),
-            content: url(
-                "ORGTHREAD_DROPBOX_CONTENT",
-                "https://content.dropboxapi.com",
-            ),
+            api: settings::dropbox_api(),
+            content: settings::dropbox_content(),
             locks: LocalFolder::new(lock_dir, ""),
         };
-        dropbox.token = match std::env::var(TOKEN).ok().filter(|t| !t.is_empty()) {
+        dropbox.token = match settings::dropbox_token() {
             Some(token) => token,
             None => dropbox.fresh_token()?,
         };
@@ -416,7 +409,7 @@ impl Dropbox {
     }
 
     fn fresh_token(&self) -> Result<String, String> {
-        let [refresh, key, secret] = REFRESH.map(|name| std::env::var(name).unwrap_or_default());
+        let [refresh, key, secret] = settings::dropbox_refresh();
         if refresh.is_empty() || key.is_empty() || secret.is_empty() {
             return Err(format!(
                 "{TOKEN} is not set, and neither are the {} values",

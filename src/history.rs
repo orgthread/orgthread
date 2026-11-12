@@ -5,7 +5,7 @@
 //! its fingerprint. The texts stay in memory only, never on the disk, in a cache
 //! of at most 25 MB that is empty when watch quits.
 
-use crate::dropbox::{self, Dropbox};
+use crate::dropbox::Dropbox;
 use crate::fingerprint::fingerprint;
 use crate::storage::{Revision, Storage};
 use crate::watch::{self, Entry};
@@ -236,11 +236,7 @@ pub enum Step {
 /// An error in short words, with the value of each secret setting taken out,
 /// so that no token can reach the screen.
 pub fn clean(text: &str) -> String {
-    let secrets: Vec<String> = std::iter::once(dropbox::TOKEN)
-        .chain(dropbox::REFRESH)
-        .filter_map(|name| std::env::var(name).ok())
-        .collect();
-    clean_of(text, &secrets)
+    clean_of(text, &crate::settings::secret_values())
 }
 
 fn clean_of(text: &str, secrets: &[String]) -> String {

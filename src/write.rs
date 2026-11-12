@@ -82,7 +82,7 @@ pub fn check_limits(
 }
 
 /// The setting that keeps the first level fixed.
-pub const FIXED_FOLDERS: &str = "ORGTHREAD_FIXED_FOLDERS";
+pub use crate::settings::FIXED_FOLDERS;
 
 /// The guard of `ORGTHREAD_FIXED_FOLDERS`, a comma-separated list: no new folder
 /// may appear directly inside a folder of the list. Deeper new folders are fine.

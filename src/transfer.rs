@@ -11,9 +11,7 @@ use std::io::{self, Read};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub const DOWNLOAD_MB: &str = "ORGTHREAD_DOWNLOAD_MB";
-pub const UPLOAD_MB: &str = "ORGTHREAD_UPLOAD_MB";
-pub const BINARY_ALLOW: &str = "ORGTHREAD_BINARY_ALLOW";
+pub use crate::settings::{BINARY_ALLOW, DOWNLOAD_MB, UPLOAD_MB};
 
 /// The time a link has to start. Once started, a transfer may take longer.
 pub const START_WITHIN: Duration = Duration::from_secs(5 * 60);
@@ -22,27 +20,14 @@ pub const START_WITHIN: Duration = Duration::from_secs(5 * 60);
 /// the memory of the server.
 const MAX_WAITING: usize = 1000;
 
-/// A limit in bytes, from a setting in MB. A MB here is 1,000,000 bytes.
-pub(crate) fn limit(name: &str, default_mb: u64) -> Result<u64, String> {
-    match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .and_then(|mb| mb.checked_mul(1_000_000))
-            .ok_or_else(|| format!("{name} needs a whole number of MB, not {value}")),
-        _ => Ok(default_mb * 1_000_000),
-    }
-}
-
 /// The largest download, in bytes: 250 MB unless the settings say otherwise.
 pub fn download_limit() -> Result<u64, String> {
-    limit(DOWNLOAD_MB, 250)
+    crate::settings::megabytes(DOWNLOAD_MB)
 }
 
 /// The largest upload, in bytes: 20 MB unless the settings say otherwise.
 pub fn upload_limit() -> Result<u64, String> {
-    limit(UPLOAD_MB, 20)
+    crate::settings::megabytes(UPLOAD_MB)
 }
 
 /// A limit in the words of a message: `250 MB`.
@@ -53,8 +38,7 @@ pub fn megabytes(bytes: u64) -> String {
 /// True when a file that is not text may go to `path`. With the setting empty,
 /// the default, it may go nowhere.
 pub fn binary_allowed(path: &str) -> bool {
-    std::env::var(BINARY_ALLOW)
-        .unwrap_or_default()
+    crate::settings::binary_allow()
         .split(',')
         .any(|rule| is_under(path, rule.trim()))
 }

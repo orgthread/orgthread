@@ -14,7 +14,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-pub const DELETE_ALLOW: &str = "ORGTHREAD_DELETE_ALLOW";
+pub use crate::settings::DELETE_ALLOW;
 
 /// True when `path` lies in one of the comma-separated folders of `allow`. With
 /// the setting empty, the default, nothing may be deleted.

@@ -12,6 +12,7 @@ use orgthread::reads::Reads;
 use orgthread::screen;
 use orgthread::search::{self, Query};
 use orgthread::serve;
+use orgthread::settings::{self, program_folder};
 use orgthread::stop;
 use orgthread::storage::{Expect, LocalFolder, Storage, new_folders, still_there};
 use orgthread::transfer;
@@ -58,6 +59,8 @@ For a person:
   orgthread watch --once                         the same screen, as plain text
   orgthread fingerprint <file>                   the content hash Dropbox reports
   orgthread serve [--http <address>]             the MCP tools, for a chat with no shell
+  orgthread config                               the settings, on a screen
+  orgthread config --check                       the settings, checked, as plain text
 
 Options of write: --size <bytes> refuses text of any other length, so a cut-off
 pipe cannot replace a whole file.
@@ -138,46 +141,9 @@ changes, the answer adds a line that wikilinks to the old name break. The log
 word is moved, with the old name as the 8th field, and every word of a move
 line starts with move. The way back is a move from the new name to the old one.
 
-Settings, from the environment:
-  A file .env beside the program, with lines ORGTHREAD_NAME=value, fills in each
-  setting of this list that the environment does not hold.
+";
 
-  ORGTHREAD_ROOT      the folder all paths live in (default: ~/Library/CloudStorage/Dropbox)
-  ORGTHREAD_LOCK_DIR  orgthread's own locks, on this machine only (default: .locks beside the
-                      program). For a local folder, on the same disk as ORGTHREAD_ROOT
-  ORGTHREAD_LOG       the log file (default: state/writes.log beside the program)
-  ORGTHREAD_READS     the notes of what was read (default: state/reads beside the program)
-  ORGTHREAD_STORAGE   dropbox: use the Dropbox API, with paths from its root, such as /org/a.md.
-                      Needs ORGTHREAD_DROPBOX_TOKEN. Keeps no copies.
-  ORGTHREAD_ALLOW, ORGTHREAD_DENY, ORGTHREAD_READ_ONLY
-                      comma-separated folders or files: what a door may touch,
-                      what it may not, and what it may only read
-  ORGTHREAD_VERSIONS  a copy of each version written, for the diff screen, for 30 days
-                      (default: state/versions beside the program)
-  ORGTHREAD_LOGINS    the logins of a door over a restart: hashes of its tokens, no raw token
-                      and no text of a note (default: state/logins.json beside the program)
-  ORGTHREAD_BINARY_ALLOW
-                      comma-separated folders where an upload of a file that is not text may go
-                      (default: none)
-  ORGTHREAD_DELETE_ALLOW
-                      comma-separated folders where delete may remove a file (default: none)
-  ORGTHREAD_MOVE_ALLOW
-                      comma-separated folders: when set, move needs both names in them
-                      (default: not set, and move has only the limits above)
-  ORGTHREAD_FIXED_FOLDERS
-                      comma-separated folders: no new folder may appear directly inside them,
-                      for write, upload, copy and move. Deeper new folders are fine.
-                      / stands for the root (default: not set, and any new folder is made)
-  ORGTHREAD_DOWNLOAD_MB, ORGTHREAD_UPLOAD_MB
-                      the largest download and upload, in MB of 1,000,000 bytes (default: 250, 20)
-  ORGTHREAD_SEARCH_MB the largest zip of a search with Dropbox, in MB, and with a local
-                      folder the largest file a search reads (default: 25)
-  ORGTHREAD_OWNER     your name, for the log lines of a revert in watch: <name> (watch)
-                      (default: owner)
-  ORGTHREAD_LISTEN_ANYWHERE
-                      yes: let serve --http listen on an address that others can reach, with
-                      no encryption (default: only 127.0.0.1, [::1] and localhost)
-
+const CODES: &str = "\
 Exit codes:
   0  done                    6  missing: this name read it, but it is gone
   1  failed, file unchanged  7  check failed, old state put back
@@ -192,6 +158,9 @@ Each code and what to do: https://github.com/orgthread/orgthread/blob/main/docs/
 fn main() -> ExitCode {
     load_settings_file();
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Some(code) = check_settings(&args) {
+        return ExitCode::from(code as u8);
+    }
     let code = match run(&args) {
         Ok(code) => code,
         Err(message) => {
@@ -203,39 +172,34 @@ fn main() -> ExitCode {
     ExitCode::from(code as u8)
 }
 
-/// The folder of this program, wherever it was started from.
-fn program_folder() -> Result<PathBuf, String> {
-    let program = env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
-    fs::canonicalize(&program)
-        .ok()
-        .and_then(|real| real.parent().map(Path::to_path_buf))
-        .ok_or_else(|| format!("could not find the folder of {}", program.display()))
-}
-
 /// Each `ORGTHREAD_` line of the `.env` beside the program, unless the
 /// environment holds that name already. Any other name stays out.
 fn load_settings_file() {
-    let Ok(folder) = program_folder() else {
+    let Ok(file) = settings::env_file() else {
         return;
     };
-    let file = folder.join(".env");
-    let text = match fs::read_to_string(&file) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
-        Err(e) => {
-            say(format!("could not read {}: {e}", file.display()));
-            return;
-        }
-    };
-    for line in text.lines() {
-        let Some((name, value)) = line.trim().split_once('=') else {
-            continue;
-        };
-        if name.starts_with("ORGTHREAD_") && env::var_os(name).is_none() {
-            // SAFETY: the first step of main, before any other thread exists.
-            unsafe { env::set_var(name, value) };
-        }
+    if let Err(e) = settings::load_file(&file) {
+        say(format!("could not read {}: {e}", file.display()));
     }
+}
+
+/// The check at start: a wrong value stops any command with code 2, and the
+/// message names the setting. `config` shows the wrong value so it can be
+/// fixed, and `--help` and `--version` read no setting, so they still run.
+fn check_settings(args: &[String]) -> Option<i32> {
+    let free = ["config", "--help", "-h", "help", "--version", "-V"];
+    if args.first().is_some_and(|a| free.contains(&a.as_str())) {
+        return None;
+    }
+    let problems = settings::problems();
+    if problems.is_empty() {
+        return None;
+    }
+    for problem in problems {
+        say(problem);
+    }
+    say("fix it in .env beside the program, or in the environment. orgthread config --check lists every setting".to_string());
+    Some(exit::USAGE)
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
@@ -253,6 +217,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("move") => cmd_move(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
+        Some("config") => cmd_config(&args[1..]),
         Some("password-hash") => {
             let mut password = String::new();
             io::stdin()
@@ -262,7 +227,7 @@ fn run(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         Some("--help" | "-h" | "help") => {
-            print!("{USAGE}");
+            print!("{USAGE}{}\n{CODES}", settings::help());
             Ok(0)
         }
         Some("--version" | "-V") => {
@@ -366,12 +331,6 @@ fn parse_write(args: &[String], command: &str) -> Result<WriteArgs, String> {
         who: checked_who(who)?,
         size,
     })
-}
-
-fn home() -> Result<PathBuf, String> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_string())
 }
 
 /// The path of the file from the root, with `/` between its parts. It follows
@@ -556,7 +515,7 @@ fn cmd_search(args: &[String]) -> Result<i32, String> {
     settings.limits(named, false)?;
     // A content search on a server fetches the whole folder as one zip.
     if settings.dropbox && !query.names {
-        let deny = env::var("ORGTHREAD_DENY").unwrap_or_default();
+        let deny = settings::deny();
         if let Some(reason) = search::holds_closed(&path, &deny) {
             return Err(reason);
         }
@@ -702,13 +661,12 @@ impl Settings {
 
     /// The path from the root. In Dropbox a file is named from there already.
     fn limits(&self, path: &str, writing: bool) -> Result<(), String> {
-        let var = |name: &str| env::var(name).unwrap_or_default();
         write::check_limits(
             path,
             writing,
-            &var("ORGTHREAD_ALLOW"),
-            &var("ORGTHREAD_DENY"),
-            &var("ORGTHREAD_READ_ONLY"),
+            &settings::allow(),
+            &settings::deny(),
+            &settings::read_only(),
         )
     }
 
@@ -758,7 +716,7 @@ impl Settings {
                 format!("could not look at the folders of {path}: {e}"),
             )
         })?;
-        let fixed = env::var(write::FIXED_FOLDERS).unwrap_or_default();
+        let fixed = settings::fixed_folders();
         write::check_fixed(&folders, &fixed).map_err(|reason| (exit::USAGE, reason))?;
         Ok(folders)
     }
@@ -885,13 +843,10 @@ impl Settings {
     }
 
     fn load() -> Result<Settings, String> {
-        let dropbox = env::var("ORGTHREAD_STORAGE").is_ok_and(|v| v == "dropbox");
+        let dropbox = settings::dropbox();
         // Locks, log and notes live beside the program, and nowhere else.
         let folder = program_folder()?;
-        let locks = match env::var_os("ORGTHREAD_LOCK_DIR") {
-            Some(dir) => folder.join(dir),
-            None => folder.join(".locks"),
-        };
+        let locks = settings::lock_dir(&folder);
         // The first run makes it. A failure shows when a write needs it.
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -901,14 +856,10 @@ impl Settings {
             builder.mode(0o700);
         }
         let _ = builder.create(&locks);
-        let state = folder.join("state");
         let root = if dropbox {
             PathBuf::new()
         } else {
-            let root = match env::var_os("ORGTHREAD_ROOT") {
-                Some(root) => PathBuf::from(root),
-                None => home()?.join("Library/CloudStorage/Dropbox"),
-            };
+            let root = settings::root()?;
             fs::canonicalize(&root).map_err(|e| {
                 format!(
                     "the folder {} does not exist: {e}. Set ORGTHREAD_ROOT to your folder, or ORGTHREAD_STORAGE=dropbox to use the Dropbox API, in the environment or in {}",
@@ -917,18 +868,9 @@ impl Settings {
                 )
             })?
         };
-        let log = match env::var_os("ORGTHREAD_LOG") {
-            Some(path) => PathBuf::from(path),
-            None => state.join("writes.log"),
-        };
-        let reads = match env::var_os("ORGTHREAD_READS") {
-            Some(path) => PathBuf::from(path),
-            None => state.join("reads"),
-        };
-        let versions = match env::var_os("ORGTHREAD_VERSIONS") {
-            Some(path) => PathBuf::from(path),
-            None => state.join("versions"),
-        };
+        let log = settings::log(&folder);
+        let reads = settings::reads(&folder);
+        let versions = settings::versions(&folder);
         Ok(Settings {
             root,
             locks,
@@ -953,14 +895,9 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
     let info = screen::Info::new(settings.dropbox, &settings.log);
     // Only the owner's r and y in this screen revert. A server keeps no copies
     // and writes in the background, so the screen never freezes.
-    let who = orgthread::revert::who_of(env::var(orgthread::revert::OWNER).ok().as_deref())?;
+    let who = orgthread::revert::who_of(settings::owner().as_deref())?;
     // A revert is a write, so the limits of the door hold for it too.
-    let var = |name: &str| env::var(name).unwrap_or_default();
-    let (allow, deny, read_only) = (
-        var("ORGTHREAD_ALLOW"),
-        var("ORGTHREAD_DENY"),
-        var("ORGTHREAD_READ_ONLY"),
-    );
+    let (allow, deny, read_only) = (settings::allow(), settings::deny(), settings::read_only());
     let limits: orgthread::revert::WriteLimits = std::sync::Arc::new(move |path: &str| {
         write::check_limits(path, true, &allow, &deny, &read_only)
     });
@@ -1008,11 +945,55 @@ fn cmd_watch(args: &[String]) -> Result<i32, String> {
     }
 }
 
+/// The settings: a screen in a real terminal, or with --check, a list that
+/// changes nothing and works anywhere.
+fn cmd_config(args: &[String]) -> Result<i32, String> {
+    let folder = program_folder()?;
+    let file_path = folder.join(".env");
+    let file = orgthread::envfile::EnvFile::read(&file_path)
+        .map_err(|e| format!("could not read {}: {e}", file_path.display()))?;
+    let env = settings::from_environment();
+    match args {
+        [flag] if flag == "--check" => {
+            let (text, fine) = orgthread::config::check(&file, &env, &file_path);
+            let mut out = io::stdout();
+            if let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+                say(format!("could not hand over the list: {e}"));
+                return Ok(exit::FAILED);
+            }
+            Ok(if fine { 0 } else { exit::USAGE })
+        }
+        [] => {
+            // Only a person at a terminal changes a setting: no script, no agent.
+            if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
+                return Err(
+                    "config needs a terminal. To see the settings as text, use config --check"
+                        .into(),
+                );
+            }
+            let paths = orgthread::config::Paths {
+                env: file_path,
+                log: settings::log(&folder),
+                dropbox: settings::dropbox(),
+            };
+            let config = orgthread::config::Config::new(file, env, settings::owner(), paths);
+            match orgthread::config::run(config) {
+                Ok(()) => Ok(0),
+                Err(e) => {
+                    say(format!("the screen failed: {e}"));
+                    Ok(exit::FAILED)
+                }
+            }
+        }
+        _ => Err("config takes nothing, or --check".into()),
+    }
+}
+
 /// Where the door keeps its logins over a restart: `state/logins.json` beside the
 /// program, unless the settings name another file.
 fn logins_file() -> Result<PathBuf, String> {
-    if let Some(file) = env::var_os("ORGTHREAD_LOGINS") {
-        return Ok(PathBuf::from(file));
+    if let Some(file) = settings::logins() {
+        return Ok(file);
     }
     let state = program_folder()?.join("state");
     // The first run makes it. A failure only means that chats log in again.
@@ -1033,7 +1014,7 @@ fn listen_addresses(address: &str) -> Result<Vec<std::net::SocketAddr>, String> 
     if let Some(addresses) = serve::local_addresses(address) {
         return Ok(addresses);
     }
-    if env::var("ORGTHREAD_LISTEN_ANYWHERE").is_ok_and(|v| v == "yes") {
+    if settings::listen_anywhere() {
         return address
             .to_socket_addrs()
             .map(Iterator::collect)
@@ -1049,8 +1030,8 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
     let result = match args {
         [] => serve::run(io::stdin().lock(), io::stdout(), &exe),
         [flag, address] if flag == "--http" => {
-            let base = env::var("ORGTHREAD_PUBLIC_URL").unwrap_or_default();
-            let hash = env::var("ORGTHREAD_LOGIN_HASH").unwrap_or_default();
+            let base = settings::public_url();
+            let hash = settings::login_hash();
             if !base.starts_with("https://") || hash.len() != 64 {
                 return Err("--http needs ORGTHREAD_PUBLIC_URL and ORGTHREAD_LOGIN_HASH".into());
             }
@@ -1377,7 +1358,7 @@ fn cmd_delete(args: &[String]) -> Result<i32, String> {
     let settings = Settings::load()?;
     let path = settings.path_of(&file)?;
     settings.limits(&path, true)?;
-    let allow = env::var(delete::DELETE_ALLOW).unwrap_or_default();
+    let allow = settings::delete_allow();
     if let Some(refused) = delete::gate(&path, &allow) {
         say(delete::message(&path, &who, &refused));
         // A check is a dry run and logs nothing; a real delete logs the refusal.
@@ -1451,11 +1432,7 @@ fn fixed_refusal(
     storage: &dyn Storage,
     to: &str,
 ) -> Option<Result<String, String>> {
-    if env::var(write::FIXED_FOLDERS)
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-    {
+    if settings::fixed_folders().trim().is_empty() {
         return None;
     }
     match settings.new_folders_for(storage, to) {
@@ -1638,7 +1615,7 @@ fn cmd_move(args: &[String]) -> Result<i32, String> {
     if let Err(reason) = limits {
         return refuse(mv::Outcome::NotAllowed { reason });
     }
-    let allow = env::var(mv::MOVE_ALLOW).unwrap_or_default();
+    let allow = settings::move_allow();
     if let Some(refused) = mv::gate(&from, &to, &allow) {
         return refuse(refused);
     }

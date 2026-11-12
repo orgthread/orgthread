@@ -439,7 +439,9 @@ fn watch_once_shows_the_writes_and_a_held_lock() {
 #[test]
 fn watch_once_starts_with_the_version_and_the_storage_and_no_secret() {
     const URL: &str = "https://example.com/invented-secret-path";
-    const HASH: &str = "invented-login-hash-7f3a";
+    // An invented hash of the right form, as password-hash gives: a wrong one
+    // would stop watch at the check at start.
+    const HASH: &str = "7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a7f3a";
     let p = Place::new();
     let version = p.run(&["--version"], b"");
     let version = String::from_utf8(version.stdout).unwrap();

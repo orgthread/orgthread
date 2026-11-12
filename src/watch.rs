@@ -300,6 +300,9 @@ pub fn why(outcome: &str) -> &'static str {
         "downloaded" => "This chat got the exact bytes of the file. Nothing was written.",
         "copied" => "A new file was made with the exact bytes of the source.",
         "made-folder" => "A missing folder was made for the file on the next line.",
+        "configured" => {
+            "The owner changed this setting in orgthread config. The log keeps its name, never its value."
+        }
         "deleted" => {
             "The file was deleted. Dropbox keeps it in Deleted files, or the last version is kept beside the program."
         }
@@ -388,6 +391,20 @@ pub fn diff_of(entry: &Entry, versions: &Versions) -> Result<Vec<Row>, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_configured_line_has_its_own_reason_and_no_revert() {
+        let line = "2026-11-12 13:30:05Z\tconfigured\tORGTHREAD_UPLOAD_MB\tAna (config)\t-\t-\t-";
+        let entry = parse_line(line).unwrap();
+        assert!(
+            why_of(&entry).contains("orgthread config"),
+            "{}",
+            why_of(&entry)
+        );
+        assert!(!crate::revert::can_revert(&entry));
+        assert!(!crate::revert::is_change(&entry));
+    }
+
     use super::*;
 
     #[test]

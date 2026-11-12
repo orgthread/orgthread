@@ -13,7 +13,7 @@ use crate::write::{self, Gate, exit, is_under};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-pub const MOVE_ALLOW: &str = "ORGTHREAD_MOVE_ALLOW";
+pub use crate::settings::MOVE_ALLOW;
 
 /// The folders of `allow`, comma-separated. `None` when the setting names no
 /// folder: then a move has no limit beyond those of the door.

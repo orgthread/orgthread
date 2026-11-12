@@ -9,9 +9,11 @@ pub const VERSION: &str = concat!(
     ")"
 );
 
+pub mod config;
 pub mod copy;
 pub mod delete;
 pub mod dropbox;
+pub mod envfile;
 pub mod fingerprint;
 pub mod history;
 pub mod list;
@@ -24,6 +26,7 @@ pub mod revert;
 pub mod screen;
 pub mod search;
 pub mod serve;
+pub mod settings;
 pub mod stop;
 pub mod storage;
 pub mod transfer;
