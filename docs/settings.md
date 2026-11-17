@@ -87,6 +87,19 @@ The list holds all settings, of both doors. The doors: `local folder` is the doo
 | `ORGTHREAD_LOGINS` | The logins of a door over a restart: hashes of its tokens, no raw token and no text of a note. | a path, not empty | state/logins.json beside the program | both |
 | `ORGTHREAD_LISTEN_ANYWHERE` | yes: let serve --http listen on an address that others can reach, with no encryption. | yes or no | no: only 127.0.0.1, [::1] and localhost | both |
 
+### Device door
+
+| Setting | What it does | A right value | Default | Doors |
+|---|---|---|---|---|
+| `ORGTHREAD_DEVICE_APP` | The app of a device door, such as reader: small letters, digits and -. Each app gets its own door, in its own folder with its own .env. A token is for one app on one device. | a name on one line | none, required by serve --http --device | both |
+| `ORGTHREAD_DEVICE_READ` | Comma-separated folders that a device may read and list, with all they hold. Each from the root, with / at both ends, such as /books/. Capitals count. | folders from the root, with / at both ends | none | both |
+| `ORGTHREAD_DEVICE_PATCH` | Comma-separated files that a device may read and patch, never make. Each from the root, such as /notes/progress-*.md, where * stands for any part of one name. Capitals count. | files from the root, * for any part of a name | none | both |
+| `ORGTHREAD_DEVICE_CAPPED` | Comma-separated files whose reads count for the read cap, in the form of ORGTHREAD_DEVICE_PATCH, such as /books/*/chapter-*.txt. | files from the root, * for any part of a name | every read | both |
+| `ORGTHREAD_DEVICE_CAP_HOUR` | The most capped reads of one device in 60 minutes. Above it the door refuses, logs capped and runs ORGTHREAD_DEVICE_NOTIFY. | a whole number from 1 | 8 | both |
+| `ORGTHREAD_DEVICE_CAP_DAY` | The most capped reads of one device in 24 hours. | a whole number from 1 | 40 | both |
+| `ORGTHREAD_DEVICE_NOTIFY` | A program that sends you a push, when a device reaches its read cap or pairs. It gets one line of text as its only argument: the device and what happened, never a path or a text of a file. | a path, not empty | none: the log only | both |
+| `ORGTHREAD_DEVICES` | The tokens and the pairing codes of a device door: hashes only, never a raw token. | a path, not empty | state/devices.json beside the program | both |
+
 ### Secrets
 
 | Setting | What it does | A right value | Default | Doors |

@@ -18,10 +18,10 @@ use std::time::Duration;
 /// Used only when a client names no version of the protocol.
 const VERSION: &str = "2025-06-18";
 
-const INVALID_REQUEST: i32 = -32600;
-const NO_METHOD: i32 = -32601;
-const INVALID_PARAMS: i32 = -32602;
-const NOT_JSON: i32 = -32700;
+pub(crate) const INVALID_REQUEST: i32 = -32600;
+pub(crate) const NO_METHOD: i32 = -32601;
+pub(crate) const INVALID_PARAMS: i32 = -32602;
+pub(crate) const NOT_JSON: i32 = -32700;
 
 /// Answers one message per line until the input ends.
 pub fn run(mut input: impl BufRead, mut output: impl Write, exe: &Path) -> io::Result<()> {
@@ -95,7 +95,12 @@ pub fn local_addresses(address: &str) -> Option<Vec<SocketAddr>> {
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const JSON_TYPE: &str = "application/json";
 
-fn respond(stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]) -> io::Result<()> {
+pub(crate) fn respond(
+    stream: &mut TcpStream,
+    status: &str,
+    extra: &str,
+    body: &[u8],
+) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
@@ -104,7 +109,7 @@ fn respond(stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]) -> io
     stream.write_all(body)
 }
 
-fn respond_json(stream: &mut TcpStream, status: &str, value: &Value) -> io::Result<()> {
+pub(crate) fn respond_json(stream: &mut TcpStream, status: &str, value: &Value) -> io::Result<()> {
     let extra = format!("Content-Type: {JSON_TYPE}\r\n");
     respond(stream, status, &extra, value.to_string().as_bytes())
 }
@@ -114,20 +119,34 @@ fn respond_page(stream: &mut TcpStream, status: &str, page: &str) -> io::Result<
     respond(stream, status, extra, page.as_bytes())
 }
 
-fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    // A client that stops reading must not hold a thread for ever.
-    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+/// The first line and the headers of a request.
+pub(crate) struct Head {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub length: usize,
+    pub has_length: bool,
+    pub wants_continue: bool,
+    /// The token after `Bearer `, or empty.
+    pub bearer: String,
+}
+
+/// Reads the first line and the headers. Each line may have up to 16 KiB.
+pub(crate) fn read_head(reader: &mut BufReader<TcpStream>) -> io::Result<Head> {
     let mut first = String::new();
     reader.by_ref().take(16384).read_line(&mut first)?;
     let mut parts = first.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let mut length = 0usize;
-    let mut has_length = false;
-    let mut wants_continue = false;
-    let mut bearer = String::new();
+    let mut head = Head {
+        method: method.to_string(),
+        path: path.to_string(),
+        query: query.to_string(),
+        length: 0,
+        has_length: false,
+        wants_continue: false,
+        bearer: String::new(),
+    };
     loop {
         let mut line = String::new();
         if reader.by_ref().take(16384).read_line(&mut line)? == 0 || line.trim().is_empty() {
@@ -135,12 +154,12 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> 
         }
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse().unwrap_or(0);
-                has_length = true;
+                head.length = value.trim().parse().unwrap_or(0);
+                head.has_length = true;
             } else if name.eq_ignore_ascii_case("expect") {
-                wants_continue = value.trim().eq_ignore_ascii_case("100-continue");
+                head.wants_continue = value.trim().eq_ignore_ascii_case("100-continue");
             } else if name.eq_ignore_ascii_case("authorization") {
-                bearer = value
+                head.bearer = value
                     .trim()
                     .strip_prefix("Bearer ")
                     .unwrap_or("")
@@ -148,6 +167,22 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> 
             }
         }
     }
+    Ok(head)
+}
+
+fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // A client that stops reading must not hold a thread for ever.
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let head = read_head(&mut reader)?;
+    let (method, path, query) = (
+        head.method.as_str(),
+        head.path.as_str(),
+        head.query.as_str(),
+    );
+    let (length, has_length, wants_continue) = (head.length, head.has_length, head.wants_continue);
+    let bearer = head.bearer.as_str();
     // A link is the only login of a transfer, and its body can be large, so it
     // is read only once the link is known. Links live outside the secret path.
     let prefix = login.prefix();
@@ -225,7 +260,7 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> 
             Err(word) => respond_json(&mut stream, "400 Bad Request", &json!({"error": word})),
         },
         (_, "/mcp") => {
-            if !login.allows(&bearer) {
+            if !login.allows(bearer) {
                 let extra = format!("WWW-Authenticate: {}\r\n", login.challenge_header());
                 return respond(&mut stream, "401 Unauthorized", &extra, b"");
             }
@@ -246,7 +281,7 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> 
     }
 }
 
-fn problem(id: Value, code: i32, message: &str) -> Value {
+pub(crate) fn problem(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
@@ -272,7 +307,7 @@ fn answer(message: &Value, exe: &Path, remote: Option<&Remote>) -> Option<Value>
     })
 }
 
-fn greeting(params: &Value) -> Value {
+pub(crate) fn greeting(params: &Value) -> Value {
     // Only tools are offered, and they read the same in every version so far.
     let version = params["protocolVersion"].as_str().unwrap_or(VERSION);
     json!({
@@ -932,7 +967,7 @@ fn search_args(params: &Value) -> Result<Vec<String>, (i32, String)> {
     Ok(args)
 }
 
-fn start(exe: &Path, args: &[&str], text: Option<&[u8]>) -> io::Result<Output> {
+pub(crate) fn start(exe: &Path, args: &[&str], text: Option<&[u8]>) -> io::Result<Output> {
     let mut child = Command::new(exe)
         .args(args)
         .stdin(if text.is_some() {
@@ -950,7 +985,7 @@ fn start(exe: &Path, args: &[&str], text: Option<&[u8]>) -> io::Result<Output> {
     child.wait_with_output()
 }
 
-fn result(tool: Option<&str>, run: io::Result<Output>) -> Value {
+pub(crate) fn result(tool: Option<&str>, run: io::Result<Output>) -> Value {
     let (text, refused) = match run {
         Err(e) => (format!("could not start the command: {e}"), true),
         Ok(out) if out.status.success() && tool == Some("read") => {

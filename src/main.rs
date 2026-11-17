@@ -1,6 +1,8 @@
 use jiff::tz::TimeZone;
 use orgthread::copy;
 use orgthread::delete;
+use orgthread::device;
+use orgthread::device_door::{self, DeviceDoor};
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::{Fingerprinter, fingerprint};
 use orgthread::list::{self, Options, Target};
@@ -52,6 +54,14 @@ For a chat with no shell:
   orgthread serve                                the same read, write, patch, delete, copy, move, list and search, as MCP tools,
                                                  and version: the build, the door, the storage, the tools
   orgthread serve --http <address>               also download and upload, through one-time links
+
+For a device, such as an e-reader, through a door of its own:
+
+  orgthread serve --http <address> --device      only list, read and patch, on the paths of
+                                                 ORGTHREAD_DEVICE_READ and ORGTHREAD_DEVICE_PATCH
+  orgthread device pair <name>                   a code of 8 signs for the device, in a terminal only
+  orgthread device list                          the paired devices, with no token
+  orgthread device revoke <name>                 ends the token of a device at once
 
 For a person:
 
@@ -127,6 +137,20 @@ After the copy, the fingerprint of the new file must be the one of the source.
 If not, the copy is removed again, code 7 and the log word removed, or 9 and
 not-removed if that fails. The log line of a copy has the source as its 8th
 field.
+
+A device door runs from its own folder, with its own .env, log and tokens, and
+with ORGTHREAD_DEVICE_APP, such as reader, and no ORGTHREAD_LOGIN_HASH. The
+device types the code at POST /pair, as {\"code\": \"ABCD-EFGH\"}, within 5 minutes,
+once, and gets {\"token\": \"...\", \"expires\": \"YYYY-MM-DD\"}. The token lasts 90
+days, and the door keeps only its hash. A new code for the same name ends the
+old token. The device sends the token as Authorization: Bearer <token> to /mcp.
+Each path starts with /, has no //, no . and no .. part, and capitals count. A
+read folder opens what it holds for read and list, one level at a time. A patch
+file opens for read and patch, never to make it. A link is never followed.
+Anything else is refused, code 2, with the log word refused. Reads of the files
+of ORGTHREAD_DEVICE_CAPPED count for the read cap: 8 in 60 minutes and 40 in 24
+hours by default. Above it the door refuses, code 2, logs capped, and runs
+ORGTHREAD_DEVICE_NOTIFY once an hour. No request or response body is logged.
 
 move moves one file to a new name in the same storage. A rename is a move in
 the same folder. If anything is at the new name, it is refused, code 5, and
@@ -217,6 +241,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some("move") => cmd_move(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
+        Some("device") => cmd_device(&args[1..]),
         Some("config") => cmd_config(&args[1..]),
         Some("password-hash") => {
             let mut password = String::new();
@@ -1030,6 +1055,13 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
     let result = match args {
         [] => serve::run(io::stdin().lock(), io::stdout(), &exe),
         [flag, address] if flag == "--http" => {
+            if device_settings_set() {
+                return Err(format!(
+                    "{} or {} is set, so this folder holds a device door. Start it with serve --http <address> --device, or remove those settings",
+                    settings::DEVICE_READ,
+                    settings::DEVICE_PATCH
+                ));
+            }
             let base = settings::public_url();
             let hash = settings::login_hash();
             if !base.starts_with("https://") || hash.len() != 64 {
@@ -1039,7 +1071,16 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
             let logins = logins_file()?;
             serve::run_http(&addresses, &Login::with_file(&base, &hash, &logins), &exe)
         }
-        _ => return Err("serve takes nothing, or --http <address>".into()),
+        [flag, address, device] if flag == "--http" && device == "--device" => {
+            let door = device_door()?;
+            let addresses = listen_addresses(address)?;
+            device_door::run(&addresses, &door, &exe)
+        }
+        _ => {
+            return Err(
+                "serve takes nothing, --http <address>, or --http <address> --device".into(),
+            );
+        }
     };
     match result {
         Ok(()) => Ok(0),
@@ -1047,6 +1088,169 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
             say(format!("the server stopped: {e}"));
             Ok(exit::FAILED)
         }
+    }
+}
+
+/// True when a setting of a device door is set: then the full door refuses
+/// to start in this folder, so the two doors never share their settings.
+fn device_settings_set() -> bool {
+    !settings::device_read().trim().is_empty() || !settings::device_patch().trim().is_empty()
+}
+
+/// The file of the tokens and codes: `state/devices.json` beside the program,
+/// unless the settings name another file.
+fn devices_file() -> Result<PathBuf, String> {
+    match settings::devices() {
+        Some(file) => Ok(file),
+        None => Ok(program_folder()?.join("state").join("devices.json")),
+    }
+}
+
+/// The app of this folder, checked.
+fn device_app() -> Result<String, String> {
+    let app = settings::device_app();
+    if app.is_empty() {
+        return Err(format!(
+            "a device door needs {}, the name of its app, such as reader",
+            settings::DEVICE_APP
+        ));
+    }
+    device::check_name(&app).map_err(|e| format!("{}: {e}", settings::DEVICE_APP))?;
+    Ok(app)
+}
+
+/// The settings of a device door, checked before it starts.
+fn device_door() -> Result<DeviceDoor, String> {
+    if !settings::login_hash().is_empty() {
+        return Err(format!(
+            "a device door has no password, and {} is set: give the device door its own folder, with its own .env",
+            settings::LOGIN_HASH
+        ));
+    }
+    let app = device_app()?;
+    let rules = device::Rules::new(&settings::device_read(), &settings::device_patch());
+    if rules.is_empty() {
+        return Err(format!(
+            "a device door needs {} or {}: the paths a device may touch",
+            settings::DEVICE_READ,
+            settings::DEVICE_PATCH
+        ));
+    }
+    let cap = device::Cap {
+        hour: settings::device_cap_hour()?,
+        day: settings::device_cap_day()?,
+    };
+    let capped = settings::device_capped().map(|list| device::split(&list));
+    let base = settings::public_url();
+    let prefix = match base.strip_prefix("https://") {
+        Some(after) => after.find('/').map_or("", |i| &after[i..]).to_string(),
+        None => String::new(),
+    };
+    let stored = Settings::load()?;
+    let root = (!stored.dropbox).then(|| stored.root.clone());
+    let store = device::Store::new(devices_file()?);
+    // A broken file stops the door at its start, not at the first device.
+    store
+        .load()
+        .map_err(|e| format!("could not read the tokens: {e}"))?;
+    Ok(DeviceDoor::new(
+        app,
+        rules,
+        capped,
+        cap,
+        store,
+        settings::device_notify(),
+        stored.log,
+        root,
+        prefix,
+    ))
+}
+
+/// `orgthread device pair <name>`, `device list` and `device revoke <name>`.
+fn cmd_device(args: &[String]) -> Result<i32, String> {
+    let app = device_app()?;
+    let store = device::Store::new(devices_file()?);
+    let log_file = Settings::load()?.log;
+    let now = device::now();
+    let logged = |word: &str, name: &str| {
+        let line = log::line(&[
+            &log::utc_now(),
+            word,
+            "",
+            &device::who(name, &app),
+            "",
+            "",
+            "",
+        ]);
+        log::append(&log_file, &line).map_err(|e| {
+            format!(
+                "the log line failed, {}: {e}. The line: {line}",
+                log_file.display()
+            )
+        })
+    };
+    match args {
+        [what, name] if what == "pair" => {
+            device::check_name(name)?;
+            // The code is for the owner's eyes: never in the output of a script,
+            // a pipe or an agent.
+            if !io::stdout().is_terminal() {
+                return Err(
+                    "device pair shows its code only in a terminal, so that no agent and no log can catch it"
+                        .into(),
+                );
+            }
+            let code = match store.issue(name, now) {
+                Ok(code) => code,
+                Err(e) => {
+                    say(format!("could not keep the code: {e}"));
+                    return Ok(exit::FAILED);
+                }
+            };
+            println!(
+                "The pairing code for {}: {}
+Type it on the device by {}. It works once.",
+                device::who(name, &app),
+                device::shown_code(&code),
+                device::time_text(now + device::CODE_LIFE)
+            );
+            Ok(0)
+        }
+        [what] if what == "list" => {
+            let devices = match store.list(now) {
+                Ok(devices) => devices,
+                Err(e) => {
+                    say(format!("could not read the tokens: {e}"));
+                    return Ok(exit::FAILED);
+                }
+            };
+            print!("{}", device::list_text(&devices, now));
+            Ok(0)
+        }
+        [what, name] if what == "revoke" => {
+            device::check_name(name)?;
+            match store.revoke(name, now) {
+                Ok(true) => {
+                    println!("revoked: {}", device::who(name, &app));
+                    match logged("revoked", name) {
+                        Ok(()) => Ok(0),
+                        Err(e) => {
+                            say(e);
+                            Ok(exit::NOT_LOGGED)
+                        }
+                    }
+                }
+                Ok(false) => {
+                    say(format!("there is no device {name} on this door"));
+                    Ok(exit::MISSING)
+                }
+                Err(e) => {
+                    say(format!("could not revoke {name}: {e}"));
+                    Ok(exit::FAILED)
+                }
+            }
+        }
+        _ => Err("device takes pair <name>, list, or revoke <name>".into()),
     }
 }
 

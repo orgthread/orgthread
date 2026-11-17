@@ -1,0 +1,890 @@
+//! The device door over HTTP, on an invented sample folder: the pairing, the
+//! three tools, the path rules, the read cap with its push, the revoke, and
+//! T6, the search for a marker word on the disk and in the output.
+
+use orgthread::device::{self, CODE_LIFE, Store, TOKEN_LIFE};
+use serde_json::{Value, json};
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+/// An invented word that stands only in the invented chapter. T6 looks for it.
+const MARKER: &str = "quendelmorgenrot";
+const CHAPTER_1: &str = "Kapitel eins. Der quendelmorgenrot Himmel war still.\nEin Satz.\n";
+const CHAPTER_2: &str = "Kapitel zwei. Ein erfundener Text.\n";
+const CHAPTER_3: &str = "Kapitel drei. Noch ein erfundener Text.\n";
+const PRIVATE: &str = "an invented private note, never for a device\n";
+const PROGRESS: &str = "# Reading: an invented book\n\n- Place: chapter 1, page 1\n";
+const PREFIX: &str = "/an-invented-secret";
+const BOOK: &str = "/books/an-invented-book";
+const PROGRESS_FILE: &str = "/reading/progress-an-invented-book.md";
+
+/// One door at a time, as for the other doors over HTTP.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+struct Door {
+    _turn: MutexGuard<'static, ()>,
+    port: u16,
+    dir: PathBuf,
+    child: Child,
+}
+
+struct Reply {
+    status: u16,
+    body: String,
+}
+
+/// The sample folder: a book, its glossary, its summary, the progress file, a
+/// private file, and two links that point at the private file.
+fn sample(dir: &Path) {
+    let root = dir.join("root");
+    let book = root.join("books/an-invented-book");
+    fs::create_dir_all(&book).unwrap();
+    fs::write(book.join("chapter-01.txt"), CHAPTER_1).unwrap();
+    fs::write(book.join("chapter-02.txt"), CHAPTER_2).unwrap();
+    fs::write(book.join("chapter-03.txt"), CHAPTER_3).unwrap();
+    fs::write(
+        book.join("contents.txt"),
+        "1 Kapitel eins\n2 Kapitel zwei\n",
+    )
+    .unwrap();
+    let reading = root.join("reading");
+    fs::create_dir_all(reading.join("glossary/an-invented-book")).unwrap();
+    fs::create_dir_all(reading.join("summaries/an-invented-book")).unwrap();
+    fs::write(
+        reading.join("glossary/an-invented-book/glossary-01.md"),
+        "# Glossar\n\n- still: quiet\n",
+    )
+    .unwrap();
+    fs::write(
+        reading.join("summaries/an-invented-book/summary-01.md"),
+        "# Zusammenfassung\n\n¶1 | Es ist still. | It is quiet.\n",
+    )
+    .unwrap();
+    fs::write(reading.join("progress-an-invented-book.md"), PROGRESS).unwrap();
+    fs::write(reading.join("notes.md"), PRIVATE).unwrap();
+    fs::create_dir_all(root.join("health")).unwrap();
+    fs::write(root.join("health/invented-health.md"), PRIVATE).unwrap();
+    std::os::unix::fs::symlink(root.join("health"), book.join("sneaky")).unwrap();
+    std::os::unix::fs::symlink(
+        root.join("health/invented-health.md"),
+        root.join("books/link.txt"),
+    )
+    .unwrap();
+    let notify = dir.join("notify.sh");
+    fs::write(
+        &notify,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n",
+            dir.join("notified.txt").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&notify, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The settings of the device door, all in the environment.
+fn settings(dir: &Path, cap_hour: &str) -> Vec<(&'static str, String)> {
+    let state = dir.join("state");
+    let at = |name: &str| state.join(name).display().to_string();
+    vec![
+        ("ORGTHREAD_STORAGE", "local".into()),
+        ("ORGTHREAD_ROOT", dir.join("root").display().to_string()),
+        ("ORGTHREAD_LOCK_DIR", at("locks")),
+        ("ORGTHREAD_LOG", at("writes.log")),
+        ("ORGTHREAD_READS", at("reads")),
+        ("ORGTHREAD_VERSIONS", at("versions")),
+        ("ORGTHREAD_DEVICES", at("devices.json")),
+        ("ORGTHREAD_LOGIN_HASH", String::new()),
+        (
+            "ORGTHREAD_PUBLIC_URL",
+            format!("https://reader.example.com{PREFIX}"),
+        ),
+        ("ORGTHREAD_DEVICE_APP", "reader".into()),
+        (
+            "ORGTHREAD_DEVICE_READ",
+            "/books/, /reading/glossary/, /reading/summaries/".into(),
+        ),
+        ("ORGTHREAD_DEVICE_PATCH", "/reading/progress-*.md".into()),
+        ("ORGTHREAD_DEVICE_CAPPED", "/books/*/chapter-*.txt".into()),
+        ("ORGTHREAD_DEVICE_CAP_HOUR", cap_hour.into()),
+        ("ORGTHREAD_DEVICE_CAP_DAY", "40".into()),
+        (
+            "ORGTHREAD_DEVICE_NOTIFY",
+            dir.join("notify.sh").display().to_string(),
+        ),
+    ]
+}
+
+/// The program with the settings of the door, and none from the test run.
+fn program(dir: &Path, cap_hour: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orgthread"));
+    for (name, _) in std::env::vars() {
+        if name.starts_with("ORGTHREAD_") {
+            command.env_remove(name);
+        }
+    }
+    command.envs(settings(dir, cap_hour));
+    command
+}
+
+fn new_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orgthread-device-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::canonicalize(dir).unwrap()
+}
+
+impl Door {
+    fn open(name: &str) -> Self {
+        Self::open_with(name, "8")
+    }
+
+    fn open_with(name: &str, cap_hour: &str) -> Self {
+        let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = new_dir(name);
+        sample(&dir);
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let port = 41_000 + (std::process::id() % 20_000) as u16 + n;
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "port {port} is busy"
+        );
+        // The output of the door goes to a file, so T6 can search it.
+        let out = fs::File::create(dir.join("door-output.txt")).unwrap();
+        let mut child = program(&dir, cap_hour)
+            .args(["serve", "--http", &format!("127.0.0.1:{port}"), "--device"])
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(Stdio::from(out))
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                let said = fs::read_to_string(dir.join("door-output.txt")).unwrap_or_default();
+                panic!("the door stopped at its start, {status}: {said}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Door {
+            _turn: turn,
+            port,
+            dir,
+            child,
+        }
+    }
+
+    fn store(&self) -> Store {
+        Store::new(self.dir.join("state/devices.json"))
+    }
+
+    fn raw(&self, method: &str, path: &str, extra: &str, body: &str) -> Reply {
+        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let text = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(text.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        let (head, body) = out.split_once("\r\n\r\n").unwrap();
+        Reply {
+            status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            body: body.to_string(),
+        }
+    }
+
+    fn pair_with(&self, code: &str) -> Reply {
+        let body = json!({ "code": code }).to_string();
+        self.raw(
+            "POST",
+            &format!("{PREFIX}/pair"),
+            "Content-Type: application/json\r\n",
+            &body,
+        )
+    }
+
+    /// A code from the owner's command, and the token the device gets for it.
+    fn pair(&self) -> String {
+        let code = self.store().issue("tablet", device::now()).unwrap();
+        let reply = self.pair_with(&device::shown_code(&code));
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let answer: Value = serde_json::from_str(&reply.body).unwrap();
+        answer["token"].as_str().unwrap().to_string()
+    }
+
+    fn mcp(&self, token: &str, method: &str, params: Value) -> Reply {
+        let message = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let extra = format!("Authorization: Bearer {token}\r\nContent-Type: application/json\r\n");
+        self.raw(
+            "POST",
+            &format!("{PREFIX}/mcp"),
+            &extra,
+            &message.to_string(),
+        )
+    }
+
+    /// A tool call: true when it was refused, and the text.
+    fn call(&self, token: &str, tool: &str, arguments: Value) -> (bool, String) {
+        let reply = self.mcp(
+            token,
+            "tools/call",
+            json!({"name": tool, "arguments": arguments}),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let answer: Value = serde_json::from_str(&reply.body).unwrap();
+        let result = &answer["result"];
+        assert!(result.is_object(), "{answer}");
+        (
+            result["isError"].as_bool().unwrap(),
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    fn read(&self, token: &str, file: &str) -> (bool, String) {
+        self.call(token, "read", json!({ "file": file }))
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(self.dir.join("state/writes.log")).unwrap_or_default()
+    }
+
+    fn notified(&self) -> String {
+        fs::read_to_string(self.dir.join("notified.txt")).unwrap_or_default()
+    }
+
+    /// The command line with the same settings as the door.
+    fn command(&self, args: &[&str]) -> Output {
+        program(&self.dir, "8").args(args).output().unwrap()
+    }
+
+    fn root_file(&self, path: &str) -> String {
+        fs::read_to_string(self.dir.join("root").join(path.trim_start_matches('/'))).unwrap()
+    }
+}
+
+impl Drop for Door {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The notify program runs in the background, so its line may come a little later.
+fn wait_for(what: impl Fn() -> bool) {
+    for _ in 0..100 {
+        if what() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_code_gives_a_token_once_and_the_token_opens_three_tools() {
+    let door = Door::open("pair");
+    let code = door.store().issue("tablet", device::now()).unwrap();
+    let before = device::date_text(device::now() + TOKEN_LIFE);
+    // Typed with small letters and a dash, as on the device.
+    let reply = door.pair_with(&device::shown_code(&code).to_lowercase());
+    let after = device::date_text(device::now() + TOKEN_LIFE);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let answer: Value = serde_json::from_str(&reply.body).unwrap();
+    let token = answer["token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    let expires = answer["expires"].as_str().unwrap();
+    assert!(expires == before || expires == after, "{expires}");
+    assert_eq!(
+        answer.as_object().unwrap().len(),
+        2,
+        "only token and expires"
+    );
+
+    let again = door.pair_with(&code);
+    assert_eq!(again.status, 400, "a code works once");
+    assert_eq!(again.body, r#"{"error":"wrong_code"}"#);
+
+    let tools = door.mcp(token, "tools/list", json!({}));
+    let tools: Value = serde_json::from_str(&tools.body).unwrap();
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["read", "patch", "list"]);
+    assert!(door.log().contains("\tpaired\t-\ttablet (reader)\t"));
+    let file = fs::read_to_string(door.dir.join("state/devices.json")).unwrap();
+    assert!(
+        !file.contains(token) && !file.contains(&code),
+        "hashes only"
+    );
+}
+
+#[test]
+fn an_old_code_or_a_wrong_one_gets_no_token_and_five_close_the_pairing() {
+    let door = Door::open("old-code");
+    let old = door
+        .store()
+        .issue("tablet", device::now() - CODE_LIFE - 1)
+        .unwrap();
+    assert_eq!(door.pair_with(&old).status, 400, "older than 5 minutes");
+    for _ in 0..3 {
+        assert_eq!(door.pair_with("ABCD-EFGH").status, 400);
+    }
+    assert_eq!(door.pair_with("no code").status, 400);
+    let fresh = door.store().issue("tablet", device::now()).unwrap();
+    let closed = door.pair_with(&fresh);
+    assert_eq!(closed.status, 429, "{}", closed.body);
+    assert_eq!(door.pair_with("{").status, 429);
+    assert!(door.log().contains("\tpair-refused\t"));
+}
+
+#[test]
+fn without_a_token_that_works_the_door_is_closed() {
+    let door = Door::open("closed");
+    let token = door.pair();
+    assert_eq!(door.mcp("", "tools/list", json!({})).status, 401);
+    let wrong = "0".repeat(64);
+    assert_eq!(door.mcp(&wrong, "tools/list", json!({})).status, 401);
+    assert_eq!(
+        door.mcp(&device::hash(&token), "tools/list", json!({}))
+            .status,
+        401,
+        "the hash is no token"
+    );
+    // No OAuth, no other place, and nothing outside the secret path.
+    for (method, path) in [
+        (
+            "GET",
+            format!("{PREFIX}/.well-known/oauth-authorization-server"),
+        ),
+        ("GET", "/.well-known/oauth-authorization-server".to_string()),
+        ("POST", format!("{PREFIX}/register")),
+        ("POST", format!("{PREFIX}/token")),
+        ("GET", format!("{PREFIX}/authorize")),
+        ("POST", "/mcp".to_string()),
+        ("POST", "/pair".to_string()),
+    ] {
+        let extra = format!("Authorization: Bearer {token}\r\n");
+        assert_eq!(
+            door.raw(method, &path, &extra, "{}").status,
+            404,
+            "{method} {path}"
+        );
+    }
+    assert_eq!(door.mcp(&token, "tools/list", json!({})).status, 200);
+    let extra = format!("Authorization: Bearer {token}\r\n");
+    assert_eq!(
+        door.raw("GET", &format!("{PREFIX}/mcp"), &extra, "").status,
+        405
+    );
+}
+
+#[test]
+fn every_other_tool_is_refused_with_the_policy_error() {
+    let door = Door::open("tools");
+    let token = door.pair();
+    for (tool, arguments) in [
+        (
+            "write",
+            json!({"file": PROGRESS_FILE, "who": "x", "text": "new\n"}),
+        ),
+        ("delete", json!({"file": PROGRESS_FILE, "who": "x"})),
+        (
+            "search",
+            json!({"text": "Kapitel", "folder": "/books/", "who": "x"}),
+        ),
+        (
+            "copy",
+            json!({"pairs": [{"from": PROGRESS_FILE, "to": "/books/x.md"}], "who": "x"}),
+        ),
+        (
+            "move",
+            json!({"pairs": [{"from": PROGRESS_FILE, "to": "/books/x.md"}], "who": "x"}),
+        ),
+        ("download", json!({"files": [PROGRESS_FILE], "who": "x"})),
+        ("upload", json!({"files": [PROGRESS_FILE], "who": "x"})),
+        ("version", json!({})),
+        ("an-invented-tool", json!({})),
+    ] {
+        let (refused, text) = door.call(&token, tool, arguments);
+        assert!(refused, "{tool}");
+        assert!(text.starts_with("exit code 2\n"), "{tool}: {text}");
+        assert!(
+            text.contains("offers only list, read, patch"),
+            "{tool}: {text}"
+        );
+    }
+    assert_eq!(door.root_file(PROGRESS_FILE), PROGRESS, "unchanged");
+    assert!(!door.dir.join("root/books/x.md").exists());
+    assert_eq!(door.log().matches("\trefused\t").count(), 9);
+}
+
+#[test]
+fn reads_lists_and_patches_work_on_the_named_paths() {
+    let door = Door::open("work");
+    let token = door.pair();
+    assert_eq!(
+        door.read(&token, &format!("{BOOK}/chapter-01.txt")),
+        (false, CHAPTER_1.to_string())
+    );
+    for file in [
+        "/reading/glossary/an-invented-book/glossary-01.md",
+        "/reading/summaries/an-invented-book/summary-01.md",
+    ] {
+        let (refused, text) = door.read(&token, file);
+        assert!(!refused, "{file}: {text}");
+    }
+
+    let (refused, list) = door.call(&token, "list", json!({"folders": ["/books/"]}));
+    assert!(!refused, "{list}");
+    assert!(
+        list.starts_with("/books/:\n"),
+        "the device sees its own path: {list}"
+    );
+    assert!(list.contains("an-invented-book/"));
+    assert!(
+        !list.contains(&door.dir.display().to_string()),
+        "no path of the disk"
+    );
+    let (refused, list) = door.call(&token, "list", json!({"folders": [BOOK]}));
+    assert!(!refused && list.contains("chapter-01.txt"), "{list}");
+
+    // A patch needs the read of the same device first, as on every door.
+    let edit =
+        json!({"old": "- Place: chapter 1, page 1\n", "new": "- Place: chapter 2, page 3\n"});
+    let patch = json!({"file": PROGRESS_FILE, "edits": [edit], "who": "anything"});
+    let (refused, text) = door.call(&token, "patch", patch.clone());
+    assert!(refused && text.starts_with("exit code"), "{text}");
+    assert_eq!(
+        door.read(&token, PROGRESS_FILE),
+        (false, PROGRESS.to_string())
+    );
+    let (refused, text) = door.call(&token, "patch", patch);
+    assert!(!refused, "{text}");
+    assert!(text.starts_with("patched: "), "{text}");
+    assert!(door.root_file(PROGRESS_FILE).contains("chapter 2, page 3"));
+    assert!(
+        door.log().contains("\ttablet (reader)\t"),
+        "the door names the device, not the who it was sent"
+    );
+    assert!(!door.log().contains("anything"));
+}
+
+#[test]
+fn a_patch_never_makes_a_file() {
+    let door = Door::open("no-new");
+    let token = door.pair();
+    let file = "/reading/progress-another-invented-book.md";
+    let (refused, text) = door.read(&token, file);
+    assert!(refused && text.starts_with("exit code 6\n"), "{text}");
+    let (refused, text) = door.call(
+        &token,
+        "patch",
+        json!({"file": file, "append": "- Place: 1\n"}),
+    );
+    assert!(refused, "{text}");
+    assert!(
+        text.starts_with("exit code 5\n"),
+        "nothing read, nothing patched: {text}"
+    );
+    assert!(
+        !door
+            .dir
+            .join("root")
+            .join(file.trim_start_matches('/'))
+            .exists()
+    );
+}
+
+#[test]
+fn path_tricks_and_closed_paths_are_refused() {
+    let door = Door::open("tricks");
+    let token = door.pair();
+    for file in [
+        "/books/../health/invented-health.md",
+        "/books/an-invented-book/../../health/invented-health.md",
+        "/books/./an-invented-book/chapter-01.txt",
+        "/Books/an-invented-book/chapter-01.txt",
+        "/BOOKS/an-invented-book/chapter-01.txt",
+        "books/an-invented-book/chapter-01.txt",
+        "/books//an-invented-book/chapter-01.txt",
+        "//books/an-invented-book/chapter-01.txt",
+        "/booksx/an-invented-book/chapter-01.txt",
+        "/books",
+        "/health/invented-health.md",
+        "/reading/notes.md",
+        "/reading/Progress-an-invented-book.md",
+        "/books/an-invented-book/sneaky/invented-health.md",
+        "/books/link.txt",
+        "/",
+        "",
+    ] {
+        let (refused, text) = door.read(&token, file);
+        assert!(refused, "{file}: {text}");
+        assert!(text.starts_with("exit code 2\n"), "{file}: {text}");
+        assert!(!text.contains("invented private note"), "{file}");
+    }
+    for file in [
+        "/reading/glossary/an-invented-book/glossary-01.md",
+        "/books/an-invented-book/chapter-01.txt",
+        "/reading/notes.md",
+        "/reading//progress-an-invented-book.md",
+        "/reading/../reading/progress-an-invented-book.md",
+        "/reading/PROGRESS-an-invented-book.md",
+    ] {
+        let patch = json!({"file": file, "append": "an invented line\n"});
+        let (refused, text) = door.call(&token, "patch", patch);
+        assert!(
+            refused && text.starts_with("exit code 2\n"),
+            "{file}: {text}"
+        );
+    }
+    for folder in [
+        "/",
+        "/reading/",
+        "/notes/",
+        "/health/",
+        "/books/an-invented-book/sneaky/",
+        "/books/../health/",
+        "books/",
+        "/Books/",
+    ] {
+        let (refused, text) = door.call(&token, "list", json!({"folders": [folder]}));
+        assert!(
+            refused && text.starts_with("exit code 2\n"),
+            "{folder}: {text}"
+        );
+        assert!(!text.contains("invented-health"), "{folder}: {text}");
+    }
+    // One closed folder refuses the whole list.
+    let both = json!({"folders": ["/books/", "/health/"]});
+    let (refused, text) = door.call(&token, "list", both);
+    assert!(refused && !text.contains("an-invented-book"), "{text}");
+    assert_eq!(
+        fs::read_to_string(door.dir.join("root/health/invented-health.md")).unwrap(),
+        PRIVATE
+    );
+    assert!(door.log().contains(
+        "\trefused\t/books/an-invented-book/sneaky/invented-health.md\ttablet (reader)\t"
+    ));
+}
+
+#[test]
+fn the_read_cap_refuses_logs_and_pushes_once() {
+    let door = Door::open_with("cap", "2");
+    let token = door.pair();
+    for n in ["01", "02"] {
+        let (refused, text) = door.read(&token, &format!("{BOOK}/chapter-{n}.txt"));
+        assert!(!refused, "{text}");
+    }
+    // A file that is not capped still opens.
+    let (refused, _) = door.read(&token, &format!("{BOOK}/contents.txt"));
+    assert!(!refused);
+    for _ in 0..3 {
+        let (refused, text) = door.read(&token, &format!("{BOOK}/chapter-03.txt"));
+        assert!(refused, "{text}");
+        assert!(text.starts_with("exit code 2\n"), "{text}");
+        assert!(text.contains("read cap of 2 in 60 minutes"), "{text}");
+        assert!(!text.contains("Kapitel drei"));
+    }
+    assert_eq!(door.log().matches("\tcapped\t").count(), 3);
+    wait_for(|| door.notified().contains("read cap"));
+    std::thread::sleep(Duration::from_millis(200));
+    let notified = door.notified();
+    assert_eq!(
+        notified.matches("read cap").count(),
+        1,
+        "one push an hour: {notified}"
+    );
+    assert!(notified.contains("tablet (reader)"), "{notified}");
+    assert!(
+        notified.contains("orgthread device revoke tablet"),
+        "{notified}"
+    );
+    assert!(
+        notified.contains("paired"),
+        "a push at the pairing too: {notified}"
+    );
+    assert!(
+        !notified.contains("chapter") && !notified.contains("Kapitel"),
+        "no path, no text"
+    );
+}
+
+#[test]
+fn a_revoke_by_the_command_closes_the_door_at_once() {
+    let door = Door::open("revoke");
+    let token = door.pair();
+    let listed = door.command(&["device", "list"]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(listed.status.code(), Some(0));
+    assert!(text.contains("tablet (reader)  paired"), "{text}");
+    assert!(!text.contains(&token) && !text.contains(&device::hash(&token)));
+
+    assert!(!door.read(&token, PROGRESS_FILE).0);
+    let revoked = door.command(&["device", "revoke", "tablet"]);
+    assert_eq!(revoked.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&revoked.stdout),
+        "revoked: tablet (reader)\n"
+    );
+    assert_eq!(door.mcp(&token, "tools/list", json!({})).status, 401);
+    assert!(door.log().contains("\trevoked\t-\ttablet (reader)\t"));
+    let again = door.command(&["device", "revoke", "tablet"]);
+    assert_eq!(again.status.code(), Some(6));
+}
+
+#[test]
+fn the_pairing_code_shows_only_in_a_terminal() {
+    let door = Door::open("no-terminal");
+    let out = door.command(&["device", "pair", "tablet"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only in a terminal"));
+    let listed = door.command(&["device", "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        "no device is paired\n"
+    );
+}
+
+#[test]
+fn the_doors_refuse_to_start_with_the_wrong_settings() {
+    let dir = new_dir("start");
+    sample(&dir);
+    let port = 61_000 + (std::process::id() % 4_000) as u16;
+    let address = format!("127.0.0.1:{port}");
+    let device = ["serve", "--http", address.as_str(), "--device"];
+    let run = |change: &[(&str, &str)], args: &[&str]| -> (Option<i32>, String) {
+        let mut command = program(&dir, "8");
+        for (name, value) in change {
+            command.env(name, value);
+        }
+        // A door that starts by mistake would run for ever: stop it after 10 s.
+        let err = dir.join("start-output.txt");
+        let file = fs::File::create(&err).unwrap();
+        let mut child = command
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        let mut code = None;
+        for _ in 0..500 {
+            if let Some(status) = child.try_wait().unwrap() {
+                code = status.code();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if code.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        (code, fs::read_to_string(&err).unwrap_or_default())
+    };
+    let hash = "a".repeat(64);
+    for (change, says) in [
+        (vec![("ORGTHREAD_DEVICE_APP", "")], "ORGTHREAD_DEVICE_APP"),
+        (
+            vec![("ORGTHREAD_DEVICE_APP", "Reader App")],
+            "ORGTHREAD_DEVICE_APP",
+        ),
+        (
+            vec![("ORGTHREAD_LOGIN_HASH", hash.as_str())],
+            "its own folder",
+        ),
+        (
+            vec![
+                ("ORGTHREAD_DEVICE_READ", ""),
+                ("ORGTHREAD_DEVICE_PATCH", ""),
+            ],
+            "ORGTHREAD_DEVICE_READ or ORGTHREAD_DEVICE_PATCH",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_READ", "/books")],
+            "ORGTHREAD_DEVICE_READ",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_READ", "/books/../")],
+            "ORGTHREAD_DEVICE_READ",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_PATCH", "notes/a.md")],
+            "ORGTHREAD_DEVICE_PATCH",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_CAP_HOUR", "0")],
+            "ORGTHREAD_DEVICE_CAP_HOUR",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_CAP_DAY", "many")],
+            "ORGTHREAD_DEVICE_CAP_DAY",
+        ),
+    ] {
+        let (code, said) = run(&change, &device);
+        assert_eq!(code, Some(2), "{change:?}: {said}");
+        assert!(said.contains(says), "{change:?}: {said}");
+    }
+    // The full door does not start in the folder of a device door.
+    let full = ["serve", "--http", address.as_str()];
+    let (code, said) = run(&[("ORGTHREAD_LOGIN_HASH", hash.as_str())], &full);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(said.contains("--device"), "{said}");
+    // A broken file of tokens stops the door at its start.
+    fs::create_dir_all(dir.join("state")).unwrap();
+    fs::write(dir.join("state/devices.json"), "{ broken").unwrap();
+    let (code, said) = run(&[], &device);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(said.contains("could not read the tokens"), "{said}");
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// T6: after a device read a chapter, no word of it is on the disk of the door,
+/// in its log, in its file of tokens, in its notes, or in its output, which a
+/// server sends to the journal.
+#[test]
+fn t6_no_text_of_a_book_reaches_the_disk_the_log_or_the_output() {
+    let door = Door::open_with("t6", "1");
+    let token = door.pair();
+    let (refused, text) = door.read(&token, &format!("{BOOK}/chapter-01.txt"));
+    assert!(!refused && text.contains(MARKER));
+    // The cap, a refusal and a patch, so that every kind of line is written.
+    assert!(door.read(&token, &format!("{BOOK}/chapter-02.txt")).0);
+    assert!(door.read(&token, "/health/invented-health.md").0);
+    assert!(!door.read(&token, PROGRESS_FILE).0);
+    let edit =
+        json!({"old": "- Place: chapter 1, page 1\n", "new": "- Place: chapter 1, page 2\n"});
+    assert!(
+        !door
+            .call(
+                &token,
+                "patch",
+                json!({"file": PROGRESS_FILE, "edits": [edit]})
+            )
+            .0
+    );
+    assert!(!door.call(&token, "list", json!({"folders": [BOOK]})).0);
+    wait_for(|| door.notified().contains("read cap"));
+
+    let mut searched = 0;
+    let mut stack = vec![door.dir.clone()];
+    while let Some(place) = stack.pop() {
+        for entry in fs::read_dir(&place).unwrap() {
+            let path = entry.unwrap().path();
+            // The sample folder stands for Dropbox: the book is meant to be there.
+            if path == door.dir.join("root") {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                searched += 1;
+                let bytes = fs::read(&path).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains(MARKER),
+                    "the marker is in {}",
+                    path.display()
+                );
+                assert!(
+                    !text.contains("Kapitel"),
+                    "book text is in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    // The log, the tokens, the notes of the reads, the push and the output.
+    assert!(searched >= 5, "searched {searched} files");
+    assert!(door.dir.join("door-output.txt").exists());
+    assert!(door.log().contains("\tcapped\t"));
+}
+
+/// The one rule for the shapes of the errors, which the reader page and the
+/// Android app rely on: only a token problem gets HTTP 401, nothing gets 403,
+/// a refused tool, a refused path and the read cap are tool results with
+/// `isError` and `exit code N`, and a wrong or used code gets HTTP 400.
+#[test]
+fn only_a_token_problem_gets_401_and_every_refusal_is_a_tool_result() {
+    let door = Door::open_with("shapes", "1");
+    // A missing, unknown, expired and revoked token: 401, with an empty body.
+    let call = json!({"name": "read", "arguments": {"file": PROGRESS_FILE}});
+    assert_eq!(door.mcp("", "tools/call", call.clone()).status, 401);
+    assert_eq!(
+        door.mcp(&"1".repeat(64), "tools/call", call.clone()).status,
+        401
+    );
+    let old = door
+        .store()
+        .issue("old-device", device::now() - TOKEN_LIFE - 10)
+        .unwrap();
+    let expired = door
+        .store()
+        .pair("reader", &old, device::now() - TOKEN_LIFE - 5)
+        .unwrap()
+        .unwrap();
+    let reply = door.mcp(&expired.token, "tools/call", call.clone());
+    assert_eq!((reply.status, reply.body.as_str()), (401, ""), "expired");
+    let token = door.pair();
+
+    // Each refusal of a tool, a path and the cap: 200, isError and exit code 2.
+    let first = format!("{BOOK}/chapter-01.txt");
+    assert!(!door.read(&token, &first).0);
+    for (tool, arguments) in [
+        ("write", json!({"file": PROGRESS_FILE, "text": "x\n"})),
+        ("read", json!({"file": "/health/invented-health.md"})),
+        (
+            "read",
+            json!({"file": "/books/../health/invented-health.md"}),
+        ),
+        ("patch", json!({"file": first, "append": "x\n"})),
+        ("list", json!({"folders": ["/health/"]})),
+        ("read", json!({"file": format!("{BOOK}/chapter-02.txt")})),
+    ] {
+        let reply = door.mcp(
+            &token,
+            "tools/call",
+            json!({"name": tool, "arguments": arguments}),
+        );
+        assert_eq!(reply.status, 200, "{tool}: {}", reply.body);
+        let answer: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(answer["result"]["isError"], true, "{tool}: {answer}");
+        let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("exit code 2\n"), "{tool}: {text}");
+    }
+    assert!(
+        door.log().contains("\tcapped\t"),
+        "the last one was the cap"
+    );
+
+    // A wrong and a used code: 400 with an error in JSON.
+    let code = door.store().issue("phone", device::now()).unwrap();
+    assert_eq!(door.pair_with(&code).status, 200);
+    for typed in [code.as_str(), "ABCD-EFGH"] {
+        let reply = door.pair_with(typed);
+        assert_eq!(reply.status, 400, "{typed}");
+        let answer: Value = serde_json::from_str(&reply.body).unwrap();
+        assert!(answer["error"].is_string(), "{answer}");
+    }
+
+    // A revoked token: 401.
+    assert_eq!(
+        door.command(&["device", "revoke", "tablet"]).status.code(),
+        Some(0)
+    );
+    assert_eq!(door.mcp(&token, "tools/call", call).status, 401);
+}

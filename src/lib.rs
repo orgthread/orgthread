@@ -12,6 +12,8 @@ pub const VERSION: &str = concat!(
 pub mod config;
 pub mod copy;
 pub mod delete;
+pub mod device;
+pub mod device_door;
 pub mod dropbox;
 pub mod envfile;
 pub mod fingerprint;

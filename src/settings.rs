@@ -47,6 +47,14 @@ pub const DROPBOX_TOKEN: &str = "ORGTHREAD_DROPBOX_TOKEN";
 pub const DROPBOX_REFRESH: &str = "ORGTHREAD_DROPBOX_REFRESH";
 pub const DROPBOX_APP_SECRET: &str = "ORGTHREAD_DROPBOX_APP_SECRET";
 pub const LOGIN_HASH: &str = "ORGTHREAD_LOGIN_HASH";
+pub const DEVICE_APP: &str = "ORGTHREAD_DEVICE_APP";
+pub const DEVICE_READ: &str = "ORGTHREAD_DEVICE_READ";
+pub const DEVICE_PATCH: &str = "ORGTHREAD_DEVICE_PATCH";
+pub const DEVICE_CAPPED: &str = "ORGTHREAD_DEVICE_CAPPED";
+pub const DEVICE_CAP_HOUR: &str = "ORGTHREAD_DEVICE_CAP_HOUR";
+pub const DEVICE_CAP_DAY: &str = "ORGTHREAD_DEVICE_CAP_DAY";
+pub const DEVICE_NOTIFY: &str = "ORGTHREAD_DEVICE_NOTIFY";
+pub const DEVICES: &str = "ORGTHREAD_DEVICES";
 
 /// The kind of value a setting takes. It decides what a right value is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +79,13 @@ pub enum Kind {
     Hash,
     /// Any text on one line. Empty means not set.
     Text,
+    /// Folders of a device door, each from the root with `/` at both ends.
+    Folders,
+    /// Files of a device door, each from the root, where `*` stands for any
+    /// part of a name.
+    Files,
+    /// A whole number from 1. Empty means the default.
+    Count,
 }
 
 impl Kind {
@@ -97,6 +112,9 @@ impl Kind {
             Kind::Address => "an address that starts with http:// or https://",
             Kind::Hash => "the 64 signs of orgthread password-hash",
             Kind::Text => "text on one line",
+            Kind::Folders => "folders from the root, with / at both ends",
+            Kind::Files => "files from the root, * for any part of a name",
+            Kind::Count => "a whole number from 1",
         }
     }
 }
@@ -139,17 +157,19 @@ pub enum Group {
     Sizes,
     Dropbox,
     Server,
+    Device,
     Secrets,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 8] = [
         Group::Basics,
         Group::FoldersAndLogs,
         Group::Limits,
         Group::Sizes,
         Group::Dropbox,
         Group::Server,
+        Group::Device,
         Group::Secrets,
     ];
 
@@ -161,6 +181,7 @@ impl Group {
             Group::Sizes => "Sizes",
             Group::Dropbox => "Dropbox",
             Group::Server => "Server",
+            Group::Device => "Device door",
             Group::Secrets => "Secrets",
         }
     }
@@ -213,10 +234,10 @@ const fn secret(name: &'static str, kind: Kind, doors: Doors, help: &'static str
 }
 
 use Doors::{Both, Dropbox as DropboxDoor, Local};
-use Group::{Basics, Dropbox as DropboxGroup, FoldersAndLogs, Limits, Server, Sizes};
+use Group::{Basics, Device, Dropbox as DropboxGroup, FoldersAndLogs, Limits, Server, Sizes};
 
 /// Every setting, in the order of the screen.
-pub const ALL: [Setting; 27] = [
+pub const ALL: [Setting; 35] = [
     setting(
         OWNER,
         Kind::Name,
@@ -392,6 +413,70 @@ pub const ALL: [Setting; 27] = [
         Both,
         Server,
         "yes: let serve --http listen on an address that others can reach, with no encryption.",
+    ),
+    setting(
+        DEVICE_APP,
+        Kind::Name,
+        "none, required by serve --http --device",
+        Both,
+        Device,
+        "The app of a device door, such as reader: small letters, digits and -. Each app gets its own door, in its own folder with its own .env. A token is for one app on one device.",
+    ),
+    setting(
+        DEVICE_READ,
+        Kind::Folders,
+        "none",
+        Both,
+        Device,
+        "Comma-separated folders that a device may read and list, with all they hold. Each from the root, with / at both ends, such as /books/. Capitals count.",
+    ),
+    setting(
+        DEVICE_PATCH,
+        Kind::Files,
+        "none",
+        Both,
+        Device,
+        "Comma-separated files that a device may read and patch, never make. Each from the root, such as /notes/progress-*.md, where * stands for any part of one name. Capitals count.",
+    ),
+    setting(
+        DEVICE_CAPPED,
+        Kind::Files,
+        "every read",
+        Both,
+        Device,
+        "Comma-separated files whose reads count for the read cap, in the form of ORGTHREAD_DEVICE_PATCH, such as /books/*/chapter-*.txt.",
+    ),
+    setting(
+        DEVICE_CAP_HOUR,
+        Kind::Count,
+        "8",
+        Both,
+        Device,
+        "The most capped reads of one device in 60 minutes. Above it the door refuses, logs capped and runs ORGTHREAD_DEVICE_NOTIFY.",
+    ),
+    setting(
+        DEVICE_CAP_DAY,
+        Kind::Count,
+        "40",
+        Both,
+        Device,
+        "The most capped reads of one device in 24 hours.",
+    ),
+    setting(
+        DEVICE_NOTIFY,
+        Kind::Path,
+        "none: the log only",
+        Both,
+        Device,
+        "A program that sends you a push, when a device reaches its read cap or pairs. It gets one line of text as its only argument: the device and what happened, never a path or a text of a file.",
+    ),
+    setting(
+        DEVICES,
+        Kind::Path,
+        "state/devices.json beside the program",
+        Both,
+        Device,
+        "The tokens and the pairing codes of a device door: hashes only, never a raw token.",
     ),
     secret(
         DROPBOX_TOKEN,
@@ -623,6 +708,60 @@ pub fn login_hash() -> String {
     list(LOGIN_HASH)
 }
 
+/// The app of a device door, empty when it is not there.
+pub fn device_app() -> String {
+    list(DEVICE_APP).trim().to_string()
+}
+
+/// The folders a device may read and list, as a comma-separated list.
+pub fn device_read() -> String {
+    list(DEVICE_READ)
+}
+
+/// The files a device may read and patch, as a comma-separated list.
+pub fn device_patch() -> String {
+    list(DEVICE_PATCH)
+}
+
+/// The files whose reads count for the cap. `None` when not set or empty:
+/// then every read counts.
+pub fn device_capped() -> Option<String> {
+    text_from(&env_get, DEVICE_CAPPED).filter(|v| !v.trim().is_empty())
+}
+
+fn count_from(get: Get, name: &str) -> Result<u64, String> {
+    match text_from(get, name) {
+        Some(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| format!("{name} needs a whole number from 1, not {value}")),
+        _ => Ok(default_of(name).parse().unwrap_or(1)),
+    }
+}
+
+/// The most capped reads of one device in 60 minutes.
+pub fn device_cap_hour() -> Result<u64, String> {
+    count_from(&env_get, DEVICE_CAP_HOUR)
+}
+
+/// The most capped reads of one device in 24 hours.
+pub fn device_cap_day() -> Result<u64, String> {
+    count_from(&env_get, DEVICE_CAP_DAY)
+}
+
+/// The program that sends the owner a push, if set.
+pub fn device_notify() -> Option<PathBuf> {
+    path(DEVICE_NOTIFY).filter(|p| !p.as_os_str().is_empty())
+}
+
+/// The file of the tokens and codes of a device door, if the setting names
+/// one. With none, the caller uses `state/devices.json` beside the program.
+pub fn devices() -> Option<PathBuf> {
+    path(DEVICES)
+}
+
 fn address_from(get: Get, name: &str) -> String {
     text_from(get, name).unwrap_or(default_of(name).to_string())
 }
@@ -695,6 +834,9 @@ pub fn check(setting: &Setting, value: &OsStr) -> Result<(), String> {
         Kind::Hash => {
             text.is_empty() || (text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()))
         }
+        Kind::Folders => crate::device::check_folders(&text).is_ok(),
+        Kind::Files => crate::device::check_files(&text).is_ok(),
+        Kind::Count => count_from(&|_: &str| Some(value.to_owned()), name).is_ok(),
     };
     if fits {
         return Ok(());
@@ -706,6 +848,15 @@ pub fn check(setting: &Setting, value: &OsStr) -> Result<(), String> {
         Kind::Megabytes => format!("{name} needs a whole number of MB, not {shown}"),
         Kind::Hash => format!("{name} needs the 64 signs that orgthread password-hash gives"),
         Kind::PublicAddress => format!("{name} needs an address that starts with https://"),
+        Kind::Folders => match crate::device::check_folders(&text) {
+            Err(why) => format!("{name}: {why}"),
+            Ok(()) => format!("{name} needs {}", setting.kind.rule()),
+        },
+        Kind::Files => match crate::device::check_files(&text) {
+            Err(why) => format!("{name}: {why}"),
+            Ok(()) => format!("{name} needs {}", setting.kind.rule()),
+        },
+        Kind::Count => format!("{name} needs a whole number from 1, not {shown}"),
         _ if empty => format!("{name} needs {}, and it is empty", setting.kind.rule()),
         _ => format!("{name} needs {}, not {shown}", setting.kind.rule()),
     })
@@ -937,7 +1088,7 @@ mod tests {
 
     #[test]
     fn the_list_has_each_setting_once_with_a_prefix_and_a_help_line() {
-        assert_eq!(ALL.len(), 27);
+        assert_eq!(ALL.len(), 35);
         for (i, s) in ALL.iter().enumerate() {
             assert!(s.name.starts_with(PREFIX), "{}", s.name);
             assert!(!s.help.is_empty() && !s.default.is_empty(), "{}", s.name);
