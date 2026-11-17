@@ -18,6 +18,7 @@ const MARKER: &str = "quendelmorgenrot";
 const CHAPTER_1: &str = "Kapitel eins. Der quendelmorgenrot Himmel war still.\nEin Satz.\n";
 const CHAPTER_2: &str = "Kapitel zwei. Ein erfundener Text.\n";
 const CHAPTER_3: &str = "Kapitel drei. Noch ein erfundener Text.\n";
+const WHOLE_BOOK: &str = "an invented whole book, kept beside the book folders\n";
 const PRIVATE: &str = "an invented private note, never for a device\n";
 const PROGRESS: &str = "# Reading: an invented book\n\n- Place: chapter 1, page 1\n";
 const PREFIX: &str = "/an-invented-secret";
@@ -53,6 +54,8 @@ fn sample(dir: &Path) {
         "1 Kapitel eins\n2 Kapitel zwei\n",
     )
     .unwrap();
+    // A whole book beside the book folders: never for a device.
+    fs::write(root.join("books/an-invented-book.epub"), WHOLE_BOOK).unwrap();
     let reading = root.join("reading");
     fs::create_dir_all(reading.join("glossary/an-invented-book")).unwrap();
     fs::create_dir_all(reading.join("summaries/an-invented-book")).unwrap();
@@ -109,7 +112,7 @@ fn settings(dir: &Path, cap_hour: &str) -> Vec<(&'static str, String)> {
         ("ORGTHREAD_DEVICE_APP", "reader".into()),
         (
             "ORGTHREAD_DEVICE_READ",
-            "/books/, /reading/glossary/, /reading/summaries/".into(),
+            "/books/*/, /reading/glossary/, /reading/summaries/".into(),
         ),
         ("ORGTHREAD_DEVICE_PATCH", "/reading/progress-*.md".into()),
         ("ORGTHREAD_DEVICE_CAPPED", "/books/*/chapter-*.txt".into()),
@@ -887,4 +890,54 @@ fn only_a_token_problem_gets_401_and_every_refusal_is_a_tool_result() {
         Some(0)
     );
     assert_eq!(door.mcp(&token, "tools/call", call).status, 401);
+}
+
+/// A `*` in a read folder stands for one folder name: `/books/*/` opens each
+/// book folder and all it holds, never a file directly in `/books/`, such as a
+/// whole book, and a list of `/books/` shows only the folder names.
+#[test]
+fn a_star_opens_the_book_folders_and_never_a_file_beside_them() {
+    let door = Door::open("star");
+    let token = door.pair();
+    let (refused, text) = door.read(&token, "/books/an-invented-book.epub");
+    assert!(refused, "{text}");
+    assert!(text.starts_with("exit code 2\n"), "{text}");
+    assert!(!text.contains("whole book"), "{text}");
+    assert!(
+        door.log()
+            .contains("\trefused\t/books/an-invented-book.epub\t")
+    );
+
+    let (refused, text) = door.read(&token, &format!("{BOOK}/contents.txt"));
+    assert!(!refused, "a file in a book folder opens: {text}");
+
+    // The * never covers a /: a file directly in /books/, or one reached by a
+    // way around, stays closed.
+    for closed in [
+        "/books/chapter-01.txt",
+        "/books/an-invented-book/../an-invented-book.epub",
+        "/books//an-invented-book.epub",
+    ] {
+        let (refused, text) = door.read(&token, closed);
+        assert!(
+            refused && text.starts_with("exit code 2\n"),
+            "{closed}: {text}"
+        );
+    }
+
+    for folder in ["/books/", "/books"] {
+        let (refused, list) = door.call(&token, "list", json!({"folders": [folder]}));
+        assert!(!refused, "{list}");
+        assert!(list.starts_with(&format!("{folder}:\n")), "{list}");
+        assert!(list.contains("an-invented-book/"), "{list}");
+        assert!(!list.contains(".epub"), "no file name at the root: {list}");
+        assert!(!list.contains("link.txt"), "{list}");
+    }
+    let both = json!({"folders": ["/books/", BOOK]});
+    let (refused, list) = door.call(&token, "list", both);
+    assert!(!refused, "{list}");
+    assert!(
+        !list.contains(".epub") && list.contains("chapter-01.txt"),
+        "{list}"
+    );
 }

@@ -25,12 +25,12 @@ mkdir ~/orgthread-reader
 cp target/release/orgthread ~/orgthread-reader/
 ```
 
-**2. Write its `.env`.** For example, for an invented app `reader` that reads books, glossaries and summaries, and keeps one progress file per book:
+**2. Write its `.env`.** For example, for an invented app `reader` that reads books, glossaries and summaries, and keeps one progress file per book. Each book is a folder in `/books/`, and `/books/` itself also holds files that no device may read, such as the whole books:
 
 ```
 ORGTHREAD_STORAGE=dropbox
 ORGTHREAD_DEVICE_APP=reader
-ORGTHREAD_DEVICE_READ=/books/,/reading/glossary/,/reading/summaries/
+ORGTHREAD_DEVICE_READ=/books/*/,/reading/glossary/,/reading/summaries/
 ORGTHREAD_DEVICE_PATCH=/reading/progress-*.md
 ORGTHREAD_DEVICE_CAPPED=/books/*/chapter-*.txt
 ORGTHREAD_DEVICE_NOTIFY=/home/example/orgthread-reader/push.sh
@@ -57,6 +57,7 @@ The rules of a device door are stricter than the limits of the other doors:
 - A path has no `//`, no `.` part, no `..` part and no `\`.
 - Capitals count. With `/books/` in the rules, `/Books/a.txt` is refused.
 - `ORGTHREAD_DEVICE_READ` names folders, with `/` at both ends. A device may read every file in them, at any depth, and list them, one level at a time. It may not patch there.
+- In `ORGTHREAD_DEVICE_READ`, `*` stands for any part of one folder name, and never for a `/`. So `/books/*/` opens `/books/an-invented-book/` and all it holds, but no file directly in `/books/`: `/books/an-invented-book.epub` is refused. A list of `/books/`, the folder right above the `*`, shows only the names of its folders, never a file or its name. A list of any other folder above, such as `/`, is refused.
 - `ORGTHREAD_DEVICE_PATCH` names files. A device may read and patch them. `*` stands for any part of one name, and never for a `/`. So `/reading/progress-*.md` opens `/reading/progress-a.md`, and not `/reading/notes.md` or `/reading/old/progress-a.md`. A patch never makes a file: a file that does not exist gives exit code 6 on the read, and the patch is then refused.
 - In a local folder, a path that goes through a link is refused. Dropbox has no links.
 - A list with one closed folder is refused whole.
@@ -168,9 +169,9 @@ Run it on a test server, with invented text only. Write the result down.
 
 1. Make an invented chapter with a marker word that is in no other file, such as `quendelmorgenrot`, in a test folder of the rules, for example `/books/an-invented-book/chapter-01.txt`.
 2. Pair a test device with `device pair` and `/pair`. Pair the same code again: 400.
-3. Allowed calls: `tools/list` gives `read`, `patch` and `list` only. `list` of each read folder, `read` of the chapter, of a glossary, of a summary and of a progress file, then a `patch` of the progress file. All work.
+3. Allowed calls: `tools/list` gives `read`, `patch` and `list` only. `list` of each read folder, `read` of the chapter, of a glossary, of a summary and of a progress file, then a `patch` of the progress file. All work. A `list` of the folder above a `*`, such as `/books/`, shows the book folders and no file.
 4. Every other tool: `write`, `delete`, `search`, `copy`, `move`, `download`, `upload`, `version`. Each gives `exit code 2`, and nothing changes.
-5. Path tricks, each with `read`: a `..` part, a `.` part, other capitals, no `/` at the start, a `//`, the folder name with a letter added, a file next to a progress file, a path outside every rule. Each gives `exit code 2`.
+5. Path tricks, each with `read`: a `..` part, a `.` part, other capitals, no `/` at the start, a `//`, the folder name with a letter added, a file next to a progress file, a path outside every rule, and a file directly in the folder above a `*`, such as a whole book in `/books/`. Each gives `exit code 2`.
 6. A `patch` of a file in a read folder: `exit code 2`. A `read` and a `patch` of a progress file that does not exist: exit code 6, then 5, and no new file.
 7. With `ORGTHREAD_DEVICE_CAP_HOUR=2` for the test: the third chapter read gives `exit code 2` and the read cap. The log has `capped`, and the push came once.
 8. `device revoke` the test device. Its next call gets 401.

@@ -215,18 +215,24 @@ pub fn fits(rule: &str, path: &str) -> bool {
     rule.len() == path.len() && rule.iter().zip(&path).all(|(r, p)| glob(r, p))
 }
 
-/// The check of `ORGTHREAD_DEVICE_READ`: folders, each with `/` at both ends.
+/// The check of `ORGTHREAD_DEVICE_READ`: folders, each with `/` at both ends,
+/// where `*` may stand for any part of one folder name.
 pub fn check_folders(list: &str) -> Result<(), String> {
     for rule in split(list) {
         clean(&rule)?;
-        if !rule.ends_with('/') || rule.contains('*') {
+        if !rule.ends_with('/') {
             return Err(format!(
-                "{} must be a folder with / at both ends, such as /books/, with no *",
+                "{} must be a folder with / at both ends, such as /books/ or /books/*/",
                 shown(&rule)
             ));
         }
     }
     Ok(())
+}
+
+/// The parts of a folder rule or a path, with no `/` at either end.
+fn parts(path: &str) -> Vec<&str> {
+    path.trim_matches('/').split('/').collect()
 }
 
 /// The check of `ORGTHREAD_DEVICE_PATCH` and `ORGTHREAD_DEVICE_CAPPED`: files,
@@ -248,10 +254,22 @@ pub fn check_files(list: &str) -> Result<(), String> {
 /// may read and patch. Anything else is closed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rules {
-    /// Folders, each with `/` at both ends.
+    /// Folders, each with `/` at both ends, where `*` stands for any part of
+    /// one folder name: `/books/*/` opens each folder in `/books/`, and what
+    /// it holds, but no file directly in `/books/`.
     pub read: Vec<String>,
     /// Files, where `*` stands for any part of a name.
     pub patch: Vec<String>,
+}
+
+/// How much of a folder a device may list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// Every entry: the folder lies inside a read folder.
+    All,
+    /// The names of its folders only: the folder holds the folders of a rule
+    /// with `*`, such as `/books/` for `/books/*/`, and its files stay closed.
+    FoldersOnly,
 }
 
 impl Rules {
@@ -266,10 +284,22 @@ impl Rules {
         self.read.is_empty() && self.patch.is_empty()
     }
 
+    /// True when the parts of `path` start with the parts of a read rule, each
+    /// part fitting, and go on below it. A `*` covers one part, never a `/`.
+    fn under_read_rule(&self, path: &[&str], deeper: bool) -> bool {
+        self.read.iter().any(|rule| {
+            let rule = parts(rule);
+            let long_enough = if deeper {
+                path.len() > rule.len()
+            } else {
+                path.len() >= rule.len()
+            };
+            long_enough && rule.iter().zip(path).all(|(r, p)| glob(r, p))
+        })
+    }
+
     fn in_read_folder(&self, path: &str) -> bool {
-        self.read
-            .iter()
-            .any(|folder| path.starts_with(folder.as_str()) && path.len() > folder.len())
+        self.under_read_rule(&parts(path), true)
     }
 
     fn in_patch_files(&self, path: &str) -> bool {
@@ -306,21 +336,22 @@ impl Rules {
         ))
     }
 
-    /// `Ok` when a device may list the folder `folder`: a folder of the rules,
-    /// with or without its last `/`, or a folder inside one.
-    pub fn list(&self, folder: &str) -> Result<(), String> {
+    /// How much a device may list of `folder`, given with or without its last
+    /// `/`: all of a read folder or a folder inside one, and only the folder
+    /// names of the folder right above the `*` of a rule.
+    pub fn list(&self, folder: &str) -> Result<Listing, String> {
         clean(folder)?;
-        let with_slash = if folder.ends_with('/') {
-            folder.to_string()
-        } else {
-            format!("{folder}/")
-        };
-        if self
-            .read
-            .iter()
-            .any(|rule| with_slash.starts_with(rule.as_str()))
-        {
-            return Ok(());
+        let asked = parts(folder);
+        if self.under_read_rule(&asked, false) {
+            return Ok(Listing::All);
+        }
+        let above_a_star = self.read.iter().any(|rule| {
+            let rule = parts(rule);
+            let star = rule.iter().position(|part| part.contains('*'));
+            star == Some(asked.len()) && rule[..asked.len()] == asked[..]
+        });
+        if above_a_star {
+            return Ok(Listing::FoldersOnly);
         }
         Err(format!(
             "{} is outside the folders this door may list",
@@ -828,6 +859,37 @@ mod tests {
     }
 
     #[test]
+    fn a_star_folder_opens_each_folder_in_it_and_no_file_beside_them() {
+        let r = Rules::new("/books/*/", "");
+        assert!(r.read("/books/an-invented-book/chapter-01.txt").is_ok());
+        assert!(r.read("/books/an-invented-book/deeper/notes.txt").is_ok());
+        for closed in [
+            "/books/an-invented-book.epub",
+            "/books/a.txt",
+            "/books/x/../a.epub",
+            "/Books/an-invented-book/chapter-01.txt",
+            "/booksx/an-invented-book/chapter-01.txt",
+        ] {
+            assert!(r.read(closed).is_err(), "{closed}");
+        }
+        assert_eq!(r.list("/books/"), Ok(Listing::FoldersOnly));
+        assert_eq!(r.list("/books"), Ok(Listing::FoldersOnly));
+        assert_eq!(r.list("/books/an-invented-book/"), Ok(Listing::All));
+        assert_eq!(r.list("/books/an-invented-book/deeper"), Ok(Listing::All));
+        for closed in ["/Books/", "/booksx/", "/notes/"] {
+            assert!(r.list(closed).is_err(), "{closed}");
+        }
+        // A star in the middle covers one folder name, never a `/`.
+        let middle = Rules::new("/a/*-book/b/", "");
+        assert!(middle.read("/a/one-book/b/x.txt").is_ok());
+        assert!(middle.read("/a/one/two-book/b/x.txt").is_err());
+        assert!(middle.read("/a/one-book/x.txt").is_err());
+        assert!(middle.read("/a/one-book/c/x.txt").is_err());
+        assert_eq!(middle.list("/a/"), Ok(Listing::FoldersOnly));
+        assert!(middle.list("/a/one-book/").is_err(), "not above the star");
+    }
+
+    #[test]
     fn a_star_stands_for_part_of_one_name_and_never_for_a_slash() {
         assert!(fits("/a/progress-*.md", "/a/progress-x.md"));
         assert!(fits("/a/progress-*.md", "/a/progress-.md"));
@@ -842,7 +904,8 @@ mod tests {
     fn the_settings_check_wants_clean_folders_and_files() {
         assert!(check_folders("/books/, /notes/glossary/").is_ok());
         assert!(check_folders("").is_ok());
-        for wrong in ["/books", "books/", "/books/../x/", "/b*/", "/a//b/"] {
+        assert!(check_folders("/books/*/, /notes/glossary/").is_ok());
+        for wrong in ["/books", "books/", "/books/../x/", "/books/*", "/a//b/"] {
             assert!(check_folders(wrong).is_err(), "{wrong}");
         }
         assert!(check_files("/notes/progress-*.md, /a/b.md").is_ok());

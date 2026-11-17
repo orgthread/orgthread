@@ -92,7 +92,7 @@ The list holds all settings, of both doors. The doors: `local folder` is the doo
 | Setting | What it does | A right value | Default | Doors |
 |---|---|---|---|---|
 | `ORGTHREAD_DEVICE_APP` | The app of a device door, such as reader: small letters, digits and -. Each app gets its own door, in its own folder with its own .env. A token is for one app on one device. | a name on one line | none, required by serve --http --device | both |
-| `ORGTHREAD_DEVICE_READ` | Comma-separated folders that a device may read and list, with all they hold. Each from the root, with / at both ends, such as /books/. Capitals count. | folders from the root, with / at both ends | none | both |
+| `ORGTHREAD_DEVICE_READ` | Comma-separated folders that a device may read and list, with all they hold. Each from the root, with / at both ends, such as /books/. * stands for any part of one folder name: /books/*/ opens each folder in /books/, but no file directly in it, and a list of /books/ shows only its folders. Capitals count. | folders from the root, with / at both ends | none | both |
 | `ORGTHREAD_DEVICE_PATCH` | Comma-separated files that a device may read and patch, never make. Each from the root, such as /notes/progress-*.md, where * stands for any part of one name. Capitals count. | files from the root, * for any part of a name | none | both |
 | `ORGTHREAD_DEVICE_CAPPED` | Comma-separated files whose reads count for the read cap, in the form of ORGTHREAD_DEVICE_PATCH, such as /books/*/chapter-*.txt. | files from the root, * for any part of a name | every read | both |
 | `ORGTHREAD_DEVICE_CAP_HOUR` | The most capped reads of one device in 60 minutes. Above it the door refuses, logs capped and runs ORGTHREAD_DEVICE_NOTIFY. | a whole number from 1 | 8 | both |

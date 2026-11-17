@@ -145,7 +145,9 @@ once, and gets {\"token\": \"...\", \"expires\": \"YYYY-MM-DD\"}. The token last
 days, and the door keeps only its hash. A new code for the same name ends the
 old token. The device sends the token as Authorization: Bearer <token> to /mcp.
 Each path starts with /, has no //, no . and no .. part, and capitals count. A
-read folder opens what it holds for read and list, one level at a time. A patch
+read folder opens what it holds for read and list, one level at a time, and *
+stands for one folder name: /books/*/ opens each folder in /books/, never a
+file directly in /books/, and a list of /books/ shows its folders only. A patch
 file opens for read and patch, never to make it. A link is never followed.
 Anything else is refused, code 2, with the log word refused. Reads of the files
 of ORGTHREAD_DEVICE_CAPPED count for the read cap: 8 in 60 minutes and 40 in 24

@@ -9,7 +9,7 @@
 //! No request or response body goes into the log or to the error output: only
 //! the time, the word, the path and the device.
 
-use crate::device::{self, Cap, Holder, Rules, Store};
+use crate::device::{self, Cap, Holder, Listing, Rules, Store};
 use crate::log;
 use crate::serve::{self, INVALID_PARAMS, INVALID_REQUEST, NO_METHOD, NOT_JSON};
 use crate::write::exit;
@@ -431,12 +431,19 @@ fn call(
                     )
                 })?;
             let mut targets = Vec::new();
+            // Each header of the answer, and whether its group shows folder names only.
+            let mut headers = Vec::new();
             for folder in folders {
                 let folder = folder
                     .as_str()
                     .ok_or_else(|| (INVALID_PARAMS, "list needs each folder as text".into()))?;
-                if let Err(why) = door.rules.list(folder).and_then(|()| door.no_link(folder)) {
-                    return Ok(refuse(door, holder, folder, &why));
+                let listing = door.rules.list(folder).and_then(|listing| {
+                    door.no_link(folder)?;
+                    Ok(listing)
+                });
+                match listing {
+                    Err(why) => return Ok(refuse(door, holder, folder, &why)),
+                    Ok(listing) => headers.push((format!("{folder}:"), listing)),
                 }
                 targets.push(door.for_command(folder));
             }
@@ -456,7 +463,11 @@ fn call(
             args.push("--".into());
             args.extend(targets);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            Ok(tidied(door, Some("list"), serve::start(exe, &args, None)))
+            let mut value = tidied(door, Some("list"), serve::start(exe, &args, None));
+            if let Some(text) = value["content"][0]["text"].as_str() {
+                value["content"][0]["text"] = Value::String(folders_only(text, &headers));
+            }
+            Ok(value)
         }
         _ => {
             let path = arguments["file"].as_str().unwrap_or_default();
@@ -482,4 +493,53 @@ fn tidied(door: &DeviceDoor, tool: Option<&str>, run: io::Result<std::process::O
         value["content"][0]["text"] = Value::String(door.tidy(text));
     }
     value
+}
+
+/// The text of a list, with only the folder names left in the groups that
+/// `headers` marks, such as `/books/:` for the rule `/books/*/`. A file directly
+/// in such a folder never shows, not even its name. A header is a line that is
+/// exactly one of the folders asked for, then `:`.
+fn folders_only(text: &str, headers: &[(String, Listing)]) -> String {
+    let mut listing = Listing::All;
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n');
+        if let Some((_, next)) = headers.iter().find(|(h, _)| h == bare) {
+            listing = *next;
+            out.push_str(line);
+            continue;
+        }
+        let keep = listing == Listing::All
+            || bare.is_empty()
+            || bare.ends_with('/')
+            || bare.starts_with("more entries not shown");
+        if keep {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_above_a_star_keeps_only_the_folder_names() {
+        let text = "/books/:\n      -  -  an-invented-book/\n  120  Tue 2026-11-17 10:00  an-invented-book.epub\n    9  Tue 2026-11-17 10:00  odd-name:\n\n/books/an-invented-book/:\n   40  Tue 2026-11-17 10:00  chapter-01.txt\n";
+        let headers = [
+            ("/books/:".to_string(), Listing::FoldersOnly),
+            ("/books/an-invented-book/:".to_string(), Listing::All),
+        ];
+        let kept = folders_only(text, &headers);
+        assert!(kept.contains("an-invented-book/\n"));
+        assert!(!kept.contains(".epub"), "{kept}");
+        assert!(!kept.contains("odd-name"), "{kept}");
+        assert!(
+            kept.contains("chapter-01.txt"),
+            "another group keeps all: {kept}"
+        );
+        let all = [("/books/:".to_string(), Listing::All)];
+        assert_eq!(folders_only(text, &all), text);
+    }
 }

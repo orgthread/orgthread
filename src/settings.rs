@@ -428,7 +428,7 @@ pub const ALL: [Setting; 35] = [
         "none",
         Both,
         Device,
-        "Comma-separated folders that a device may read and list, with all they hold. Each from the root, with / at both ends, such as /books/. Capitals count.",
+        "Comma-separated folders that a device may read and list, with all they hold. Each from the root, with / at both ends, such as /books/. * stands for any part of one folder name: /books/*/ opens each folder in /books/, but no file directly in it, and a list of /books/ shows only its folders. Capitals count.",
     ),
     setting(
         DEVICE_PATCH,
