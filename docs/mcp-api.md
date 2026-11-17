@@ -2,6 +2,8 @@
 
 The tools of both MCP servers, their refusals, and examples. To start a server and add it to a client, see [mcp.md](mcp.md).
 
+The device door offers only `list`, `read` and `patch`, with no `who`, and `list` goes one level down. Its rules and refusals are in [device-door.md](device-door.md).
+
 ## The tools
 
 | Tool | Field | What it holds |

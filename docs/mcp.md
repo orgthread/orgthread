@@ -8,10 +8,13 @@ MCP is a standard way for a chat to call tools. The program has two MCP servers,
 |---|---|---|---|
 | Local | `orgthread serve` | A client on the same machine, such as Claude Code | None |
 | Remote | `orgthread serve --http <address>` | A chat in the cloud, such as claude.ai | One password |
+| Device | `orgthread serve --http <address> --device` | One app on your own devices, such as an e-reader | A token per device |
 
 Each tool call starts the command itself: `orgthread read`, `orgthread write`, `orgthread patch`, `orgthread delete`, `orgthread copy` or `orgthread move` for each pair, `orgthread list`, `orgthread search`, `orgthread download` or `orgthread upload`. So the rules, the log and the refusals are the same as in the shell. Only `version` is answered by the server itself, as it reads no file. A chat never deals with a lock.
 
 The tools, their refusals and examples are in [mcp-api.md](mcp-api.md).
+
+The device door is a third server, in a folder of its own, with only `list`, `read` and `patch` on the paths that its settings name. How to set it up, pair a device, and check it, is in [device-door.md](device-door.md).
 
 ## Build it
 

@@ -21,7 +21,7 @@ Each command ends with an exit code. 0 means done. Every other code names one ki
 
 So a code other than 0 does not always mean that nothing changed. With 8 and 10, the change is written, the file is deleted, the copy is made, or the file is moved. With 9, the file may be damaged.
 
-The other commands give few codes. `watch` and `serve` give 0, 1 or 2. `config` gives 0, 1 or 2, and `config --check` gives 0, or 2 when a value is wrong. `fingerprint` gives 0, 1, 2 or 6. `password-hash` gives 0 or 2. `--help` and `--version` give 0.
+The other commands give few codes. `watch` and `serve` give 0, 1 or 2. `device pair` and `device list` give 0, 1 or 2, and `device revoke` gives 0, 1, 2, 6 or 8. `config` gives 0, 1 or 2, and `config --check` gives 0, or 2 when a value is wrong. `fingerprint` gives 0, 1, 2 or 6. `password-hash` gives 0 or 2. `--help` and `--version` give 0.
 
 ## Several files or folders
 
@@ -47,6 +47,10 @@ If the command was stopped before it could end, the text starts with `the comman
 A missing field or an unknown tool is no refusal. It gets a JSON-RPC error with the code -32602, and the server goes on.
 
 How each tool is called is in [mcp-api.md](mcp-api.md).
+
+## On the device door
+
+The device door refuses with code 2 what its rules close: a tool other than `list`, `read` and `patch`, a path outside its rules, a path that is not clean, a patch in a read folder, and a read above the read cap. The text names the reason, and for the cap the time when reads open again. Its `/pair` answers with an HTTP status: see [device-door.md](device-door.md).
 
 ## The answers of a link
 

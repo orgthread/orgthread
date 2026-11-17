@@ -17,6 +17,7 @@ orgthread copy <file> <new> --who <name>
 orgthread move <file> <new> --who <name>
 orgthread watch
 orgthread config
+orgthread device pair <name>
 ```
 
 To see what a folder holds, list it: `orgthread list notes tasks` shows each folder as a group, with the size, the time and the name of each entry, as `ls` does. `ls` is a short form of `list`. It goes one level down, and `--depth 3` or `--depth all` goes deeper. Names that start with a dot stay out, unless you add `--all`. Paths that the limits close stay out too, and read-only ones get a mark. With `--fingerprint`, each file also shows its fingerprint, the content hash that Dropbox reports. With Dropbox it costs nothing more. With a local folder, it reads each file.
@@ -63,6 +64,8 @@ Run the tests with `cargo test`. They use invented files in a temporary folder.
 ## MCP
 
 Two MCP servers give the same read, write, patch, delete, copy, move, list and search to a chat that has no shell, and `version`, which names the version, the commit, the door, the storage and the tools: `orgthread serve` for a client on the same machine, and `orgthread serve --http <address>`, behind a login, for a chat in the cloud such as claude.ai. The remote server also gives `download` and `upload`: a one-time link for each file, which the code sandbox of the chat uses with `curl`. How to start and add each, and the settings, are in [docs/mcp.md](docs/mcp.md). The tools, the refusals and examples are in [docs/mcp-api.md](docs/mcp-api.md).
+
+A third door is for one app on your own devices, such as a reader on an e-reader: `orgthread serve --http <address> --device`, in a folder of its own. It offers only `list`, `read` and `patch`, on the paths that its settings name, with a token per device, a read cap and a revoke. `orgthread device pair <name>` gives the device a code of 8 signs, in a terminal only. See [docs/device-door.md](docs/device-door.md).
 
 To set up the local door on a Mac with a plain folder, such as `~/notes`, with no Dropbox and no server, follow [docs/local-folder.md](docs/local-folder.md).
 
