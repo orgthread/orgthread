@@ -2098,3 +2098,343 @@ fn a_dropbox_search_of_nothing_is_6_and_of_a_file_is_2() {
     );
     assert_eq!(code(&search(&f, &["blood", "/org/../x"], &[])), 2);
 }
+
+/// A closing rule and an opening rule inside it, as one door has them.
+const OPEN_DENY: (&str, &str) = ("ORGTHREAD_DENY", "/notes/private,!/notes/private/shared");
+const DIARY: &str = "/notes/private/diary.md";
+const PLAN: &str = "/notes/private/shared/plan.md";
+const BESIDE: &str = "/notes/private/shared2/x.md";
+
+/// The stand-in with a closed file, a file in the open folder and a closed file
+/// in a folder whose name only starts with the same letters.
+fn open_fake() -> Fake {
+    let f = Fake::new();
+    f.put(DIARY, b"closed diary\n");
+    f.put(PLAN, b"shared plan\n");
+    f.put(BESIDE, b"beside\n");
+    f
+}
+
+fn said(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).to_string()
+}
+
+#[test]
+fn an_opening_rule_lets_a_dropbox_door_read_write_and_patch_only_the_open_folder() {
+    let f = open_fake();
+    let env = [OPEN_DENY];
+    // Inside the open folder, with or without the first slash.
+    for path in [PLAN, PLAN.trim_start_matches('/')] {
+        let o = f.run_with_env(&["read", path, "--who", "chat"], b"", &env);
+        assert_eq!(code(&o), 0, "{path} {o:?}");
+        assert_eq!(o.stdout, b"shared plan\n");
+    }
+    let o = f.run_with_env(&["write", PLAN, "--who", "chat"], b"line 1\nline 2\n", &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(PLAN).unwrap(), b"line 1\nline 2\n");
+    let patch = br#"{"edits":[{"old":"line 2\n","new":"line two\n"}]}"#;
+    let o = f.run_with_env(&["patch", PLAN, "--who", "chat"], patch, &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(PLAN).unwrap(), b"line 1\nline two\n");
+    let o = f.run_with_env(
+        &["write", "/notes/private/shared/new.md", "--who", "chat"],
+        b"new\n",
+        &env,
+    );
+    assert_eq!(code(&o), 0, "a new file in the open folder: {o:?}");
+    // The closed file, the closed folder and the folder beside stay closed.
+    for path in [DIARY, BESIDE, "/Notes/Private/diary.md", "/notes/private"] {
+        let o = f.run_with_env(&["read", path, "--who", "chat"], b"", &env);
+        assert_eq!(code(&o), 2, "{path} {o:?}");
+        assert!(o.stdout.is_empty(), "{path}");
+        assert!(said(&o).contains("is closed to this door"), "{path} {o:?}");
+        let o = f.run_with_env(&["write", path, "--who", "chat"], b"x\n", &env);
+        assert_eq!(code(&o), 2, "{path} {o:?}");
+        let o = f.run_with_env(&["patch", path, "--who", "chat"], patch, &env);
+        assert_eq!(code(&o), 2, "{path} {o:?}");
+    }
+    assert_eq!(f.get(DIARY).unwrap(), b"closed diary\n");
+    assert_eq!(f.get(BESIDE).unwrap(), b"beside\n");
+    assert!(f.get("/notes/private/x").is_none());
+}
+
+#[test]
+fn a_dropbox_list_shows_the_open_folder_but_hides_its_closed_parents() {
+    let f = open_fake();
+    f.put("/notes/private/shared/2026/11/a.md", b"a\n");
+    f.put("/notes/today.md", b"today\n");
+    let env = [OPEN_DENY];
+    let o = f.run_with_env(&["list", "/notes/private/shared"], b"", &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.starts_with("/notes/private/shared:\n"), "{text}");
+    assert!(text.contains("  plan.md\n"), "{text}");
+    assert!(text.contains("  2026/\n"), "{text}");
+    assert!(!text.contains("a.md"), "depth 1 only: {text}");
+    let o = f.run_with_env(
+        &["list", "--depth", "all", "notes/private/shared"],
+        b"",
+        &env,
+    );
+    assert_eq!(code(&o), 0, "{o:?}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains("plan.md\n"), "{text}");
+    assert!(text.contains("a.md\n"), "{text}");
+    // The parents stay hidden, at any depth, and the folder beside too.
+    for args in [
+        &["list", "/"][..],
+        &["list", "/notes"],
+        &["list", "--depth", "all", "/"],
+    ] {
+        let o = f.run_with_env(args, b"", &env);
+        assert_eq!(code(&o), 0, "{args:?} {o:?}");
+        let text = String::from_utf8(o.stdout).unwrap();
+        assert!(!text.contains("private"), "{args:?}: {text}");
+        assert!(!text.contains("diary"), "{args:?}: {text}");
+        assert!(!text.contains("shared2"), "{args:?}: {text}");
+    }
+    let o = f.run_with_env(&["list", "/notes"], b"", &env);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("  today.md\n"));
+    for folder in ["/notes/private", "/notes/private/shared2"] {
+        let o = f.run_with_env(&["list", folder], b"", &env);
+        assert_eq!(code(&o), 2, "{folder} {o:?}");
+        let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), said(&o));
+        assert!(all.contains("is closed to this door"), "{folder}: {all}");
+        assert!(!all.contains("diary") && !all.contains("x.md"), "{all}");
+    }
+}
+
+#[test]
+fn a_dropbox_search_of_the_open_folder_works_and_of_its_parents_is_refused() {
+    let f = open_fake();
+    f.put("/notes/private/shared/2026/b.md", b"another plan\n");
+    let env = [OPEN_DENY];
+    let o = search(&f, &["plan", "/notes/private/shared", "--names"], &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        "/notes/private/shared/plan.md\n"
+    );
+    let o = search(&f, &["PLAN", "/notes/private/shared"], &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        "/notes/private/shared/2026/b.md:1: another plan\n\
+         /notes/private/shared/plan.md:1: shared plan\n"
+    );
+    assert_eq!(f.state.lock().unwrap().zips, 1);
+    // A content search of a parent would fetch the closed files in its zip.
+    for folder in ["/", "/notes"] {
+        let o = search(&f, &["plan", folder], &env);
+        assert_eq!(code(&o), 2, "{folder} {o:?}");
+        assert!(o.stdout.is_empty(), "{folder}");
+        let said = said(&o);
+        assert!(
+            said.contains("holds the closed path /notes/private."),
+            "{folder}: {said}"
+        );
+        assert!(!said.contains("!/notes"), "{folder}: {said}");
+    }
+    // The closed folder and the folder beside are closed for names too.
+    for folder in ["/notes/private", "/notes/private/shared2"] {
+        let o = search(&f, &["x", folder, "--names"], &env);
+        assert_eq!(code(&o), 2, "{folder} {o:?}");
+        assert!(said(&o).contains("is closed to this door"), "{folder}");
+    }
+    // A closing rule inside the open folder closes again, for content.
+    let again = [(
+        "ORGTHREAD_DENY",
+        "/notes/private,!/notes/private/shared,/notes/private/shared/secret",
+    )];
+    let o = search(&f, &["plan", "/notes/private/shared"], &again);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(
+        said(&o)
+            .contains("/notes/private/shared holds the closed path /notes/private/shared/secret."),
+        "{o:?}"
+    );
+    assert_eq!(f.state.lock().unwrap().zips, 1, "no zip for a refusal");
+    let o = search(&f, &["plan", "/notes/private/shared/2026"], &again);
+    assert_eq!(code(&o), 0, "{o:?}");
+}
+
+#[test]
+fn a_pdf_goes_up_and_down_in_the_open_folder_on_dropbox() {
+    let f = open_fake();
+    let scan = "/notes/private/shared/scan.pdf";
+    f.put(scan, &picture(3_000));
+    f.put("/notes/private/scan.pdf", &picture(20));
+    let env = [
+        OPEN_DENY,
+        ("ORGTHREAD_BINARY_ALLOW", "/notes/private/shared"),
+    ];
+    let o = f.run_with_env(&["download", scan, "--who", "a"], b"", &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(o.stdout, picture(3_000));
+    // The download counts as a read, so the same name may replace the file.
+    let o = f.run_with_env(&["upload", scan, "--who", "a"], &picture(10), &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(scan).unwrap(), picture(10));
+    // Another name has not seen it.
+    let o = f.run_with_env(&["upload", scan, "--who", "b"], &picture(5), &env);
+    assert_eq!(code(&o), 5, "{o:?}");
+    assert_eq!(f.get(scan).unwrap(), picture(10));
+    let new = "/notes/private/shared/new.pdf";
+    let o = f.run_with_env(&["upload", "--check", new, "--who", "a"], b"", &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    let o = f.run_with_env(&["upload", new, "--who", "a"], &picture(7), &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(new).unwrap(), picture(7));
+    // The closed PDF stays closed, both ways.
+    let o = f.run_with_env(
+        &["download", "/notes/private/scan.pdf", "--who", "a"],
+        b"",
+        &env,
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(o.stdout.is_empty());
+    let o = f.run_with_env(
+        &["upload", "/notes/private/shared2/new.pdf", "--who", "a"],
+        &picture(7),
+        &env,
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(f.get("/notes/private/shared2/new.pdf").is_none());
+}
+
+#[test]
+fn a_dropbox_copy_or_move_across_the_edge_of_the_open_folder_is_refused() {
+    let f = open_fake();
+    let env = [OPEN_DENY];
+    let run = |command: &str, from: &str, to: &str| {
+        f.run_with_env(&[command, from, to, "--who", "chat"], b"", &env)
+    };
+    for command in ["copy", "move"] {
+        for (from, to) in [
+            (PLAN, "/notes/private/plan.md"),
+            (PLAN, "/notes/private/shared2/plan.md"),
+            (DIARY, "/notes/private/shared/diary.md"),
+            (BESIDE, "/notes/private/shared/x.md"),
+        ] {
+            let o = run(command, from, to);
+            assert_eq!(code(&o), 2, "{command} {from} {to}: {o:?}");
+            assert!(said(&o).contains("is closed to this door"), "{o:?}");
+        }
+    }
+    {
+        let s = f.state.lock().unwrap();
+        assert!(s.copies.is_empty() && s.moves.is_empty(), "no call");
+    }
+    assert_eq!(f.names(), [DIARY, PLAN, BESIDE.to_string().as_str()]);
+    // Inside the open folder, also into a new folder there.
+    let copied = "/notes/private/shared/plan copy.md";
+    let o = run("copy", PLAN, copied);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(copied).unwrap(), b"shared plan\n");
+    let moved = "/notes/private/shared/2026/plan.md";
+    let o = run("move", copied, moved);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("notes/private/shared/2026"),
+        "{o:?}"
+    );
+    assert_eq!(f.get(moved).unwrap(), b"shared plan\n");
+    assert!(f.get(copied).is_none());
+}
+
+#[test]
+fn a_delete_in_the_open_folder_on_dropbox_needs_the_setting_and_the_fingerprint() {
+    let f = open_fake();
+    let allow = ("ORGTHREAD_DELETE_ALLOW", "/notes/private/shared");
+    let env = [OPEN_DENY, allow];
+    assert_eq!(
+        code(&f.run_with_env(&["read", PLAN, "--who", "chat"], b"", &env)),
+        0
+    );
+    // With no delete setting, every delete is refused.
+    let o = f.run_with_env(&["delete", PLAN, "--who", "chat"], b"", &[OPEN_DENY]);
+    assert_eq!(code(&o), 2, "{o:?}");
+    // Another name has no fingerprint.
+    let o = f.run_with_env(&["delete", PLAN, "--who", "other"], b"", &env);
+    assert_eq!(code(&o), 4, "{o:?}");
+    assert!(f.state.lock().unwrap().deletes.is_empty());
+    let o = f.run_with_env(&["delete", PLAN, "--who", "chat"], b"", &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(f.get(PLAN), None);
+    // A closed file stays, even with its right fingerprint and a wide setting.
+    let wide = [OPEN_DENY, ("ORGTHREAD_DELETE_ALLOW", "/notes")];
+    for (path, bytes) in [(DIARY, &b"closed diary\n"[..]), (BESIDE, b"beside\n")] {
+        let print = fingerprint(bytes);
+        let o = f.run_with_env(
+            &["delete", path, "--who", "chat", "--expect", &print],
+            b"",
+            &wide,
+        );
+        assert_eq!(code(&o), 2, "{path} {o:?}");
+        assert!(said(&o).contains("is closed to this door"), "{o:?}");
+        assert_eq!(f.get(path).unwrap(), bytes);
+    }
+    assert_eq!(f.state.lock().unwrap().deletes.len(), 1);
+}
+
+#[test]
+fn a_new_closed_folder_on_dropbox_is_refused_before_any_call_that_writes() {
+    let f = Fake::new();
+    f.put("/notes/today.md", b"today\n");
+    let env = [OPEN_DENY];
+    let target = "/notes/private/shared/new.md";
+    let closed = "notes/private would be a new folder, and it is closed to this door.";
+    // The folder notes/private does not exist. Dropbox would make it by itself.
+    let o = f.run_with_env(&["write", target, "--who", "chat"], b"abc\n", &env);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(said(&o).contains(closed), "{o:?}");
+    let o = f.run_with_env(&["upload", "--check", target, "--who", "chat"], b"", &env);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(said(&o).contains(closed), "{o:?}");
+    let o = f.run_with_env(&["upload", target, "--who", "chat"], b"abc\n", &env);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(said(&o).contains(closed), "{o:?}");
+    for command in ["copy", "move"] {
+        let o = f.run_with_env(
+            &[command, "/notes/today.md", target, "--who", "chat"],
+            b"",
+            &env,
+        );
+        assert_eq!(code(&o), 2, "{command}: {o:?}");
+        assert!(said(&o).contains(closed), "{command}: {o:?}");
+    }
+    {
+        let s = f.state.lock().unwrap();
+        assert_eq!(s.uploads, 0, "no upload call");
+        assert!(s.copies.is_empty() && s.moves.is_empty(), "no copy or move");
+    }
+    assert_eq!(f.names(), ["/notes/today.md"]);
+    // With notes/private there, the open folder itself would be new.
+    f.put(DIARY, b"closed diary\n");
+    let opened = "notes/private/shared would be a new folder, and it is the folder that !/notes/private/shared opens.";
+    let o = f.run_with_env(&["write", target, "--who", "chat"], b"abc\n", &env);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(said(&o).contains(opened), "{o:?}");
+    let o = f.run_with_env(
+        &["copy", "/notes/today.md", target, "--who", "chat"],
+        b"",
+        &env,
+    );
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(said(&o).contains(opened), "{o:?}");
+    {
+        let s = f.state.lock().unwrap();
+        assert_eq!(s.uploads, 0, "no upload call");
+        assert!(s.copies.is_empty() && s.moves.is_empty(), "no copy or move");
+    }
+    // With the open folder there, new folders inside it are fine.
+    f.put(PLAN, b"shared plan\n");
+    let deep = "/notes/private/shared/2026/11/plan.md";
+    let o = f.run_with_env(&["write", deep, "--who", "chat"], b"deep\n", &env);
+    assert_eq!(code(&o), 0, "{o:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        "written: notes/private/shared/2026/11/plan.md, 5 bytes, new folders: notes/private/shared/2026, notes/private/shared/2026/11\n"
+    );
+    assert_eq!(f.get(deep).unwrap(), b"deep\n");
+}
