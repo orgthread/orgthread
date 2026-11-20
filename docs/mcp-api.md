@@ -62,6 +62,7 @@ written: notes/2026/11/a.md, 4 bytes, new folders: notes/2026, notes/2026/11
 - The log gets one line per new folder, with the word `made-folder`, the folder, the name of the chat, and `-` for the other three fields. These lines come right before the line of the file. A folder made by hand gets no line.
 - If the file fails after its folders were made, the folders stay, and the log shows them before the line of the failure.
 - When the owner set `ORGTHREAD_FIXED_FOLDERS`, no new folder may appear directly inside one of its folders. With `/org` there, `/org/garden/a.md` is refused with code 2 when `/org/garden` does not exist, and nothing is made. `/org/notes/2026/a.md` is fine when `/org/notes` exists, and so is `/org/a.md`, as it makes no folder.
+- A new folder that `ORGTHREAD_DENY` closes is refused with code 2, and nothing is made. So is the folder that a rule with `!` opens, such as `/notes/private/shared` in `ORGTHREAD_DENY=/notes/private,!/notes/private/shared`: only the owner makes it, by hand. New folders inside it are fine. See [mcp.md](mcp.md).
 - With Dropbox, a new file costs one look at each folder up to the first that exists. A change to a file that exists costs no extra look.
 - On a server, a new folder means one that was missing right before the call. Another writer may make the same folder in between, as the lock is the one of the file.
 
@@ -89,6 +90,7 @@ A task that may send the same patch twice, for example after a lost answer, puts
 
 - Names that start with a dot, such as `.DS_Store`, stay out unless `all` is `true`.
 - A path that the limits close stays out, always. A read-only path gets `(read only)` after its name.
+- A folder that a rule with `!` opens stays out of the list of the folder around it, as that folder is closed. With `ORGTHREAD_DENY=/notes/private,!/notes/private/shared`, a list of `/notes` does not show `private/`, and a list of `/notes/private` is refused with code 2. List `/notes/private/shared` by its full name.
 - With a `depth` above 1, each subfolder gets its own group, with its full path as the header.
 - A file in place of a folder shows under its own folder.
 - A list shows at most 1000 entries. After that, a last line says `more entries not shown: list a smaller folder or a lower depth`.
@@ -106,14 +108,14 @@ A list notes nothing, so it needs no `who`.
 - The rules of `list` hold: a closed path stays out, a hit in a read-only path gets `(read only)` at the end of its line, and names that start with a dot stay out, with all they hold, unless `all` is `true`. A file that is not text, such as a picture or a PDF, is skipped for content. A folder is always needed.
 - The hits come in the order of their paths, and capitals do not count. The lines of one file stay in their order.
 - With a local folder, each file is read at the time of the search. A file above `ORGTHREAD_SEARCH_MB`, 25 MB by default, is skipped.
-- With Dropbox, a content search fetches the folder as one zip, with one call. The zip stays in the memory of that one command for the time of the search, and never goes to the disk. A zip above `ORGTHREAD_SEARCH_MB` is refused with code 2: search a smaller folder. A content search of a folder that holds a closed path, such as `/`, is refused with code 2 too, as the zip would bring the closed files into memory. With `names`, the server lists the folder and fetches no file, so that works for such a folder.
+- With Dropbox, a content search fetches the folder as one zip, with one call. The zip stays in the memory of that one command for the time of the search, and never goes to the disk. A zip above `ORGTHREAD_SEARCH_MB` is refused with code 2: search a smaller folder. A content search of a folder that holds a closed path, such as `/`, is refused with code 2 too, as the zip would bring the closed files into memory. A rule with `!` closes nothing, so it does not count: the folder that it opens can be searched, unless a closing rule lies inside it. With `names`, the server lists the folder and fetches no file, so that works for such a folder.
 - The log gets one line `searched`, with the folder, the name of the chat, and the number of files with a hit in the size field. The search text and the hits never go to the log or to any file, as a search text can be health data. They go only to the chat that asked.
 
 `delete` removes one file, and only the version that this name saw:
 
 - The version is the one this name read, or the one given as `expect`. If the file changed since, or this name has not read it and no `expect` is given, it is refused with code 4, and nothing is deleted.
 - It never removes a folder. One file per call.
-- It works only in the folders that the owner opened for deletes, with `ORGTHREAD_DELETE_ALLOW`. With that setting empty, the default, every delete is refused with code 2. The other limits still count: a closed or read-only path is refused too.
+- It works only in the folders that the owner opened for deletes, with `ORGTHREAD_DELETE_ALLOW`. With that setting empty, the default, every delete is refused with code 2. The other limits still count: a closed or read-only path is refused too. In a folder that a rule with `!` opens, `ORGTHREAD_DELETE_ALLOW` must hold that folder as well.
 - There is a way back. The local door keeps the last version beside the program, as for every write. With Dropbox, the file stays in its Deleted files, and the answer and the log line give its rev.
 - With Dropbox, a read notes the rev of the file next to its fingerprint. The delete is then one web call, and Dropbox checks the version at the same moment as it deletes. With `expect` and no read, the server first looks up the rev.
 

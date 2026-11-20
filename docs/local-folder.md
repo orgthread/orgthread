@@ -65,7 +65,17 @@ ORGTHREAD_READ_ONLY=archive
 ORGTHREAD_DENY=private
 ```
 
-With these, an agent may read `archive` but not change it, and it cannot see `private` at all. All settings are in [settings.md](settings.md). `orgthread config` changes them on a screen in a terminal, and `orgthread config --check` lists them and checks each value.
+With these, an agent may read `archive` but not change it, and it cannot see `private` at all.
+
+A rule with `!` in front opens a folder inside a closed one again:
+
+```
+ORGTHREAD_DENY=private,!private/shared
+```
+
+Now an agent may use `private/shared` and all it holds, and nothing else in `private`. Of all rules that hold a path, the one with the most parts decides, so the order does not count. Add `private/shared/secret` to close that folder again. Capitals do not count. `private` stays closed and hidden: a list of the root does not show it, and a list or search of `private` is refused with exit code 2. So an agent reaches `private/shared` only by its full name. Make `private/shared` by hand: a write that would make it, or that would make any other closed folder, is refused with exit code 2, and nothing is made. New folders inside `private/shared` are fine. An opening rule must lie inside a closing rule, and must not be the same path. Else every command but `config` stops with exit code 2, and `orgthread config --check` names the reason.
+
+All settings are in [settings.md](settings.md). `orgthread config` changes them on a screen in a terminal, and `orgthread config --check` lists them and checks each value.
 
 ## 4. Check it
 
@@ -137,7 +147,7 @@ A deny holds in every permission mode. Claude Code reads the file when a session
 
 ## 7. Keep a safety net
 
-`orgthread watch` can undo one change: choose the newest write or patch of a file, press `r`, read the question, and press `y`. It writes the text from before that change back, only if the file is still as the change left it. The undo is a write, so the settings of step 3 hold for it too: a file under `ORGTHREAD_READ_ONLY` or `ORGTHREAD_DENY` gets no undo. The undo needs the copy of the old text in `state/versions`, so it works for 30 days. An agent cannot undo: only a key press in `watch` does. New files, deletes and moves have no undo there. So keep the notes folder in git too:
+`orgthread watch` can undo one change: choose the newest write or patch of a file, press `r`, read the question, and press `y`. It writes the text from before that change back, only if the file is still as the change left it. The undo is a write, so the settings of step 3 hold for it too: a file under `ORGTHREAD_READ_ONLY`, or closed by `ORGTHREAD_DENY`, gets no undo. A file in a folder that a rule with `!` opens gets one. The undo needs the copy of the old text in `state/versions`, so it works for 30 days. An agent cannot undo: only a key press in `watch` does. New files, deletes and moves have no undo there. So keep the notes folder in git too:
 
 ```
 cd ~/notes

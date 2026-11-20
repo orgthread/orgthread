@@ -114,6 +114,28 @@ Every setting, with its default and the doors that use it, is in [settings.md](s
 
 The limits use paths from the root, such as `notes/drafts`, and capitals do not count. They guard against a confused chat, not against a thief. Messages call a server "this door".
 
+### Open a folder inside a closed one
+
+A rule of `ORGTHREAD_DENY` with `!` in front is an opening rule. It opens a path inside a closing rule:
+
+```
+ORGTHREAD_DENY=/notes/private,!/notes/private/shared
+```
+
+- Of all rules that hold a path, the one with the most parts decides. An opening rule opens, and a closing rule closes. A path that no rule holds is open. The order of the list does not count.
+- A closing rule inside the open folder closes again. With `/notes/private/shared/secret` added, that folder is closed, and the rest of `/notes/private/shared` stays open.
+- `/notes/private` stays closed and hidden. A list of `/notes` does not show `private/`, and a list or search of `/notes/private` is refused with code 2. So a chat reaches the open folder only by its full name.
+- On Dropbox, a content search of a folder that holds a closing rule, such as `/notes`, is refused, as before. The open folder can be searched, unless a closing rule lies inside it.
+- A `write`, `upload`, `copy` or `move` that would make a new folder that is closed, or the open folder itself, is refused with code 2 before any change. The owner makes the open folder by hand. New folders inside it are fine.
+- `ORGTHREAD_ALLOW` is checked first and `ORGTHREAD_READ_ONLY` after, so `ORGTHREAD_READ_ONLY` can still make the open folder read only. The other gates count too: a file that is not text goes there only when `ORGTHREAD_BINARY_ALLOW` holds it, a delete works there only when `ORGTHREAD_DELETE_ALLOW` holds it, and when `ORGTHREAD_MOVE_ALLOW` names folders, a move works there only when it holds it.
+- The revert of `orgthread watch` follows the same limits.
+
+The check at the start: an opening rule must lie inside a closing rule, and must not be the same path. It must not be empty, as `!` or `!/`, and must not hold an empty part, `.` or `..`. Else every command but `config` stops with code 2, and `orgthread config --check` names the reason, for example:
+
+```
+wrong: ORGTHREAD_DENY: !/tasks/a lies inside no closing rule, so it opens nothing. An opening rule must lie inside a closing rule
+```
+
 The Dropbox calls use the program `curl`, so it must be on the machine.
 
 ## What a login keeps

@@ -81,7 +81,23 @@ path. The answer names them, for example:
 The log gets one line made-folder per new folder, the outer one first, right
 before the line of the file. With ORGTHREAD_FIXED_FOLDERS set, a new folder
 directly inside one of its folders is refused, code 2, and nothing is made.
-Deeper new folders are fine.
+Deeper new folders are fine. A new folder that ORGTHREAD_DENY closes, or the
+folder that a rule with ! opens, is refused too, code 2, before any change.
+The owner makes such a folder by hand. New folders inside the open folder are
+fine.
+
+Closed paths: a rule of ORGTHREAD_DENY with ! in front opens a path inside a
+closing rule, for example /notes/private,!/notes/private/shared. Of all rules
+that hold a path, the one with the most parts decides, and the order does not
+count. So /notes/private/shared/secret in the list closes that folder again.
+Capitals do not count. An opening rule must lie inside a closing rule, and may
+not be the same path, be empty, or hold an empty part, . or .. Else every
+command but config stops with code 2. The folder around it stays closed: a list
+of /notes leaves out private/, and a list or search of /notes/private is
+refused, code 2. So a chat reaches the open folder only by its full name.
+ORGTHREAD_ALLOW is checked first, and ORGTHREAD_READ_ONLY after. Inside the
+open folder, ORGTHREAD_BINARY_ALLOW, ORGTHREAD_DELETE_ALLOW and
+ORGTHREAD_MOVE_ALLOW still count.
 
 A patch is one JSON object: edits, a list of {old, new}, and append. Each edit
 replaces its exact old text, whole lines with their newlines, which must occur
@@ -108,8 +124,9 @@ are not text are skipped for content. No hits gives exit 0 and the answer: no
 hits in <folder>. The log line, searched, names the folder and the number of
 files with a hit: never the text and never a hit. With Dropbox, a content search
 fetches the folder as one zip, in memory only. It is refused, code 2, above
-ORGTHREAD_SEARCH_MB, and for a folder that holds a closed path. --names makes one
-listing and fetches no file.
+ORGTHREAD_SEARCH_MB, and for a folder that holds a closed path. A rule with !
+closes nothing, so it does not count. --names makes one listing and fetches no
+file.
 
 download without --to sends the bytes to its output, never to a terminal. It
 notes what this name read, as read does. upload takes --size too. A text file

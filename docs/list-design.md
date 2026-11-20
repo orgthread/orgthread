@@ -52,10 +52,12 @@ By name, and capitals do not count. Files and folders are mixed, as in `ls`.
 | Entry | What the list does |
 |---|---|
 | A name that starts with a dot, such as `.DS_Store`, `.obsidian/`, `.claude/`, `.cc-writes` | Left out. `--all` shows it |
-| A path under `ORGTHREAD_DENY`, or outside `ORGTHREAD_ALLOW` | Left out, also with `--all`. A chat never learns that it exists |
+| A path that `ORGTHREAD_DENY` closes, or outside `ORGTHREAD_ALLOW` | Left out, also with `--all`. A chat never learns that it exists |
 | A path under `ORGTHREAD_READ_ONLY` | Shown, with `(read only)` after the name |
 | A link to a place outside the root | Left out |
 | A name that is not valid UTF-8 | Left out |
+
+A rule of `ORGTHREAD_DENY` with `!` in front opens a path inside a closed folder, as [mcp.md](mcp.md) says. The closed folder around it stays left out. With `ORGTHREAD_DENY=notes/private,!notes/private/shared`, a list of `notes` does not show `private/`, and a list of `notes/private` is refused. List `notes/private/shared` directly.
 
 With `ORGTHREAD_ALLOW=notes/drafts`, a list of `notes` is refused, as `notes` itself lies outside the allowed folders. List `notes/drafts` directly.
 
