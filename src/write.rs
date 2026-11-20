@@ -833,6 +833,10 @@ mod tests {
         assert!(closed("notes/private/shared2", DENY));
         assert!(closed("notes/private/shared2/plan.md", DENY));
         assert!(closed("notes/private/shared.md", DENY));
+        assert!(
+            !closed("notes/private/shared/plan.md", DENY),
+            "the open one"
+        );
     }
 
     #[test]
@@ -848,8 +852,12 @@ mod tests {
     #[test]
     fn at_a_tie_the_closing_rule_wins() {
         // The start check refuses this value, and the limits still fail safe.
-        let deny = "!/notes/private,/notes/private";
+        let deny = "!/notes/private,/notes/private,!/notes/private/shared";
         assert!(closed("notes/private/diary.md", deny));
+        assert!(
+            !closed("notes/private/shared/plan.md", deny),
+            "the deeper opening rule still wins"
+        );
     }
 
     #[test]
@@ -879,6 +887,7 @@ mod tests {
         ] {
             assert_eq!(check_deny(deny), Ok(()), "{deny:?}");
         }
+        assert!(check_deny("/notes,!/tasks/a").is_err(), "the check works");
     }
 
     #[test]

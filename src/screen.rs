@@ -1976,6 +1976,16 @@ mod tests {
 
         #[test]
         fn r_beside_or_below_an_opening_rule_is_refused() {
+            let place = Place::new("inside");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            let diffs = place.kept();
+            let mut w = Watch::new(Some(limited(&place, "", "org,!org/notes", "")));
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(
+                shown(&w, &snap).contains("Revert this change?"),
+                "the same path inside the opening rule is open"
+            );
             refused(
                 "beside",
                 "",
