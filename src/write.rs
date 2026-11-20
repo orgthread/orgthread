@@ -125,10 +125,19 @@ pub fn is_closed(path: &str, deny: &str) -> bool {
     deciding.is_some_and(|(_, open)| !open)
 }
 
-/// The check of an `ORGTHREAD_DENY` value at the start. A closing rule is
-/// always right. An opening rule must name a path with no empty part, `.` or
-/// `..`, and lie inside a closing rule, as it opens only what such a rule
-/// closes. It may not be the same path as a closing rule.
+/// True when a cleaned path holds an empty part, `.` or `..`. Such a rule
+/// holds no real path.
+fn bad_parts(path: &str) -> bool {
+    path.split('/')
+        .any(|part| part.trim().is_empty() || part == "." || part == "..")
+}
+
+/// The check of an `ORGTHREAD_DENY` value at the start. An opening rule must
+/// name a path with no empty part, `.` or `..`, and lie inside a closing rule,
+/// as it opens only what such a rule closes. It may not be the same path as a
+/// closing rule. A closing rule inside an opening rule may not hold an empty
+/// part, `.` or `..` either: it would close nothing, so a typo would leave the
+/// folder open. Every other closing rule is right, as before.
 pub fn check_deny(deny: &str) -> Result<(), String> {
     let rules = deny_rules(deny);
     for rule in rules.iter().filter(|rule| rule.open) {
@@ -138,11 +147,7 @@ pub fn check_deny(deny: &str) -> Result<(), String> {
                 "{written} opens no path. Write a path after !, such as !/notes/private/shared"
             ));
         }
-        if rule
-            .path
-            .split('/')
-            .any(|part| part.trim().is_empty() || part == "." || part == "..")
-        {
+        if bad_parts(&rule.path) {
             return Err(format!(
                 "{written} holds an empty part, . or .. Write each folder by its name"
             ));
@@ -162,6 +167,20 @@ pub fn check_deny(deny: &str) -> Result<(), String> {
         if !inside {
             return Err(format!(
                 "{written} lies inside no closing rule, so it opens nothing. An opening rule must lie inside a closing rule"
+            ));
+        }
+    }
+    for rule in rules
+        .iter()
+        .filter(|rule| !rule.open && bad_parts(&rule.path))
+    {
+        if let Some(open) = rules
+            .iter()
+            .find(|open| open.open && !open.path.is_empty() && is_under(&rule.path, &open.path))
+        {
+            return Err(format!(
+                "{} lies inside the opening rule {}, and it holds an empty part, . or .., so it closes nothing. Write each folder by its name",
+                rule.written, open.written
             ));
         }
     }
@@ -888,6 +907,32 @@ mod tests {
             assert_eq!(check_deny(deny), Ok(()), "{deny:?}");
         }
         assert!(check_deny("/notes,!/tasks/a").is_err(), "the check works");
+    }
+
+    #[test]
+    fn a_closing_rule_with_a_typo_inside_an_opening_rule_is_refused() {
+        let wrong = [
+            "/notes/private,!/notes/private/shared,/notes/private/shared//secret",
+            "/notes/private,!/notes/private/shared,/notes/private/shared/./secret",
+            "/notes/private/shared/../x,/notes/private,!/notes/private/shared",
+            "/Notes/Private,!/notes/private/shared,/NOTES/private/shared/a//b/",
+        ];
+        for deny in wrong {
+            let reason = check_deny(deny).unwrap_err();
+            assert!(
+                reason.contains("lies inside the opening rule !/notes/private/shared, and it holds an empty part, . or .., so it closes nothing"),
+                "{deny:?}: {reason}"
+            );
+        }
+        // A typo in a closing rule inside no opening rule keeps its meaning.
+        for deny in [
+            "/notes//old",
+            "/notes/./old, /notes/../x",
+            "/notes/private,!/notes/private/shared,/notes//old",
+            "/notes/private,!/notes/private/shared,/notes/private//other",
+        ] {
+            assert_eq!(check_deny(deny), Ok(()), "{deny:?}");
+        }
     }
 
     #[test]

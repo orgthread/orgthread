@@ -1469,6 +1469,7 @@ mod tests {
             (ALLOW, "notes/drafts, private"),
             (DENY, "/notes/private"),
             (DENY, "notes//x, /, ./y"),
+            (DENY, "/notes/private,!/notes/private/shared,/notes//old"),
             (DENY, "/notes/private,!/notes/private/shared"),
             (DENY, "!/notes/private/shared, /notes/private"),
             (
@@ -1563,6 +1564,11 @@ mod tests {
                 DENY,
                 "!/notes/private/shared",
                 "ORGTHREAD_DENY: !/notes/private/shared lies inside no closing rule",
+            ),
+            (
+                DENY,
+                "/notes/private,!/notes/private/shared,/notes/private/shared//secret",
+                "ORGTHREAD_DENY: /notes/private/shared//secret lies inside the opening rule !/notes/private/shared, and it holds an empty part",
             ),
         ];
         for (name, value, start) in wrong {

@@ -628,6 +628,10 @@ fn a_wrong_opening_rule_stops_each_command_and_config_check_names_it() {
             "ORGTHREAD_DENY: !/notes/private opens the same path that /notes/private closes.",
         ),
         ("/notes/private,!/", "ORGTHREAD_DENY: !/ opens no path."),
+        (
+            "/notes/private,!/notes/private/shared,/notes/private/shared//secret",
+            "ORGTHREAD_DENY: /notes/private/shared//secret lies inside the opening rule !/notes/private/shared, and it holds an empty part, . or .., so it closes nothing.",
+        ),
     ];
     let (today, plan, root) = (program.p(TODAY), program.p(PLAN), program.p(""));
     for (deny, reason) in wrong {
@@ -651,6 +655,16 @@ fn a_wrong_opening_rule_stops_each_command_and_config_check_names_it() {
             "{deny}: {}",
             out(&o)
         );
+    }
+
+    // A typo in a closing rule inside no opening rule keeps its meaning.
+    for deny in ["/notes//old", &format!("{DENY},/notes//old")] {
+        program.with_deny(deny);
+        let o = program.run(&["config", "--check"]);
+        assert_eq!(code(&o), 0, "{deny}: {o:?}");
+        assert!(!out(&o).contains("wrong: "), "{deny}: {}", out(&o));
+        let o = program.run(&["read", &today, "--who", "chat"]);
+        assert_eq!(code(&o), 0, "{deny}: {o:?}");
     }
 
     program.with_deny(DENY);
