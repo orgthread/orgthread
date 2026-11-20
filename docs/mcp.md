@@ -130,7 +130,7 @@ ORGTHREAD_DENY=/notes/private,!/notes/private/shared
 - `ORGTHREAD_ALLOW` is checked first and `ORGTHREAD_READ_ONLY` after, so `ORGTHREAD_READ_ONLY` can still make the open folder read only. The other gates count too: a file that is not text goes there only when `ORGTHREAD_BINARY_ALLOW` holds it, a delete works there only when `ORGTHREAD_DELETE_ALLOW` holds it, and when `ORGTHREAD_MOVE_ALLOW` names folders, a move works there only when it holds it.
 - The revert of `orgthread watch` follows the same limits.
 
-The check at the start: an opening rule must lie inside a closing rule, and must not be the same path. It must not be empty, as `!` or `!/`, and must not hold an empty part, `.` or `..`. Else every command but `config` stops with code 2, and `orgthread config --check` names the reason, for example:
+The check at the start: an opening rule must lie inside a closing rule, and must not be the same path. It must not be empty, as `!` or `!/`, and must not hold an empty part, `.` or `..`. A closing rule inside an opening rule must not hold an empty part, `.` or `..` either, as `/notes/private/shared//secret` would close nothing. Else every command but `config` stops with code 2, and `orgthread config --check` names the reason, for example:
 
 ```
 wrong: ORGTHREAD_DENY: !/tasks/a lies inside no closing rule, so it opens nothing. An opening rule must lie inside a closing rule

@@ -91,7 +91,8 @@ closing rule, for example /notes/private,!/notes/private/shared. Of all rules
 that hold a path, the one with the most parts decides, and the order does not
 count. So /notes/private/shared/secret in the list closes that folder again.
 Capitals do not count. An opening rule must lie inside a closing rule, and may
-not be the same path, be empty, or hold an empty part, . or .. Else every
+not be the same path, be empty, or hold an empty part, . or .. A closing rule
+inside an opening rule may not hold an empty part, . or .. either. Else every
 command but config stops with code 2. The folder around it stays closed: a list
 of /notes leaves out private/, and a list or search of /notes/private is
 refused, code 2. So a chat reaches the open folder only by its full name.
