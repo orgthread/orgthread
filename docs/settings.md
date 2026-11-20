@@ -57,7 +57,7 @@ The list holds all settings, of both doors. The doors: `local folder` is the doo
 | Setting | What it does | A right value | Default | Doors |
 |---|---|---|---|---|
 | `ORGTHREAD_ALLOW` | Comma-separated folders or files that a door may touch. | paths, separated by commas | all | both |
-| `ORGTHREAD_DENY` | Comma-separated folders or files that a door may not touch. | paths, separated by commas | none | both |
+| `ORGTHREAD_DENY` | Comma-separated folders or files that a door may not touch. A path with ! in front opens a path inside them again. The rule with the most parts wins. | paths, separated by commas, ! in front opens a path inside one | none | both |
 | `ORGTHREAD_READ_ONLY` | Comma-separated folders or files that a door may only read. | paths, separated by commas | none | both |
 | `ORGTHREAD_BINARY_ALLOW` | Comma-separated folders where a file that is not text may go, by upload, copy or move. | paths, separated by commas | none | both |
 | `ORGTHREAD_DELETE_ALLOW` | Comma-separated folders where delete may remove a file. | paths, separated by commas | none, so every delete is refused | both |

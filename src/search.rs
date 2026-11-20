@@ -10,7 +10,7 @@
 use crate::list::{Limits, join, join_shown, named};
 use crate::storage::{Storage, Walked};
 use crate::transfer::named_binary;
-use crate::write::{exit, is_under};
+use crate::write::{deny_rules, exit, is_under};
 use std::io::ErrorKind;
 
 /// The hits of one answer, unless the caller asks for another number.
@@ -56,17 +56,22 @@ struct Hit {
     line: Option<(usize, String)>,
 }
 
-/// `Some` with the reason when `folder` holds a closed path of `deny`. A content
-/// search on a server fetches the whole folder as one zip, so the closed files
-/// would come into memory: such a search is refused. `folder` is from the root,
-/// and empty for the root itself.
+/// `Some` with the reason when `folder` holds a closing rule of `deny`. A
+/// content search on a server fetches the whole folder as one zip, so the closed
+/// files would come into memory: such a search is refused. An opening rule
+/// closes nothing, so it does not count here. A closing rule inside an open
+/// folder counts. `folder` is from the root, and empty for the root itself. A
+/// folder that is itself closed is refused before, by the limits.
 pub fn holds_closed(folder: &str, deny: &str) -> Option<String> {
     let folder = folder.trim_matches('/');
-    deny.split(',')
-        .map(str::trim)
-        .filter(|rule| !rule.trim_matches('/').is_empty())
-        .find(|rule| folder.is_empty() || (is_under(rule, folder) && !is_under(folder, rule)))
+    deny_rules(deny)
+        .into_iter()
+        .filter(|rule| !rule.open && !rule.path.is_empty())
+        .find(|rule| {
+            folder.is_empty() || (is_under(&rule.path, folder) && !is_under(folder, &rule.path))
+        })
         .map(|rule| {
+            let rule = rule.written;
             format!(
                 "/{folder} holds the closed path {rule}. A search of the content on a server fetches the whole folder, so it is refused. Search a folder inside it that holds no closed path, or search with names."
             )
@@ -455,6 +460,27 @@ mod tests {
         assert!(holds_closed("org/healthy", deny).is_none());
         assert!(holds_closed("", "").is_none());
         assert!(holds_closed("", " , ").is_none());
+    }
+
+    #[test]
+    fn an_opening_rule_is_no_closed_path_for_a_content_search() {
+        let deny = "/notes/private, !/notes/private/shared";
+        assert!(holds_closed("notes/private/shared", deny).is_none());
+        assert!(holds_closed("notes/private/shared/2026", deny).is_none());
+        assert!(holds_closed("", "!/notes/private/shared").is_none());
+        let reason = holds_closed("notes", deny).unwrap();
+        assert!(
+            reason.contains("holds the closed path /notes/private."),
+            "{reason}"
+        );
+        assert!(holds_closed("", deny).is_some(), "the root holds all");
+        let again = format!("{deny}, /notes/private/shared/secret");
+        let reason = holds_closed("Notes/Private/Shared", &again).unwrap();
+        assert!(
+            reason.contains("holds the closed path /notes/private/shared/secret."),
+            "{reason}"
+        );
+        assert!(holds_closed("notes/private/shared/2026", &again).is_none());
     }
 
     #[test]

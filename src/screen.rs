@@ -1961,6 +1961,38 @@ mod tests {
         }
 
         #[test]
+        fn r_then_y_inside_an_opening_rule_reverts() {
+            let place = Place::new("opening");
+            place.add("patched", PATH, OLD, NEW);
+            let snap = place.snap();
+            let diffs = place.kept();
+            let mut w = Watch::new(Some(limited(&place, "", "org,!org/notes", "")));
+            w.key(KeyCode::Char('r'), false, &snap, &diffs);
+            assert!(shown(&w, &snap).contains("Revert this change?"));
+            w.key(KeyCode::Char('y'), false, &snap, &diffs);
+            assert_eq!(place.file(), OLD);
+            is_reverted_back(&place, OLD.len());
+        }
+
+        #[test]
+        fn r_beside_or_below_an_opening_rule_is_refused() {
+            refused(
+                "beside",
+                "",
+                "org,!org/notes2",
+                "",
+                "is closed to this door",
+            );
+            refused(
+                "below",
+                "",
+                "org,!org/notes,/org/notes/plan.md",
+                "",
+                "is closed to this door",
+            );
+        }
+
+        #[test]
         fn the_write_checks_the_limits_again_before_the_lock() {
             // The limits may close between r and y; the write itself checks too.
             let place = Place::new("again");

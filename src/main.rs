@@ -730,8 +730,9 @@ impl Settings {
     }
 
     /// The new folders a new file at `path` needs, the outer one first, after
-    /// the guard of `ORGTHREAD_FIXED_FOLDERS`. The error is an exit code and the
-    /// reason, for a refusal before the lock: then nothing is made.
+    /// the guards of `ORGTHREAD_DENY` and `ORGTHREAD_FIXED_FOLDERS`. The error is
+    /// an exit code and the reason, for a refusal before the lock: then nothing
+    /// is made.
     fn new_folders_for(
         &self,
         storage: &dyn Storage,
@@ -743,6 +744,9 @@ impl Settings {
                 format!("could not look at the folders of {path}: {e}"),
             )
         })?;
+        // A folder inside an open folder may be new. Its closed parents may not.
+        write::check_new_folders(&folders, &settings::deny())
+            .map_err(|reason| (exit::USAGE, reason))?;
         let fixed = settings::fixed_folders();
         write::check_fixed(&folders, &fixed).map_err(|reason| (exit::USAGE, reason))?;
         Ok(folders)
@@ -1630,15 +1634,18 @@ fn cmd_delete(args: &[String]) -> Result<i32, String> {
     Ok(report.exit_code(logged.is_ok()))
 }
 
-/// The guard of `ORGTHREAD_FIXED_FOLDERS` for the new name of a copy or a move,
-/// before the lock. With no setting there is no guard and no look. `Ok` holds
-/// the reason of a refusal, `Err` a look that failed.
-fn fixed_refusal(
+/// The guards of new folders for the new name of a copy or a move, before the
+/// lock, as `new_folders_for` has them. With no `ORGTHREAD_FIXED_FOLDERS` and
+/// no opening rule in `ORGTHREAD_DENY` there is no guard and no look: then a
+/// new folder is closed only where the new name is closed too, and the limits
+/// refused that before. `Ok` holds the reason of a refusal, `Err` a look that
+/// failed.
+fn folder_refusal(
     settings: &Settings,
     storage: &dyn Storage,
     to: &str,
 ) -> Option<Result<String, String>> {
-    if settings::fixed_folders().trim().is_empty() {
+    if settings::fixed_folders().trim().is_empty() && !write::has_opening(&settings::deny()) {
         return None;
     }
     match settings.new_folders_for(storage, to) {
@@ -1708,7 +1715,7 @@ fn cmd_copy(args: &[String]) -> Result<i32, String> {
         return refuse(copy::Outcome::NotText { reason });
     }
     let storage = settings.storage()?;
-    if let Some(refused) = fixed_refusal(&settings, storage.as_ref(), &to) {
+    if let Some(refused) = folder_refusal(&settings, storage.as_ref(), &to) {
         return match refused {
             Ok(reason) => refuse(copy::Outcome::NotAllowed { reason }),
             Err(reason) => refuse(copy::Outcome::Failed { reason }),
@@ -1829,7 +1836,7 @@ fn cmd_move(args: &[String]) -> Result<i32, String> {
         return refuse(mv::Outcome::NotText { reason });
     }
     let storage = settings.storage()?;
-    if let Some(refused) = fixed_refusal(&settings, storage.as_ref(), &to) {
+    if let Some(refused) = folder_refusal(&settings, storage.as_ref(), &to) {
         return match refused {
             Ok(reason) => refuse(mv::Outcome::NotAllowed { reason }),
             Err(reason) => refuse(mv::Outcome::Failed { reason }),

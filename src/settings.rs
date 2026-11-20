@@ -63,6 +63,9 @@ pub enum Kind {
     Path,
     /// Folders or files, separated by commas.
     Paths,
+    /// The folders or files of `ORGTHREAD_DENY`, separated by commas. A rule
+    /// that starts with `!` opens a path inside a closing rule.
+    Deny,
     /// A whole number of MB of 1,000,000 bytes. Empty means the default.
     Megabytes,
     /// A name on one line. Empty means the default.
@@ -104,6 +107,7 @@ impl Kind {
         match self {
             Kind::Path => "a path, not empty",
             Kind::Paths => "paths, separated by commas",
+            Kind::Deny => "paths, separated by commas, ! in front opens a path inside one",
             Kind::Megabytes => "a whole number",
             Kind::Name => "a name on one line",
             Kind::Storage => "dropbox or local",
@@ -304,11 +308,11 @@ pub const ALL: [Setting; 35] = [
     ),
     setting(
         DENY,
-        Kind::Paths,
+        Kind::Deny,
         "none",
         Both,
         Limits,
-        "Comma-separated folders or files that a door may not touch.",
+        "Comma-separated folders or files that a door may not touch. A path with ! in front opens a path inside them again. The rule with the most parts wins.",
     ),
     setting(
         READ_ONLY,
@@ -834,6 +838,7 @@ pub fn check(setting: &Setting, value: &OsStr) -> Result<(), String> {
         Kind::Hash => {
             text.is_empty() || (text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()))
         }
+        Kind::Deny => crate::write::check_deny(&text).is_ok(),
         Kind::Folders => crate::device::check_folders(&text).is_ok(),
         Kind::Files => crate::device::check_files(&text).is_ok(),
         Kind::Count => count_from(&|_: &str| Some(value.to_owned()), name).is_ok(),
@@ -848,6 +853,10 @@ pub fn check(setting: &Setting, value: &OsStr) -> Result<(), String> {
         Kind::Megabytes => format!("{name} needs a whole number of MB, not {shown}"),
         Kind::Hash => format!("{name} needs the 64 signs that orgthread password-hash gives"),
         Kind::PublicAddress => format!("{name} needs an address that starts with https://"),
+        Kind::Deny => match crate::write::check_deny(&text) {
+            Err(why) => format!("{name}: {why}"),
+            Ok(()) => format!("{name} needs {}", setting.kind.rule()),
+        },
         Kind::Folders => match crate::device::check_folders(&text) {
             Err(why) => format!("{name}: {why}"),
             Ok(()) => format!("{name} needs {}", setting.kind.rule()),
@@ -1458,6 +1467,14 @@ mod tests {
             (OWNER, "Ana"),
             (OWNER, ""),
             (ALLOW, "notes/drafts, private"),
+            (DENY, "/notes/private"),
+            (DENY, "notes//x, /, ./y"),
+            (DENY, "/notes/private,!/notes/private/shared"),
+            (DENY, "!/notes/private/shared, /notes/private"),
+            (
+                DENY,
+                "/notes/private,!/notes/private/shared,/notes/private/shared/secret",
+            ),
             (STORAGE, "dropbox"),
             (STORAGE, "local"),
             (STORAGE, ""),
@@ -1515,6 +1532,38 @@ mod tests {
             ),
             (OWNER, "Ana\tB", "ORGTHREAD_OWNER must be on one line"),
             (DENY, "a\nb", "ORGTHREAD_DENY must be on one line"),
+            (DENY, "/notes,!", "ORGTHREAD_DENY: ! opens no path"),
+            (DENY, "/notes,!/", "ORGTHREAD_DENY: !/ opens no path"),
+            (
+                DENY,
+                "/notes,!/notes//a",
+                "ORGTHREAD_DENY: !/notes//a holds an empty part, . or ..",
+            ),
+            (
+                DENY,
+                "/notes,!/notes/../a",
+                "ORGTHREAD_DENY: !/notes/../a holds an empty part, . or ..",
+            ),
+            (
+                DENY,
+                "/notes,!/notes/./a",
+                "ORGTHREAD_DENY: !/notes/./a holds an empty part, . or ..",
+            ),
+            (
+                DENY,
+                "/notes/private,!/Notes/Private",
+                "ORGTHREAD_DENY: !/Notes/Private opens the same path that /notes/private closes",
+            ),
+            (
+                DENY,
+                "/notes/private,!/tasks/shared",
+                "ORGTHREAD_DENY: !/tasks/shared lies inside no closing rule",
+            ),
+            (
+                DENY,
+                "!/notes/private/shared",
+                "ORGTHREAD_DENY: !/notes/private/shared lies inside no closing rule",
+            ),
         ];
         for (name, value, start) in wrong {
             let reason = checked(name, value).unwrap_err();

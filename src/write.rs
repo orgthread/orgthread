@@ -53,8 +53,151 @@ pub fn is_under(path: &str, rule: &str) -> bool {
     !rule.is_empty() && (path == rule || path.starts_with(&format!("{rule}/")))
 }
 
+/// One rule of `ORGTHREAD_DENY`. A rule that starts with `!` is an opening
+/// rule. Every other rule is a closing rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DenyRule {
+    /// True for an opening rule.
+    pub open: bool,
+    /// The path of the rule, cleaned as `clean_rule` does.
+    pub path: String,
+    /// The rule as written, with no space at either end, for a message.
+    pub written: String,
+}
+
+/// A path of a rule as every limit compares it: no space and no `/` at either
+/// end, in lower case. Empty for the root.
+pub fn clean_rule(rule: &str) -> String {
+    rule.trim().trim_matches('/').to_lowercase()
+}
+
+/// The number of parts of a path, such as 3 for `/notes/private/shared`. Empty
+/// parts do not count, so extra signs `/` change nothing.
+fn depth(path: &str) -> usize {
+    path.split('/').filter(|part| !part.is_empty()).count()
+}
+
+/// The rules of an `ORGTHREAD_DENY` value, in the order written. Empty rules
+/// are left out.
+pub fn deny_rules(deny: &str) -> Vec<DenyRule> {
+    deny.split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| match rule.strip_prefix('!') {
+            Some(rest) => DenyRule {
+                open: true,
+                path: clean_rule(rest),
+                written: rule.to_string(),
+            },
+            None => DenyRule {
+                open: false,
+                path: clean_rule(rule),
+                written: rule.to_string(),
+            },
+        })
+        .collect()
+}
+
+/// True when `deny` holds at least one opening rule.
+pub fn has_opening(deny: &str) -> bool {
+    deny_rules(deny).iter().any(|rule| rule.open)
+}
+
+/// True when the rules of `deny` close `path`. Of all rules that hold the path,
+/// the one with the most parts decides: an opening rule opens, a closing rule
+/// closes. The order of the list does not count. At a tie the closing rule
+/// wins. A path that no rule holds is open.
+pub fn is_closed(path: &str, deny: &str) -> bool {
+    let mut deciding: Option<(usize, bool)> = None;
+    for rule in deny_rules(deny) {
+        if !is_under(path, &rule.path) {
+            continue;
+        }
+        let depth = depth(&rule.path);
+        let wins = match deciding {
+            None => true,
+            Some((best, open)) => depth > best || (depth == best && open && !rule.open),
+        };
+        if wins {
+            deciding = Some((depth, rule.open));
+        }
+    }
+    deciding.is_some_and(|(_, open)| !open)
+}
+
+/// The check of an `ORGTHREAD_DENY` value at the start. A closing rule is
+/// always right. An opening rule must name a path with no empty part, `.` or
+/// `..`, and lie inside a closing rule, as it opens only what such a rule
+/// closes. It may not be the same path as a closing rule.
+pub fn check_deny(deny: &str) -> Result<(), String> {
+    let rules = deny_rules(deny);
+    for rule in rules.iter().filter(|rule| rule.open) {
+        let written = &rule.written;
+        if rule.path.is_empty() {
+            return Err(format!(
+                "{written} opens no path. Write a path after !, such as !/notes/private/shared"
+            ));
+        }
+        if rule
+            .path
+            .split('/')
+            .any(|part| part.trim().is_empty() || part == "." || part == "..")
+        {
+            return Err(format!(
+                "{written} holds an empty part, . or .. Write each folder by its name"
+            ));
+        }
+        if let Some(same) = rules
+            .iter()
+            .find(|other| !other.open && other.path == rule.path)
+        {
+            return Err(format!(
+                "{written} opens the same path that {} closes. An opening rule must lie inside a closing rule",
+                same.written
+            ));
+        }
+        let inside = rules.iter().any(|other| {
+            !other.open && !other.path.is_empty() && is_under(&rule.path, &other.path)
+        });
+        if !inside {
+            return Err(format!(
+                "{written} lies inside no closing rule, so it opens nothing. An opening rule must lie inside a closing rule"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The guard of `ORGTHREAD_DENY` for new folders. `new` holds the new folders
+/// from the root, as `new_folders` gives them. A new folder that the rules
+/// close is refused, and so is a new folder that is an opening rule itself:
+/// only the owner makes such a folder, by hand.
+pub fn check_new_folders(new: &[String], deny: &str) -> Result<(), String> {
+    let rules = deny_rules(deny);
+    for folder in new {
+        let path = clean_rule(folder);
+        if let Some(rule) = rules
+            .iter()
+            .find(|rule| rule.open && !rule.path.is_empty() && rule.path == path)
+        {
+            return Err(format!(
+                "{folder} would be a new folder, and it is the folder that {} opens. Only the owner makes it, by hand.",
+                rule.written
+            ));
+        }
+        if is_closed(folder, deny) {
+            return Err(format!(
+                "{folder} would be a new folder, and it is closed to this door. Only the owner makes it, by hand."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The limits of a door, from comma-separated lists. An empty `allow` allows all.
-/// A refusal says why. These guard against a confused chat, not against a thief.
+/// In `deny`, a rule that starts with `!` opens a path inside a closing rule, as
+/// `is_closed` says. A refusal says why. These guard against a confused chat,
+/// not against a thief.
 pub fn check_limits(
     path: &str,
     writing: bool,
@@ -72,7 +215,7 @@ pub fn check_limits(
     if !allowed.is_empty() && !allowed.iter().any(|rule| is_under(path, rule)) {
         return Err(format!("{path} is outside the folders this door may touch"));
     }
-    if list(deny).iter().any(|rule| is_under(path, rule)) {
+    if is_closed(path, deny) {
         return Err(format!("{path} is closed to this door"));
     }
     if writing && list(read_only).iter().any(|rule| is_under(path, rule)) {
@@ -639,5 +782,159 @@ mod tests {
             "no setting, no guard"
         );
         assert!(check_fixed(&new(&["new"]), "/").is_err(), "/ is the root");
+    }
+
+    const DENY: &str = "/notes/private,!/notes/private/shared";
+
+    fn closed(path: &str, deny: &str) -> bool {
+        check_limits(path, false, "", deny, "")
+            .is_err_and(|reason| reason == format!("{path} is closed to this door"))
+    }
+
+    #[test]
+    fn the_deeper_rule_wins() {
+        assert!(closed("notes/private", DENY));
+        assert!(closed("notes/private/diary.md", DENY));
+        assert!(!closed("notes/private/shared", DENY), "the open folder");
+        assert!(!closed("notes/private/shared/plan.md", DENY));
+        assert!(!closed("notes/private/shared/2026/11/plan.md", DENY));
+        assert!(!closed("notes/today.md", DENY), "no rule holds it");
+        assert!(!closed("notes", DENY), "the parent of a closing rule");
+    }
+
+    #[test]
+    fn the_order_of_the_rules_does_not_count() {
+        let turned = "!/notes/private/shared,/notes/private";
+        assert!(!closed("notes/private/shared/plan.md", turned));
+        assert!(closed("notes/private/diary.md", turned));
+    }
+
+    #[test]
+    fn capitals_do_not_count_in_an_opening_rule() {
+        let deny = "/Notes/Private,!/NOTES/private/Shared";
+        assert!(!closed("notes/private/shared/plan.md", deny));
+        assert!(!closed("Notes/Private/SHARED/Plan.md", DENY));
+        assert!(closed("NOTES/PRIVATE/diary.md", DENY));
+    }
+
+    #[test]
+    fn a_closing_rule_inside_an_opening_rule_closes_again() {
+        let deny = format!("{DENY},/notes/private/shared/secret");
+        assert!(closed("notes/private/shared/secret", &deny));
+        assert!(closed("notes/private/shared/secret/code.md", &deny));
+        assert!(!closed("notes/private/shared/plan.md", &deny));
+        let deeper = format!("{deny},!/notes/private/shared/secret/open");
+        assert!(!closed("notes/private/shared/secret/open/a.md", &deeper));
+        assert!(closed("notes/private/shared/secret/code.md", &deeper));
+    }
+
+    #[test]
+    fn a_folder_beside_the_open_folder_stays_closed() {
+        assert!(closed("notes/private/shared2", DENY));
+        assert!(closed("notes/private/shared2/plan.md", DENY));
+        assert!(closed("notes/private/shared.md", DENY));
+    }
+
+    #[test]
+    fn extra_signs_and_spaces_change_nothing_in_the_ranking() {
+        // The opening rule written with many signs `/` is still one level
+        // above the closing rule inside it.
+        let deny = " /notes/private/ , !//notes/private/shared/// , /notes/private/shared/secret";
+        assert!(closed("notes/private/shared/secret/code.md", deny));
+        assert!(!closed("notes/private/shared/plan.md", deny));
+        assert!(closed("notes/private/diary.md", deny));
+    }
+
+    #[test]
+    fn at_a_tie_the_closing_rule_wins() {
+        // The start check refuses this value, and the limits still fail safe.
+        let deny = "!/notes/private,/notes/private";
+        assert!(closed("notes/private/diary.md", deny));
+    }
+
+    #[test]
+    fn allow_comes_first_and_read_only_after_an_opening_rule() {
+        let path = "notes/private/shared/plan.md";
+        assert_eq!(
+            check_limits(path, false, "/tasks", DENY, ""),
+            Err(format!("{path} is outside the folders this door may touch"))
+        );
+        assert_eq!(
+            check_limits(path, true, "", DENY, "/notes/private/shared"),
+            Err(format!("{path} is read only for this door"))
+        );
+        assert_eq!(check_limits(path, false, "", DENY, "/notes"), Ok(()));
+        assert_eq!(check_limits(path, true, "/notes", DENY, ""), Ok(()));
+    }
+
+    #[test]
+    fn the_start_check_takes_closing_rules_as_before() {
+        for deny in [
+            "",
+            "/notes/private",
+            "a//b, /, ./x",
+            DENY,
+            "/notes/private, !/notes/private/shared, /notes/private/shared/secret",
+            " /Notes/Private , ! /notes/private/shared/ ",
+        ] {
+            assert_eq!(check_deny(deny), Ok(()), "{deny:?}");
+        }
+    }
+
+    #[test]
+    fn the_start_check_refuses_a_wrong_opening_rule() {
+        let wrong = [
+            ("/notes,!", "! opens no path"),
+            ("/notes,!/", "!/ opens no path"),
+            ("/notes,!//", "!// opens no path"),
+            (
+                "/notes,!/notes//a",
+                "!/notes//a holds an empty part, . or ..",
+            ),
+            (
+                "/notes,!/notes/./a",
+                "!/notes/./a holds an empty part, . or ..",
+            ),
+            ("/notes,!/notes/../a", "!/notes/../a holds an empty part"),
+            ("/notes,!/notes/a/..", "!/notes/a/.. holds an empty part"),
+            (
+                "/notes,!/Notes/",
+                "!/Notes/ opens the same path that /notes closes",
+            ),
+            ("/notes,!/tasks/a", "!/tasks/a lies inside no closing rule"),
+            ("!/notes/a", "!/notes/a lies inside no closing rule"),
+            ("/notes/a,!/notes", "!/notes lies inside no closing rule"),
+            (
+                "/notes/a,!/notes/ab/c",
+                "!/notes/ab/c lies inside no closing rule",
+            ),
+        ];
+        for (deny, start) in wrong {
+            let reason = check_deny(deny).unwrap_err();
+            assert!(reason.starts_with(start), "{deny:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_new_folder_that_is_closed_or_opening_is_refused() {
+        let refused = |list: &[&str]| check_new_folders(&new(list), DENY).unwrap_err();
+        assert!(refused(&["notes/private"]).contains("is closed to this door"));
+        let reason = refused(&["notes/private", "notes/private/shared"]);
+        assert!(
+            reason.starts_with("notes/private would be a new folder"),
+            "{reason}"
+        );
+        let reason = refused(&["notes/private/shared"]);
+        assert!(
+            reason.contains("is the folder that !/notes/private/shared opens"),
+            "{reason}"
+        );
+        assert!(refused(&["Notes/Private/Shared"]).contains("opens"));
+        assert!(refused(&["notes/private/other"]).contains("closed"));
+        let fine = new(&["notes/private/shared/2026", "notes/private/shared/2026/11"]);
+        assert_eq!(check_new_folders(&fine, DENY), Ok(()));
+        assert_eq!(check_new_folders(&new(&["tasks/new"]), DENY), Ok(()));
+        assert_eq!(check_new_folders(&[], DENY), Ok(()));
+        assert_eq!(check_new_folders(&new(&["notes/private"]), ""), Ok(()));
     }
 }
