@@ -50,7 +50,7 @@ How each tool is called is in [mcp-api.md](mcp-api.md).
 
 ## On the device door
 
-The device door refuses with code 2 what its rules close: a tool other than `list`, `read` and `patch`, a path outside its rules, a path that is not clean, a patch in a read folder, and a read above the read cap. The text names the reason, and for the cap the time when reads open again. Its `/pair` answers with an HTTP status: see [device-door.md](device-door.md).
+The device door refuses with code 2 what its rules close: a tool other than `list`, `read` and `patch`, a path outside its rules, a path that is not clean, a patch in a read folder, a read or a patch in a folder of `ORGTHREAD_DEVICE_LIST`, and a read above the read cap. The text names the reason, and for the cap the time when reads open again. Its `/pair` answers with an HTTP status: see [device-door.md](device-door.md).
 
 ## The answers of a link
 

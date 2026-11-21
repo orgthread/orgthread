@@ -8,6 +8,7 @@ A device door is a third door, for a device such as an e-reader. Think of a side
 - One door per app. The app is a name in the settings, such as `reader`.
 - One token per app and device. A lost device costs only its own token.
 - Only three tools: `list`, `read` and `patch`, and only on the paths that the settings name. Every other tool and every other path is refused with exit code 2, as a closed path is on the other doors.
+- A folder can be open to `list` only: the device sees the names, sizes, times and fingerprints of the files, never their text.
 - No password and no OAuth. A device pairs once with a code of 8 signs, and then sends its token.
 - A read cap per device, with a push to the owner when a device reaches it.
 - No request and no answer goes into the log.
@@ -37,7 +38,19 @@ ORGTHREAD_DEVICE_NOTIFY=/home/example/orgthread-reader/push.sh
 ORGTHREAD_PUBLIC_URL=https://reader.example.com/another-long-invented-secret
 ```
 
-Add the Dropbox settings of [settings.md](settings.md), as for the remote door. Do not set `ORGTHREAD_LOGIN_HASH`: a device door with a password refuses to start, as it then shares a folder with the other door. The other way round, `serve --http` without `--device` refuses to start where `ORGTHREAD_DEVICE_READ` or `ORGTHREAD_DEVICE_PATCH` is set.
+Another example, for an invented app `lessons` that only checks which files of `/lessons/` it has: it may list `/lessons/` with fingerprints, and read nothing.
+
+```
+ORGTHREAD_STORAGE=dropbox
+ORGTHREAD_DEVICE_APP=lessons
+ORGTHREAD_DEVICE_LIST=/lessons/
+ORGTHREAD_DEVICE_NOTIFY=/home/example/orgthread-lessons/push.sh
+ORGTHREAD_PUBLIC_URL=https://lessons.example.com/a-third-long-invented-secret
+```
+
+A device door needs at least one of `ORGTHREAD_DEVICE_READ`, `ORGTHREAD_DEVICE_PATCH` and `ORGTHREAD_DEVICE_LIST`, and any one of them is enough.
+
+Add the Dropbox settings of [settings.md](settings.md), as for the remote door. Do not set `ORGTHREAD_LOGIN_HASH`: a device door with a password refuses to start, as it then shares a folder with the other door. The other way round, `serve --http` without `--device` refuses to start where `ORGTHREAD_DEVICE_READ`, `ORGTHREAD_DEVICE_PATCH` or `ORGTHREAD_DEVICE_LIST` is set.
 
 `ORGTHREAD_PUBLIC_URL` is optional here. With a path in it, everything lives under that path, and any other path gets an empty 404, as on the remote door.
 
@@ -58,6 +71,8 @@ The rules of a device door are stricter than the limits of the other doors:
 - Capitals count. With `/books/` in the rules, `/Books/a.txt` is refused.
 - `ORGTHREAD_DEVICE_READ` names folders, with `/` at both ends. A device may read every file in them, at any depth, and list them, one level at a time. It may not patch there.
 - In `ORGTHREAD_DEVICE_READ`, `*` stands for any part of one folder name, and never for a `/`. So `/books/*/` opens `/books/an-invented-book/` and all it holds, but no file directly in `/books/`: `/books/an-invented-book.epub` is refused. A list of `/books/`, the folder right above the `*`, shows only the names of its folders, never a file or its name. A list of any other folder above, such as `/`, is refused.
+- `ORGTHREAD_DEVICE_LIST` names folders in the form of `ORGTHREAD_DEVICE_READ`, with `/` at both ends and `*` for any part of one folder name. A device may list them, and every folder in them, one level at a time, with `fingerprint`. A `read` or a `patch` of any file in them is refused with exit code 2, and the log gets a `refused` line with the path and the device, never a text of the file. So with `/lessons/`, a list of `/lessons/` and of `/lessons/archive/` works, and a read of `/lessons/lesson-1.pdf` is refused.
+- Where a list folder meets a read folder or a patch file, the list folder wins: a file in it is closed to `read` and `patch`, also when `ORGTHREAD_DEVICE_READ` or `ORGTHREAD_DEVICE_PATCH` names it. The door checks this at each call, so no overlap of two rules with a `*` can slip through, and a mistake in the settings closes a file, never opens it.
 - `ORGTHREAD_DEVICE_PATCH` names files. A device may read and patch them. `*` stands for any part of one name, and never for a `/`. So `/reading/progress-*.md` opens `/reading/progress-a.md`, and not `/reading/notes.md` or `/reading/old/progress-a.md`. A patch never makes a file: a file that does not exist gives exit code 6 on the read, and the patch is then refused.
 - In a local folder, a path that goes through a link is refused. Dropbox has no links.
 - A list with one closed folder is refused whole.
@@ -111,12 +126,37 @@ curl -sS https://reader.example.com/another-long-invented-secret/mcp \
 A missing, wrong, revoked or old token gets an empty 401, and nothing else does. No answer is a 403. A refused tool, a refused path and the read cap are no HTTP errors: each is a tool result with `isError` set to true and a text that starts with `exit code 2`, as on the other doors. The fields of the tools are those of [mcp-api.md](mcp-api.md), with three changes:
 
 - There is no `who`. The door names the device itself, as `tablet (reader)`, in the log and in the notes of what it read. A `who` that the device sends is not used. So a patch needs a read by the same device first.
-- `list` takes `folders` and `fingerprint`, and goes one level down. It takes no `depth` and no `all`.
+- `list` takes `folders` and `fingerprint`, and goes one level down. It takes no `depth` and no `all`. With `fingerprint` set to `true`, each file shows its fingerprint before its name: the content hash that Dropbox reports, the same as `orgthread fingerprint` gives.
 - `version` is not offered.
+
+## A door that only lists
+
+With the `lessons` example above, the device sends:
+
+```
+{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+ "params": {"name": "list", "arguments": {"folders": ["/lessons/"], "fingerprint": true}}}
+```
+
+The text of the answer has one line per entry: the size in bytes, the time, the fingerprint and the name. A folder shows `-` for its size, time and fingerprint, and its name ends with `/`. For example, with invented files:
+
+```
+/lessons/:
+          -  -                     -                                                                 archive/
+         13  2026-11-21 Sat 19:24  7a2229db9c520d7b3617d2089d56599b43001c12949a56f4c106562501c27a71  lesson-1.pdf
+         13  2026-11-21 Sat 19:24  e3f108bb948e6e32a77b9389d8cb0ad1d2572a9ba15e3527dda071ee2555ff3c  lesson-1.pdf.mark
+```
+
+The device compares each fingerprint with the content hash of its own copy: the same hash, the same file. A read of `/lessons/lesson-1.pdf` gives:
+
+```
+exit code 2
+orgthread: /lessons/lesson-1.pdf lies in a folder that this door may only list, not read or patch
+```
 
 ## The read cap
 
-Each read of a file of `ORGTHREAD_DEVICE_CAPPED` counts: by default 8 in 60 minutes and 40 in 24 hours for each device, set with `ORGTHREAD_DEVICE_CAP_HOUR` and `ORGTHREAD_DEVICE_CAP_DAY`. With `ORGTHREAD_DEVICE_CAPPED` not set, every read counts. A refused read does not count.
+Each read of a file of `ORGTHREAD_DEVICE_CAPPED` counts: by default 8 in 60 minutes and 40 in 24 hours for each device, set with `ORGTHREAD_DEVICE_CAP_HOUR` and `ORGTHREAD_DEVICE_CAP_DAY`. With `ORGTHREAD_DEVICE_CAPPED` not set, every read counts. A refused read does not count. A list never counts, with or without `fingerprint`.
 
 Above the cap, the read is refused with exit code 2 and the time it opens again:
 
