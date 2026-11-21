@@ -50,6 +50,7 @@ pub const LOGIN_HASH: &str = "ORGTHREAD_LOGIN_HASH";
 pub const DEVICE_APP: &str = "ORGTHREAD_DEVICE_APP";
 pub const DEVICE_READ: &str = "ORGTHREAD_DEVICE_READ";
 pub const DEVICE_PATCH: &str = "ORGTHREAD_DEVICE_PATCH";
+pub const DEVICE_LIST: &str = "ORGTHREAD_DEVICE_LIST";
 pub const DEVICE_CAPPED: &str = "ORGTHREAD_DEVICE_CAPPED";
 pub const DEVICE_CAP_HOUR: &str = "ORGTHREAD_DEVICE_CAP_HOUR";
 pub const DEVICE_CAP_DAY: &str = "ORGTHREAD_DEVICE_CAP_DAY";
@@ -241,7 +242,7 @@ use Doors::{Both, Dropbox as DropboxDoor, Local};
 use Group::{Basics, Device, Dropbox as DropboxGroup, FoldersAndLogs, Limits, Server, Sizes};
 
 /// Every setting, in the order of the screen.
-pub const ALL: [Setting; 35] = [
+pub const ALL: [Setting; 36] = [
     setting(
         OWNER,
         Kind::Name,
@@ -441,6 +442,14 @@ pub const ALL: [Setting; 35] = [
         Both,
         Device,
         "Comma-separated files that a device may read and patch, never make. Each from the root, such as /notes/progress-*.md, where * stands for any part of one name. Capitals count.",
+    ),
+    setting(
+        DEVICE_LIST,
+        Kind::Folders,
+        "none",
+        Both,
+        Device,
+        "Comma-separated folders that a device may only list: the names, sizes, times and fingerprints of what they hold, never the text of a file. In the form of ORGTHREAD_DEVICE_READ, such as /lessons/. A read or a patch of a file in them is refused, also where ORGTHREAD_DEVICE_READ or ORGTHREAD_DEVICE_PATCH names it.",
     ),
     setting(
         DEVICE_CAPPED,
@@ -725,6 +734,11 @@ pub fn device_read() -> String {
 /// The files a device may read and patch, as a comma-separated list.
 pub fn device_patch() -> String {
     list(DEVICE_PATCH)
+}
+
+/// The folders a device may only list, as a comma-separated list.
+pub fn device_list() -> String {
+    list(DEVICE_LIST)
 }
 
 /// The files whose reads count for the cap. `None` when not set or empty:
@@ -1097,7 +1111,7 @@ mod tests {
 
     #[test]
     fn the_list_has_each_setting_once_with_a_prefix_and_a_help_line() {
-        assert_eq!(ALL.len(), 35);
+        assert_eq!(ALL.len(), 36);
         for (i, s) in ALL.iter().enumerate() {
             assert!(s.name.starts_with(PREFIX), "{}", s.name);
             assert!(!s.help.is_empty() && !s.default.is_empty(), "{}", s.name);

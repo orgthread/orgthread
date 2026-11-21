@@ -24,6 +24,28 @@ const PROGRESS: &str = "# Reading: an invented book\n\n- Place: chapter 1, page 
 const PREFIX: &str = "/an-invented-secret";
 const BOOK: &str = "/books/an-invented-book";
 const PROGRESS_FILE: &str = "/reading/progress-an-invented-book.md";
+/// The invented lessons of a list-only door, each with a marker word that
+/// must never leave the sample folder.
+const LESSON_MARKER: &str = "fliederwolkenbank";
+const LESSON: &str = "/lessons/Lesson 1 Mon.pdf";
+const LESSONS: [(&str, &str); 4] = [
+    (
+        "Lesson 1 Mon.pdf",
+        "%PDF-1.4 an invented lesson fliederwolkenbank\n",
+    ),
+    (
+        "Lesson 1 Mon.pdf.mark",
+        "an invented ink file fliederwolkenbank\n",
+    ),
+    (
+        "00 Week.json",
+        "{\"week\": \"an invented week fliederwolkenbank\"}\n",
+    ),
+    (
+        "Archive/2026/11/Lesson 0 Sun.pdf",
+        "%PDF-1.4 an old invented lesson fliederwolkenbank\n",
+    ),
+];
 
 /// One door at a time, as for the other doors over HTTP.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -73,6 +95,11 @@ fn sample(dir: &Path) {
     fs::write(reading.join("notes.md"), PRIVATE).unwrap();
     fs::create_dir_all(root.join("health")).unwrap();
     fs::write(root.join("health/invented-health.md"), PRIVATE).unwrap();
+    for (name, text) in LESSONS {
+        let file = root.join("lessons").join(name);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
     std::os::unix::fs::symlink(root.join("health"), book.join("sneaky")).unwrap();
     std::os::unix::fs::symlink(
         root.join("health/invented-health.md"),
@@ -150,6 +177,11 @@ impl Door {
     }
 
     fn open_with(name: &str, cap_hour: &str) -> Self {
+        Self::open_changed(name, cap_hour, &[])
+    }
+
+    /// A door with some settings changed from those of `settings`.
+    fn open_changed(name: &str, cap_hour: &str, change: &[(&str, &str)]) -> Self {
         let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = new_dir(name);
         sample(&dir);
@@ -163,6 +195,7 @@ impl Door {
         // The output of the door goes to a file, so T6 can search it.
         let out = fs::File::create(dir.join("door-output.txt")).unwrap();
         let mut child = program(&dir, cap_hour)
+            .envs(change.iter().copied())
             .args(["serve", "--http", &format!("127.0.0.1:{port}"), "--device"])
             .stdout(Stdio::from(out.try_clone().unwrap()))
             .stderr(Stdio::from(out))
@@ -714,7 +747,23 @@ fn the_doors_refuse_to_start_with_the_wrong_settings() {
                 ("ORGTHREAD_DEVICE_READ", ""),
                 ("ORGTHREAD_DEVICE_PATCH", ""),
             ],
-            "ORGTHREAD_DEVICE_READ or ORGTHREAD_DEVICE_PATCH",
+            "ORGTHREAD_DEVICE_READ, ORGTHREAD_DEVICE_PATCH or ORGTHREAD_DEVICE_LIST",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_LIST", "/lessons")],
+            "ORGTHREAD_DEVICE_LIST",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_LIST", "lessons/")],
+            "ORGTHREAD_DEVICE_LIST",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_LIST", "/lessons/../")],
+            "ORGTHREAD_DEVICE_LIST",
+        ),
+        (
+            vec![("ORGTHREAD_DEVICE_LIST", "/lessons//")],
+            "ORGTHREAD_DEVICE_LIST",
         ),
         (
             vec![("ORGTHREAD_DEVICE_READ", "/books")],
@@ -746,6 +795,19 @@ fn the_doors_refuse_to_start_with_the_wrong_settings() {
     let (code, said) = run(&[("ORGTHREAD_LOGIN_HASH", hash.as_str())], &full);
     assert_eq!(code, Some(2), "{said}");
     assert!(said.contains("--device"), "{said}");
+    // The same with only a list folder set.
+    let list_only = [
+        ("ORGTHREAD_LOGIN_HASH", hash.as_str()),
+        ("ORGTHREAD_DEVICE_READ", ""),
+        ("ORGTHREAD_DEVICE_PATCH", ""),
+        ("ORGTHREAD_DEVICE_LIST", "/lessons/"),
+    ];
+    let (code, said) = run(&list_only, &full);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(
+        said.contains("--device") && said.contains("ORGTHREAD_DEVICE_LIST"),
+        "{said}"
+    );
     // A broken file of tokens stops the door at its start.
     fs::create_dir_all(dir.join("state")).unwrap();
     fs::write(dir.join("state/devices.json"), "{ broken").unwrap();
@@ -939,5 +1001,181 @@ fn a_star_opens_the_book_folders_and_never_a_file_beside_them() {
     assert!(
         !list.contains(".epub") && list.contains("chapter-01.txt"),
         "{list}"
+    );
+}
+
+/// The settings of a door for an app `lessons` that may only list `/lessons/`.
+const LIST_ONLY: [(&str, &str); 5] = [
+    ("ORGTHREAD_DEVICE_APP", "lessons"),
+    ("ORGTHREAD_DEVICE_READ", ""),
+    ("ORGTHREAD_DEVICE_PATCH", ""),
+    ("ORGTHREAD_DEVICE_CAPPED", ""),
+    ("ORGTHREAD_DEVICE_LIST", "/lessons/"),
+];
+
+/// The files outside the sample folder that hold `word`, and how many files
+/// were searched.
+fn files_with(dir: &Path, word: &str) -> (usize, Vec<PathBuf>) {
+    let (mut searched, mut hits) = (0, Vec::new());
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(place) = stack.pop() {
+        for entry in fs::read_dir(&place).unwrap() {
+            let path = entry.unwrap().path();
+            if path == dir.join("root") {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                searched += 1;
+                if String::from_utf8_lossy(&fs::read(&path).unwrap()).contains(word) {
+                    hits.push(path);
+                }
+            }
+        }
+    }
+    (searched, hits)
+}
+
+#[test]
+fn a_door_with_only_a_list_folder_starts_lists_and_reads_nothing() {
+    // The door starts with ORGTHREAD_DEVICE_LIST alone: open_changed stops the
+    // test when the door stops at its start.
+    let door = Door::open_changed("list-only", "8", &LIST_ONLY);
+    let token = door.pair();
+
+    let (refused, list) = door.call(&token, "list", json!({"folders": ["/lessons/"]}));
+    assert!(!refused, "{list}");
+    assert!(list.starts_with("/lessons/:\n"), "{list}");
+    for name in [
+        "Lesson 1 Mon.pdf",
+        "Lesson 1 Mon.pdf.mark",
+        "00 Week.json",
+        "Archive/",
+    ] {
+        assert!(list.contains(name), "{name}: {list}");
+    }
+    let (refused, deeper) = door.call(
+        &token,
+        "list",
+        json!({"folders": ["/lessons/Archive/2026/11/"]}),
+    );
+    assert!(!refused && deeper.contains("Lesson 0 Sun.pdf"), "{deeper}");
+
+    // With fingerprint, each file shows the content hash that Dropbox reports.
+    let (refused, printed) = door.call(
+        &token,
+        "list",
+        json!({"folders": ["/lessons/", "/lessons/Archive/2026/11/"], "fingerprint": true}),
+    );
+    assert!(!refused, "{printed}");
+    for (name, text) in LESSONS {
+        let file_name = name.rsplit('/').next().unwrap();
+        let print = orgthread::fingerprint::fingerprint(text.as_bytes());
+        let line = printed
+            .lines()
+            .find(|l| l.ends_with(&format!("  {file_name}")))
+            .unwrap_or_else(|| panic!("no line for {name}: {printed}"));
+        assert!(
+            line.ends_with(&format!("{print}  {file_name}")),
+            "{name}: {line}"
+        );
+    }
+    let print = orgthread::fingerprint::fingerprint(LESSONS[0].1.as_bytes());
+    let shown = door.command(&[
+        "fingerprint",
+        &format!("{}{LESSON}", door.dir.join("root").display()),
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout).trim(),
+        print,
+        "the same as orgthread fingerprint"
+    );
+
+    // A read or a patch of any file in it is refused, as a closed path is.
+    let mut refusals = 0;
+    for (name, text) in LESSONS {
+        let file = format!("/lessons/{name}");
+        let (refused, said) = door.read(&token, &file);
+        assert!(
+            refused && said.starts_with("exit code 2\n"),
+            "{file}: {said}"
+        );
+        assert!(said.contains("may only list"), "{said}");
+        assert!(!said.contains(LESSON_MARKER), "{said}");
+        let (refused, said) = door.call(
+            &token,
+            "patch",
+            json!({"file": file, "append": "an invented line\n"}),
+        );
+        assert!(
+            refused && said.starts_with("exit code 2\n"),
+            "{file}: {said}"
+        );
+        assert_eq!(door.root_file(&file), text, "unchanged");
+        refusals += 2;
+    }
+    // Every other path stays closed.
+    for folder in ["/", "/books/", "/Lessons/", "/lessons/../books/"] {
+        assert!(
+            door.call(&token, "list", json!({"folders": [folder]})).0,
+            "{folder}"
+        );
+        refusals += 1;
+    }
+    assert!(door.read(&token, &format!("{BOOK}/chapter-01.txt")).0);
+    refusals += 1;
+
+    let log = door.log();
+    assert_eq!(log.matches("\trefused\t").count(), refusals, "{log}");
+    assert!(
+        log.contains(&format!("\trefused\t{LESSON}\ttablet (lessons)\t")),
+        "{log}"
+    );
+    let (searched, hits) = files_with(&door.dir, LESSON_MARKER);
+    assert!(searched >= 3, "searched {searched} files");
+    assert!(hits.is_empty(), "the text of a lesson is in {hits:?}");
+}
+
+#[test]
+fn a_list_costs_no_read_and_a_list_folder_beats_a_read_folder() {
+    let change = [
+        (
+            "ORGTHREAD_DEVICE_READ",
+            "/books/*/, /reading/glossary/, /reading/summaries/, /lessons/",
+        ),
+        ("ORGTHREAD_DEVICE_LIST", "/lessons/"),
+    ];
+    let door = Door::open_changed("list-cap", "1", &change);
+    let token = door.pair();
+    for _ in 0..3 {
+        let (refused, list) = door.call(
+            &token,
+            "list",
+            json!({"folders": ["/lessons/", BOOK], "fingerprint": true}),
+        );
+        assert!(!refused, "{list}");
+    }
+    // The cap of 1 is still free after the lists, and then full.
+    let (refused, text) = door.read(&token, &format!("{BOOK}/chapter-01.txt"));
+    assert!(!refused, "{text}");
+    let (refused, text) = door.read(&token, &format!("{BOOK}/chapter-02.txt"));
+    assert!(refused && text.contains("read cap"), "{text}");
+    let listed = door.command(&["device", "list"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("capped reads: 1 in 60 minutes"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    // ORGTHREAD_DEVICE_READ names /lessons/ too, and the list rule wins.
+    let (refused, said) = door.read(&token, LESSON);
+    assert!(refused && said.contains("may only list"), "{said}");
+    assert!(!said.contains(LESSON_MARKER));
+    // Beside it, a read folder reads as before: the glossary is not capped.
+    assert!(
+        !door
+            .read(&token, "/reading/glossary/an-invented-book/glossary-01.md")
+            .0
     );
 }

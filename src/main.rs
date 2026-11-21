@@ -58,7 +58,8 @@ For a chat with no shell:
 For a device, such as an e-reader, through a door of its own:
 
   orgthread serve --http <address> --device      only list, read and patch, on the paths of
-                                                 ORGTHREAD_DEVICE_READ and ORGTHREAD_DEVICE_PATCH
+                                                 ORGTHREAD_DEVICE_READ and ORGTHREAD_DEVICE_PATCH,
+                                                 and only list in ORGTHREAD_DEVICE_LIST
   orgthread device pair <name>                   a code of 8 signs for the device, in a terminal only
   orgthread device list                          the paired devices, with no token
   orgthread device revoke <name>                 ends the token of a device at once
@@ -166,8 +167,11 @@ Each path starts with /, has no //, no . and no .. part, and capitals count. A
 read folder opens what it holds for read and list, one level at a time, and *
 stands for one folder name: /books/*/ opens each folder in /books/, never a
 file directly in /books/, and a list of /books/ shows its folders only. A patch
-file opens for read and patch, never to make it. A link is never followed.
-Anything else is refused, code 2, with the log word refused. Reads of the files
+file opens for read and patch, never to make it. A list folder of
+ORGTHREAD_DEVICE_LIST opens what it holds for list only, with fingerprint, and
+a read or a patch of a file in it is refused, also where a read folder or a
+patch file names it. A link is never followed. Anything else is refused, code
+2, with the log word refused. Reads of the files
 of ORGTHREAD_DEVICE_CAPPED count for the read cap: 8 in 60 minutes and 40 in 24
 hours by default. Above it the door refuses, code 2, logs capped, and runs
 ORGTHREAD_DEVICE_NOTIFY once an hour. No request or response body is logged.
@@ -1081,9 +1085,10 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
         [flag, address] if flag == "--http" => {
             if device_settings_set() {
                 return Err(format!(
-                    "{} or {} is set, so this folder holds a device door. Start it with serve --http <address> --device, or remove those settings",
+                    "{}, {} or {} is set, so this folder holds a device door. Start it with serve --http <address> --device, or remove those settings",
                     settings::DEVICE_READ,
-                    settings::DEVICE_PATCH
+                    settings::DEVICE_PATCH,
+                    settings::DEVICE_LIST
                 ));
             }
             let base = settings::public_url();
@@ -1118,7 +1123,9 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
 /// True when a setting of a device door is set: then the full door refuses
 /// to start in this folder, so the two doors never share their settings.
 fn device_settings_set() -> bool {
-    !settings::device_read().trim().is_empty() || !settings::device_patch().trim().is_empty()
+    !settings::device_read().trim().is_empty()
+        || !settings::device_patch().trim().is_empty()
+        || !settings::device_list().trim().is_empty()
 }
 
 /// The file of the tokens and codes: `state/devices.json` beside the program,
@@ -1152,12 +1159,17 @@ fn device_door() -> Result<DeviceDoor, String> {
         ));
     }
     let app = device_app()?;
-    let rules = device::Rules::new(&settings::device_read(), &settings::device_patch());
+    let rules = device::Rules::new(
+        &settings::device_read(),
+        &settings::device_patch(),
+        &settings::device_list(),
+    );
     if rules.is_empty() {
         return Err(format!(
-            "a device door needs {} or {}: the paths a device may touch",
+            "a device door needs {}, {} or {}: the paths a device may touch",
             settings::DEVICE_READ,
-            settings::DEVICE_PATCH
+            settings::DEVICE_PATCH,
+            settings::DEVICE_LIST
         ));
     }
     let cap = device::Cap {

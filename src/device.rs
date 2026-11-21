@@ -8,7 +8,9 @@
 //! The rules of the door are strict, unlike the limits of the full door: each
 //! path starts with `/`, has no `//`, no `.` and no `..` part, and capitals
 //! count. A folder rule opens what lies inside it for `read` and `list`. A file
-//! rule opens the files it matches for `read` and `patch`, never more.
+//! rule opens the files it matches for `read` and `patch`, never more. A list
+//! rule opens what lies inside it for `list` only, and closes it to `read` and
+//! `patch`, also where a read or a patch rule covers it: the stricter wins.
 //!
 //! No function here reads a setting: the door hands each one in.
 
@@ -215,8 +217,9 @@ pub fn fits(rule: &str, path: &str) -> bool {
     rule.len() == path.len() && rule.iter().zip(&path).all(|(r, p)| glob(r, p))
 }
 
-/// The check of `ORGTHREAD_DEVICE_READ`: folders, each with `/` at both ends,
-/// where `*` may stand for any part of one folder name.
+/// The check of `ORGTHREAD_DEVICE_READ` and `ORGTHREAD_DEVICE_LIST`: folders,
+/// each with `/` at both ends, where `*` may stand for any part of one folder
+/// name.
 pub fn check_folders(list: &str) -> Result<(), String> {
     for rule in split(list) {
         clean(&rule)?;
@@ -235,6 +238,21 @@ fn parts(path: &str) -> Vec<&str> {
     path.trim_matches('/').split('/').collect()
 }
 
+/// True when the parts of `path` start with the parts of one of the folder
+/// `rules`, each part fitting. With `deeper`, the path must also go on below
+/// the rule, as a file in it does. A `*` covers one part, never a `/`.
+fn under_a_rule(rules: &[String], path: &[&str], deeper: bool) -> bool {
+    rules.iter().any(|rule| {
+        let rule = parts(rule);
+        let long_enough = if deeper {
+            path.len() > rule.len()
+        } else {
+            path.len() >= rule.len()
+        };
+        long_enough && rule.iter().zip(path).all(|(r, p)| glob(r, p))
+    })
+}
+
 /// The check of `ORGTHREAD_DEVICE_PATCH` and `ORGTHREAD_DEVICE_CAPPED`: files,
 /// where `*` may stand for any part of a name.
 pub fn check_files(list: &str) -> Result<(), String> {
@@ -250,8 +268,8 @@ pub fn check_files(list: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// What a device may touch: the folders it may read and list, and the files it
-/// may read and patch. Anything else is closed.
+/// What a device may touch: the folders it may read and list, the files it may
+/// read and patch, and the folders it may only list. Anything else is closed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rules {
     /// Folders, each with `/` at both ends, where `*` stands for any part of
@@ -260,6 +278,9 @@ pub struct Rules {
     pub read: Vec<String>,
     /// Files, where `*` stands for any part of a name.
     pub patch: Vec<String>,
+    /// Folders in the form of `read`, open to `list` only. A file in them is
+    /// closed to `read` and `patch`, even where `read` or `patch` names it.
+    pub list: Vec<String>,
 }
 
 /// How much of a folder a device may list.
@@ -273,37 +294,38 @@ pub enum Listing {
 }
 
 impl Rules {
-    pub fn new(read: &str, patch: &str) -> Rules {
+    pub fn new(read: &str, patch: &str, list: &str) -> Rules {
         Rules {
             read: split(read),
             patch: split(patch),
+            list: split(list),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.read.is_empty() && self.patch.is_empty()
-    }
-
-    /// True when the parts of `path` start with the parts of a read rule, each
-    /// part fitting, and go on below it. A `*` covers one part, never a `/`.
-    fn under_read_rule(&self, path: &[&str], deeper: bool) -> bool {
-        self.read.iter().any(|rule| {
-            let rule = parts(rule);
-            let long_enough = if deeper {
-                path.len() > rule.len()
-            } else {
-                path.len() >= rule.len()
-            };
-            long_enough && rule.iter().zip(path).all(|(r, p)| glob(r, p))
-        })
+        self.read.is_empty() && self.patch.is_empty() && self.list.is_empty()
     }
 
     fn in_read_folder(&self, path: &str) -> bool {
-        self.under_read_rule(&parts(path), true)
+        under_a_rule(&self.read, &parts(path), true)
+    }
+
+    /// True when `path` lies in a folder of the list rules: then it is closed
+    /// to `read` and `patch`, whatever the other rules say.
+    fn in_list_folder(&self, path: &str) -> bool {
+        under_a_rule(&self.list, &parts(path), true)
     }
 
     fn in_patch_files(&self, path: &str) -> bool {
         self.patch.iter().any(|rule| fits(rule, path))
+    }
+
+    /// The refusal of a read or a patch in a folder of the list rules.
+    fn list_only(path: &str) -> String {
+        format!(
+            "{} lies in a folder that this door may only list, not read or patch",
+            shown(path)
+        )
     }
 
     /// `Ok` when a device may read the file `path`.
@@ -311,6 +333,9 @@ impl Rules {
         clean(path)?;
         if path.ends_with('/') {
             return Err(format!("{} names a folder, not a file", shown(path)));
+        }
+        if self.in_list_folder(path) {
+            return Err(Rules::list_only(path));
         }
         if self.in_read_folder(path) || self.in_patch_files(path) {
             return Ok(());
@@ -324,6 +349,9 @@ impl Rules {
     /// `Ok` when a device may patch the file `path`.
     pub fn patch(&self, path: &str) -> Result<(), String> {
         clean(path)?;
+        if self.in_list_folder(path) {
+            return Err(Rules::list_only(path));
+        }
         if self.in_patch_files(path) {
             return Ok(());
         }
@@ -337,15 +365,15 @@ impl Rules {
     }
 
     /// How much a device may list of `folder`, given with or without its last
-    /// `/`: all of a read folder or a folder inside one, and only the folder
-    /// names of the folder right above the `*` of a rule.
+    /// `/`: all of a read or list folder or a folder inside one, and only the
+    /// folder names of the folder right above the `*` of a rule.
     pub fn list(&self, folder: &str) -> Result<Listing, String> {
         clean(folder)?;
         let asked = parts(folder);
-        if self.under_read_rule(&asked, false) {
+        if under_a_rule(&self.read, &asked, false) || under_a_rule(&self.list, &asked, false) {
             return Ok(Listing::All);
         }
-        let above_a_star = self.read.iter().any(|rule| {
+        let above_a_star = self.read.iter().chain(&self.list).any(|rule| {
             let rule = parts(rule);
             let star = rule.iter().position(|part| part.contains('*'));
             star == Some(asked.len()) && rule[..asked.len()] == asked[..]
@@ -779,7 +807,7 @@ mod tests {
     const PATCH: &str = "/notes/progress-*.md";
 
     fn rules() -> Rules {
-        Rules::new(READ, PATCH)
+        Rules::new(READ, PATCH, "")
     }
 
     fn folder(name: &str) -> PathBuf {
@@ -860,7 +888,7 @@ mod tests {
 
     #[test]
     fn a_star_folder_opens_each_folder_in_it_and_no_file_beside_them() {
-        let r = Rules::new("/books/*/", "");
+        let r = Rules::new("/books/*/", "", "");
         assert!(r.read("/books/an-invented-book/chapter-01.txt").is_ok());
         assert!(r.read("/books/an-invented-book/deeper/notes.txt").is_ok());
         for closed in [
@@ -880,7 +908,7 @@ mod tests {
             assert!(r.list(closed).is_err(), "{closed}");
         }
         // A star in the middle covers one folder name, never a `/`.
-        let middle = Rules::new("/a/*-book/b/", "");
+        let middle = Rules::new("/a/*-book/b/", "", "");
         assert!(middle.read("/a/one-book/b/x.txt").is_ok());
         assert!(middle.read("/a/one/two-book/b/x.txt").is_err());
         assert!(middle.read("/a/one-book/x.txt").is_err());
@@ -898,6 +926,83 @@ mod tests {
         assert!(!fits("/a/progress-*.md", "/a/b/progress-x.md"));
         assert!(!fits("/a/progress-*.md", "/a/progress-x.mdx"));
         assert!(!fits("/a/*", "/a/b/c"));
+    }
+
+    #[test]
+    fn a_list_folder_opens_list_and_closes_read_and_patch() {
+        let r = Rules::new("", "", "/lessons/");
+        assert!(!r.is_empty(), "a list rule alone is a rule");
+        assert_eq!(r.list("/lessons/"), Ok(Listing::All));
+        assert_eq!(r.list("/lessons"), Ok(Listing::All));
+        assert_eq!(r.list("/lessons/Archive/2026/"), Ok(Listing::All));
+        let only = "may only list, not read or patch";
+        for file in [
+            "/lessons/Lesson 1 Mon.pdf",
+            "/lessons/Lesson 1 Mon.pdf.mark",
+            "/lessons/00 Week.json",
+            "/lessons/Archive/2026/11/Lesson 0 Sun.pdf",
+        ] {
+            assert!(r.read(file).unwrap_err().contains(only), "{file}");
+            assert!(r.patch(file).unwrap_err().contains(only), "{file}");
+        }
+        for closed in ["/", "/Lessons/", "/lessonsx/", "/books/"] {
+            assert!(r.list(closed).is_err(), "{closed}");
+        }
+        for trick in [
+            "/lessons/../books/a.txt",
+            "/lessons//a.pdf",
+            "lessons/a.pdf",
+            "/Lessons/a.pdf",
+        ] {
+            assert!(r.read(trick).is_err(), "{trick}");
+        }
+        assert!(r.list("/lessons/..").is_err());
+        assert!(r.read("/books/a.txt").unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn where_list_and_read_or_patch_meet_the_stricter_wins() {
+        // The same folder in both, a list folder inside a read folder, and a
+        // patch file inside a list folder: all closed to read and patch.
+        let r = Rules::new(
+            "/lessons/, /books/",
+            "/books/a/progress-*.md",
+            "/lessons/, /books/a/",
+        );
+        let only = "may only list, not read or patch";
+        assert!(r.read("/lessons/a.pdf").unwrap_err().contains(only));
+        assert!(
+            r.read("/books/a/chapter-01.txt")
+                .unwrap_err()
+                .contains(only)
+        );
+        assert!(r.read("/books/a/progress-1.md").unwrap_err().contains(only));
+        assert!(
+            r.patch("/books/a/progress-1.md")
+                .unwrap_err()
+                .contains(only)
+        );
+        assert_eq!(r.list("/books/a/"), Ok(Listing::All));
+        // Beside the list folder, the read rule holds as before.
+        assert!(r.read("/books/b/chapter-01.txt").is_ok());
+        assert!(r.read("/books/a.epub").is_ok());
+        // A read folder inside a list folder opens nothing either.
+        let inside = Rules::new("/lessons/open/", "", "/lessons/");
+        assert!(
+            inside
+                .read("/lessons/open/a.md")
+                .unwrap_err()
+                .contains(only)
+        );
+    }
+
+    #[test]
+    fn a_star_in_a_list_rule_works_as_in_a_read_rule() {
+        let r = Rules::new("", "", "/lessons/*/");
+        assert_eq!(r.list("/lessons/"), Ok(Listing::FoldersOnly));
+        assert_eq!(r.list("/lessons/week-47/"), Ok(Listing::All));
+        assert!(r.read("/lessons/week-47/a.pdf").is_err());
+        assert!(r.list("/").is_err());
     }
 
     #[test]
