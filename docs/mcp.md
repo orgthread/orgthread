@@ -146,7 +146,7 @@ The remote server keeps its logins in `state/logins.json`, so that they outlive 
 |---|---|
 | `owner` | A hash that ties the file to this address and this password |
 | `clients` | The id of each client that registered, at most 100 |
-| `access` | The SHA-256 of each live access token, and when it ends |
+| `access` | The SHA-256 of each live access token, its client, and when it ends |
 | `refresh` | The SHA-256 of each live refresh token, its client, and when it ends |
 
 An access token lasts 1 hour. A refresh token lasts 30 days and works once, as each refresh gives a new pair.
@@ -160,3 +160,58 @@ To end every login at once, do one of these:
 - Change the public address.
 
 With a file that is missing, broken or made for another address or password, chats log in again. Nothing else breaks. If the file cannot be saved, the server removes it, so that a used token can never come back after a restart.
+
+An older version kept an access token as a plain number, with no client. Such a file is still read, so nobody has to log in again. A token in that form shows the client `?` in the sign-in log until its next renewal, at most 1 hour later.
+
+### The sign-in log
+
+The remote server writes one line for each step of a login and for each call. The lines go into one file per month, such as `state/door-2026-11.log`, in the folder of the write log (`ORGTHREAD_LOG`). The month is the month in UTC. Only the owner may read a file (mode 600). Only `serve --http` writes these files. A device door, the local door and a download or upload link write none.
+
+A line has six fields with a tab between them, and a dash for an empty field: the time in UTC, the word, the client, the detail, the exit code, and the time the call took in milliseconds.
+
+```text
+2026-11-23 12:14:58Z	renewed	3f9a1c2e	-	-	-
+2026-11-23 12:15:02Z	call	3f9a1c2e	read	0	140
+2026-11-23 12:15:40Z	call	3f9a1c2e	patch	4	31200
+2026-11-23 12:16:05Z	no-token	-	-	-	-
+2026-11-23 12:16:06Z	renew-refused	3f9a1c2e	used-or-unknown	-	-
+2026-11-23 12:20:00Z	wrong-password	3f9a1c2e	-	-	-
+2026-12-01 00:00:03Z	deleted-old	-	door-2025-11.log	-	-
+```
+
+| Word | When | Detail |
+|---|---|---|
+| `registered` | A chat app named itself and got a client id | |
+| `signed-in` | The password was right, or a login code gave the first tokens | `password` or `code` |
+| `wrong-password` | The password was wrong | |
+| `lock-started` | The fifth wrong password in 15 minutes locked the login | |
+| `still-locked` | A password came in while the login was locked | |
+| `unknown-client` | The login page was asked for by a client the server does not know | |
+| `bad-request` | Any other refused request of a client id, the login page or the token door | `redirect-uri`, `response-type`, `pkce`, `resource` or `grant-type` |
+| `code-refused` | A login code gave no tokens | `used-or-unknown`, `expired` or `mismatch` |
+| `renewed` | A refresh token gave a new pair of tokens | |
+| `renew-refused` | A refresh token gave nothing | `used-or-unknown`, `expired` or `other-client` |
+| `no-token` | A call came with no access token | |
+| `bad-token` | A call came with an access token that is not live | |
+| `call` | A call with a live access token got its answer | the tool, or the method, such as `initialize` |
+| `deleted-old` | The server deleted a month file older than 12 months | the file name |
+| `not-deleted` | A month file older than 12 months could not be deleted, or is not a plain file | the file name |
+| `skipped` | Refused lines were left out in the hour before | how many |
+
+The client is the first 8 signs of the client id. A client id from a request keeps only the signs `0` to `9` and `a` to `f`, and shows `?` when none is left. A refresh token that is past its time is dropped when the server starts and when it makes a new pair, so it then shows `used-or-unknown`, not `expired`.
+
+A `call` line of a tool shows its exit code: `0` when it worked, the exit code of the command when it was refused, or the code of the protocol, such as `-32602`, for a call that was wrong. A dash means there is no code, for example when the command could not start. A call of another method has a dash for the exit code. A call that is not a POST names its HTTP method, such as `GET`, and has a dash for the time. A tool or method that the server does not know shows as `?`.
+
+A line never holds a token, a refresh token, a password, a login code, the hash of any of them, the secret path, a file path or a text of a note.
+
+The server keeps 12 months. When it starts, and at the first line of a new month, it deletes each plain file named `door-YYYY-MM.log` in that folder whose month lies more than 12 months back. On 1 December 2026 it deletes `door-2025-11.log` and keeps `door-2025-12.log`. It deletes no other file, and never a link or a folder.
+
+A stranger can cause many refused lines. So the server writes at most 600 refused lines per clock hour. A `skipped` line at the start of the next hour says how many it left out. The lines of `registered`, `signed-in`, `lock-started`, `renewed`, `call` and of the delete always go in.
+
+When a line cannot be written, for example on a full disk, the request still gets its answer. The server then writes one line to standard error, which is the journal of the service, at most once a minute.
+
+To see the last lines:
+
+```bash
+tail -n 20 state/door-2026-11.log
+```
