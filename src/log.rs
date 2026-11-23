@@ -19,7 +19,7 @@ pub fn utc_now() -> String {
 }
 
 /// Days to a civil date, after Howard Hinnant's `civil_from_days`.
-fn utc_text(seconds: u64) -> String {
+pub(crate) fn utc_text(seconds: u64) -> String {
     let z = (seconds / 86_400) as i64 + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;

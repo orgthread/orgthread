@@ -14,6 +14,7 @@ pub mod copy;
 pub mod delete;
 pub mod device;
 pub mod device_door;
+pub mod door_log;
 pub mod dropbox;
 pub mod envfile;
 pub mod fingerprint;
