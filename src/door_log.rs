@@ -108,6 +108,15 @@ fn month_number(name: &str) -> Option<i64> {
     (1..=12).contains(&month).then_some(year * 12 + month - 1)
 }
 
+/// The folder of a write log, where the door log goes too. A bare file name means
+/// the folder the program runs in.
+pub fn folder_of(log: &Path) -> PathBuf {
+    match log.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 pub type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
 pub type Journal = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -505,6 +514,14 @@ mod tests {
             place.lines("2026-12"),
             ["2026-12-01 00:00:03Z\tnot-deleted\t-\tdoor-2020-01.log\t-\t-"]
         );
+    }
+
+    #[test]
+    fn the_door_log_goes_into_the_folder_of_the_write_log() {
+        let folder = |log: &str| folder_of(Path::new(log));
+        assert_eq!(folder("/srv/state/writes.log"), Path::new("/srv/state"));
+        assert_eq!(folder("state/writes.log"), Path::new("state"));
+        assert_eq!(folder("writes.log"), Path::new("."));
     }
 
     #[test]

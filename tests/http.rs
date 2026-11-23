@@ -24,6 +24,8 @@ struct Door {
     _turn: MutexGuard<'static, ()>,
     port: u16,
     root: PathBuf,
+    /// The write log. The door writes its sign-in log into the same folder.
+    log: PathBuf,
     child: Child,
 }
 
@@ -45,14 +47,14 @@ fn encode(text: &str) -> String {
 }
 
 /// Starts the program, and returns once it answers.
-fn start(port: u16, base: &str, root: &Path) -> Child {
+fn start(port: u16, base: &str, root: &Path, log: &Path) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_orgthread"))
         .args(["serve", "--http", &format!("127.0.0.1:{port}")])
         .env("ORGTHREAD_PUBLIC_URL", base)
         .env("ORGTHREAD_LOGIN_HASH", password_hash(PASSWORD))
         .env("ORGTHREAD_ROOT", root)
         .env("ORGTHREAD_LOCK_DIR", root.join("org/.locks"))
-        .env("ORGTHREAD_LOG", root.join("log"))
+        .env("ORGTHREAD_LOG", log)
         .env("ORGTHREAD_READS", root.join("reads"))
         .env("ORGTHREAD_VERSIONS", root.join("versions"))
         .env("ORGTHREAD_LOGINS", root.join("logins.json"))
@@ -76,6 +78,10 @@ impl Door {
         Self::open_at(name, BASE)
     }
     fn open_at(name: &str, base: &str) -> Self {
+        Self::open_with_log(name, base, "log")
+    }
+    /// A door whose write log is `log` inside its test folder.
+    fn open_with_log(name: &str, base: &str, log: &str) -> Self {
         let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let root =
             std::env::temp_dir().join(format!("orgthread-http-{name}-{}", std::process::id()));
@@ -91,11 +97,13 @@ impl Door {
             TcpListener::bind(("127.0.0.1", port)).is_ok(),
             "port {port} is busy"
         );
-        let child = start(port, base, &root);
+        let log = root.join(log);
+        let child = start(port, base, &root, &log);
         Door {
             _turn: turn,
             port,
             root,
+            log,
             child,
         }
     }
@@ -181,7 +189,7 @@ impl Door {
     fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.child = start(self.port, BASE, &self.root);
+        self.child = start(self.port, BASE, &self.root, &self.log);
     }
     fn mcp(&self, token: &str, message: &Value) -> Reply {
         let extra = format!("Authorization: Bearer {token}\r\n");
@@ -1023,4 +1031,222 @@ fn a_link_never_holds_the_secret_path_of_the_door() {
         404
     );
     assert_eq!(d.bytes("GET", &link, "", b"").body, picture(10));
+}
+
+/// The lines of the sign-in log of the door, from each month file in the folder of
+/// its write log.
+fn door_lines(d: &Door) -> Vec<Vec<String>> {
+    let folder = d.log.parent().unwrap();
+    let mut files: Vec<PathBuf> = fs::read_dir(folder)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name.starts_with("door-") && name.ends_with(".log")
+        })
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no month file in {}", folder.display());
+    files
+        .iter()
+        .flat_map(|f| {
+            fs::read_to_string(f)
+                .unwrap()
+                .lines()
+                .map(|l| l.split('\t').map(str::to_string).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn a_whole_login_and_its_calls_leave_their_lines_and_no_secret() {
+    let d = Door::open_at("door-log", SECRET_BASE);
+    let at = |path: &str| format!("{SECRET}{path}");
+    let reg = d.raw(
+        "POST",
+        &at("/register"),
+        "",
+        &json!({"redirect_uris": [REDIRECT]}).to_string(),
+    );
+    let v: Value = serde_json::from_str(&reg.body).unwrap();
+    let client = v["client_id"].as_str().unwrap().to_string();
+    let resource = encode(&format!("{SECRET_BASE}/mcp"));
+    let query = format!(
+        "client_id={client}&redirect_uri={}&response_type=code&code_challenge={}&code_challenge_method=S256&resource={resource}",
+        encode(REDIRECT),
+        challenge_of("v4")
+    );
+    assert_eq!(
+        d.raw("GET", &at(&format!("/authorize?{query}")), "", "")
+            .status,
+        200
+    );
+    let wrong = d.raw(
+        "POST",
+        &at("/authorize"),
+        "",
+        &format!("{query}&password=not+it"),
+    );
+    assert_eq!(wrong.status, 401);
+    let sent = d.raw(
+        "POST",
+        &at("/authorize"),
+        "",
+        &format!("{query}&password={}", encode(PASSWORD)),
+    );
+    let location = sent
+        .head
+        .lines()
+        .find_map(|l| l.strip_prefix("Location: "))
+        .unwrap();
+    let code = location
+        .split("code=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let token = d.raw(
+        "POST",
+        &at("/token"),
+        "",
+        &format!(
+            "grant_type=authorization_code&code={code}&client_id={client}&redirect_uri={}&code_verifier=v4&resource={resource}",
+            encode(REDIRECT)
+        ),
+    );
+    let v: Value = serde_json::from_str(&token.body).unwrap();
+    let access = v["access_token"].as_str().unwrap().to_string();
+    let refresh = v["refresh_token"].as_str().unwrap().to_string();
+
+    let mcp = |token: &str, message: Value| {
+        let extra = if token.is_empty() {
+            String::new()
+        } else {
+            format!("Authorization: Bearer {token}\r\n")
+        };
+        d.raw("POST", &at("/mcp"), &extra, &message.to_string())
+    };
+    assert_eq!(mcp("", json!({})).status, 401);
+    assert_eq!(mcp("not-a-live-token", json!({})).status, 401);
+    let extra = format!("Authorization: Bearer {access}\r\n");
+    assert_eq!(d.raw("GET", &at("/mcp"), &extra, "").status, 405);
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+    assert_eq!(mcp(&access, init).status, 200);
+    let note_text = "an invented line of a note";
+    let write = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write",
+        "arguments":{"who":"a","file":d.file(),"text":note_text}}});
+    assert_eq!(mcp(&access, write).status, 200);
+    let missing = d.root.join("org/notes/missing.md");
+    let read = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read",
+        "arguments":{"who":"a","file":missing}}});
+    let r = mcp(&access, read);
+    let reply: Value = serde_json::from_str(&r.body).unwrap();
+    let exit = text_of(&reply)
+        .strip_prefix("exit code ")
+        .unwrap()
+        .split('\n')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let renew = |refresh: &str| {
+        d.raw(
+            "POST",
+            &at("/token"),
+            "",
+            &format!("grant_type=refresh_token&refresh_token={refresh}&client_id={client}"),
+        )
+    };
+    let renewed = renew(&refresh);
+    assert_eq!(renewed.status, 200);
+    let v: Value = serde_json::from_str(&renewed.body).unwrap();
+    let (access2, refresh2) = (
+        v["access_token"].as_str().unwrap().to_string(),
+        v["refresh_token"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(renew(&refresh).status, 400);
+
+    let lines = door_lines(&d);
+    let tag = &client[..8];
+    let short: Vec<String> = lines.iter().map(|l| l[1..5].join(" ")).collect();
+    assert_eq!(
+        short,
+        [
+            format!("registered {tag} - -"),
+            format!("wrong-password {tag} - -"),
+            format!("signed-in {tag} password -"),
+            format!("signed-in {tag} code -"),
+            "no-token - - -".to_string(),
+            "bad-token - - -".to_string(),
+            format!("call {tag} GET -"),
+            format!("call {tag} initialize -"),
+            format!("call {tag} write 0"),
+            format!("call {tag} read {exit}"),
+            format!("renewed {tag} - -"),
+            format!("renew-refused {tag} used-or-unknown -"),
+        ]
+    );
+    assert_ne!(exit, "0");
+    for line in &lines {
+        assert_eq!(line.len(), 6, "{line:?}");
+        assert!(line[0].ends_with('Z'), "{line:?}");
+        if line[1] == "call" && line[3] != "GET" {
+            assert!(line[5].parse::<u64>().is_ok(), "{line:?}");
+        } else {
+            assert_eq!(line[5], "-", "{line:?}");
+        }
+    }
+
+    // No secret, no path and no text of a note, in any form.
+    let text = fs::read_to_string(
+        d.log
+            .parent()
+            .unwrap()
+            .join(format!("door-{}.log", &lines.last().unwrap()[0][..7])),
+    )
+    .unwrap();
+    let mut secrets = vec![
+        PASSWORD.to_string(),
+        encode(PASSWORD),
+        "not it".to_string(),
+        code.to_string(),
+        access.clone(),
+        refresh.clone(),
+        access2,
+        refresh2,
+        "not-a-live-token".to_string(),
+    ];
+    secrets.extend(secrets.clone().iter().map(|s| password_hash(s)));
+    secrets.extend([
+        SECRET.to_string(),
+        client.clone(),
+        note_text.to_string(),
+        d.file(),
+        "invented.md".to_string(),
+        "missing.md".to_string(),
+        d.root.to_string_lossy().to_string(),
+    ]);
+    for secret in &secrets {
+        assert!(
+            !text.contains(secret.as_str()),
+            "{secret} is in the log:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn a_door_whose_log_cannot_be_written_still_answers() {
+    // A file stands where the folder of the logs goes.
+    let d = Door::open_with_log("door-log-blocked", BASE, "blocked/log");
+    fs::write(d.root.join("blocked"), "").unwrap();
+    let t = d.log_in();
+    let r = d.call(&t, "version", json!({}));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let names: Vec<String> = fs::read_dir(&d.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("door-")), "{names:?}");
 }

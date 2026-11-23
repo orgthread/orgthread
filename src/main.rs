@@ -3,7 +3,7 @@ use orgthread::copy;
 use orgthread::delete;
 use orgthread::device;
 use orgthread::device_door::{self, DeviceDoor};
-use orgthread::door_log::DoorLog;
+use orgthread::door_log::{self, DoorLog};
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::{Fingerprinter, fingerprint};
 use orgthread::list::{self, Options, Target};
@@ -1065,11 +1065,7 @@ fn logins_file() -> Result<PathBuf, String> {
 /// Where the claude.ai door keeps its sign-in log: the folder of the write log, so
 /// `state` beside the program unless ORGTHREAD_LOG names another file.
 fn door_log_folder() -> Result<PathBuf, String> {
-    let log = settings::log(&program_folder()?);
-    Ok(match log.parent() {
-        Some(folder) if !folder.as_os_str().is_empty() => folder.to_path_buf(),
-        _ => PathBuf::from("."),
-    })
+    Ok(door_log::folder_of(&settings::log(&program_folder()?)))
 }
 
 /// Where the door may listen. It speaks plain HTTP, so only on this machine, unless
