@@ -4,6 +4,7 @@
 //! So there is no second copy of the rules: the lock, the checks, the log and every
 //! refusal are the ones of the command.
 
+use crate::door_log::Word;
 use crate::login::{Login, Refused};
 use crate::search;
 use crate::transfer::{self, Direction, Links, Taken};
@@ -13,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Used only when a client names no version of the protocol.
 const VERSION: &str = "2025-06-18";
@@ -260,25 +261,109 @@ fn handle(mut stream: TcpStream, login: &Login, exe: &Path, remote: &Remote) -> 
             Err(word) => respond_json(&mut stream, "400 Bad Request", &json!({"error": word})),
         },
         (_, "/mcp") => {
-            if !login.allows(bearer) {
+            let Some(client) = caller(login, bearer) else {
                 let extra = format!("WWW-Authenticate: {}\r\n", login.challenge_header());
                 return respond(&mut stream, "401 Unauthorized", &extra, b"");
-            }
+            };
             if method != "POST" {
+                login.note(Word::Call, &client, http_method(method), "", "");
                 return respond(&mut stream, "405 Method Not Allowed", "", b"");
             }
-            let answered = match serde_json::from_slice::<Value>(&body) {
-                Ok(message) => answer(&message, exe, Some(remote)),
+            let started = Instant::now();
+            let message = serde_json::from_slice::<Value>(&body);
+            let answered = match &message {
+                Ok(message) => answer(message, exe, Some(remote)),
                 Err(e) => Some(problem(Value::Null, NOT_JSON, &e.to_string())),
             };
-            match answered {
+            let ms = started.elapsed().as_millis().to_string();
+            let (detail, code) = call_fields(message.as_ref().ok(), answered.as_ref());
+            let sent = match answered {
                 Some(reply) => respond_json(&mut stream, "200 OK", &reply),
                 // A notification wants no answer.
                 None => respond(&mut stream, "202 Accepted", "", b""),
-            }
+            };
+            // After the answer, so a slow disk never holds it up.
+            login.note(Word::Call, &client, detail, &code, &ms);
+            sent
         }
         _ => respond(&mut stream, "404 Not Found", "", b""),
     }
+}
+
+/// The client of a live access token. A refusal gets its line: `no-token` with
+/// no token at all, `bad-token` with one that is not live.
+fn caller(login: &Login, bearer: &str) -> Option<String> {
+    let client = login.client_of(bearer);
+    if client.is_none() {
+        let word = if bearer.is_empty() {
+            Word::NoToken
+        } else {
+            Word::BadToken
+        };
+        login.note(word, "", "", "", "");
+    }
+    client
+}
+
+/// The tools a call line may name. Any other name shows as `?`.
+const TOOL_NAMES: [&str; 11] = [
+    "read", "write", "patch", "download", "upload", "version", "delete", "copy", "move", "search",
+    "list",
+];
+
+/// The methods a call line may name. Any other shows as `?`.
+const METHODS: [&str; 5] = [
+    "initialize",
+    "ping",
+    "tools/list",
+    "notifications/initialized",
+    "notifications/cancelled",
+];
+
+/// A method of HTTP other than POST, as a call line names it.
+fn http_method(method: &str) -> &'static str {
+    ["GET", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+        .into_iter()
+        .find(|m| *m == method)
+        .unwrap_or("?")
+}
+
+/// The detail and the exit code of a call line. A tool call names the tool and its
+/// exit code: 0, the code of the command, the JSON-RPC code of a refused call, or
+/// a dash when there is none. Any other message names its method, with a dash. Only
+/// names from a fixed list go in, never another value of the request.
+fn call_fields(message: Option<&Value>, reply: Option<&Value>) -> (&'static str, String) {
+    let pick = |name: Option<&str>, known: &[&'static str]| {
+        known
+            .iter()
+            .copied()
+            .find(|k| Some(*k) == name)
+            .unwrap_or("?")
+    };
+    let method = message.and_then(|m| m["method"].as_str());
+    if method != Some("tools/call") {
+        return (pick(method, &METHODS), String::new());
+    }
+    let tool = pick(
+        message.and_then(|m| m["params"]["name"].as_str()),
+        &TOOL_NAMES,
+    );
+    let Some(reply) = reply else {
+        return (tool, String::new());
+    };
+    if let Some(code) = reply["error"]["code"].as_i64() {
+        return (tool, code.to_string());
+    }
+    if reply["result"]["isError"] == false {
+        return (tool, "0".to_string());
+    }
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap_or("");
+    let code = text
+        .strip_prefix("exit code ")
+        .and_then(|rest| rest.split('\n').next())
+        .and_then(|n| n.parse::<i32>().ok())
+        .map_or(String::new(), |n| n.to_string());
+    (tool, code)
 }
 
 pub(crate) fn problem(id: Value, code: i32, message: &str) -> Value {
@@ -1229,6 +1314,128 @@ fn send_file(stream: &mut TcpStream, link: &transfer::Link, exe: &Path) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::door_log::DoorLog;
+    use crate::login::{challenge_of, parse_form, password_hash};
+
+    #[test]
+    fn a_call_line_may_name_each_tool_of_the_remote_door_and_no_other() {
+        let mut listed: Vec<String> = tools(true)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        listed.sort();
+        let mut known: Vec<String> = TOOL_NAMES.iter().map(|t| t.to_string()).collect();
+        known.sort();
+        assert_eq!(listed, known);
+    }
+
+    fn fields(message: Value, reply: Option<Value>) -> (&'static str, String) {
+        call_fields(Some(&message), reply.as_ref())
+    }
+
+    fn tool_call(name: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}})
+    }
+
+    fn said(text: &str, refused: bool) -> Option<Value> {
+        let result = json!({"content": [{"type": "text", "text": text}], "isError": refused});
+        Some(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+    }
+
+    #[test]
+    fn a_tool_call_line_names_the_tool_and_its_exit_code() {
+        assert_eq!(
+            fields(tool_call("read"), said("a text", false)),
+            ("read", "0".into())
+        );
+        let refused = said("exit code 4\nthe file changed", true);
+        assert_eq!(fields(tool_call("patch"), refused), ("patch", "4".into()));
+        let failed = said("could not start the command: no such file", true);
+        assert_eq!(fields(tool_call("read"), failed), ("read", String::new()));
+        let wrong = Some(problem(json!(1), INVALID_PARAMS, "read needs who"));
+        assert_eq!(fields(tool_call("read"), wrong), ("read", "-32602".into()));
+        assert_eq!(fields(tool_call("read"), None), ("read", String::new()));
+    }
+
+    #[test]
+    fn a_call_line_keeps_no_name_from_the_request_that_it_does_not_know() {
+        let evil = tool_call("read\tsecret/path.org\n");
+        assert_eq!(fields(evil, said("x", false)).0, "?");
+        assert_eq!(fields(tool_call("rm"), said("x", true)).0, "?");
+        let odd = json!({"jsonrpc": "2.0", "id": 1, "method": "/home/someone/notes"});
+        assert_eq!(fields(odd, None), ("?", String::new()));
+        assert_eq!(call_fields(None, None), ("?", String::new()));
+        assert_eq!(fields(json!([1, 2]), None), ("?", String::new()));
+        assert_eq!(http_method("GET"), "GET");
+        assert_eq!(http_method("G\tET"), "?");
+    }
+
+    #[test]
+    fn a_message_that_is_not_a_tool_call_names_its_method_with_a_dash() {
+        for method in METHODS {
+            let message = json!({"jsonrpc": "2.0", "id": 1, "method": method});
+            let reply = Some(json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+            assert_eq!(fields(message, reply), (method, String::new()));
+        }
+    }
+
+    /// A door with its sign-in log in a test folder of its own.
+    struct Place(std::path::PathBuf);
+    impl Drop for Place {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_call_with_no_token_or_a_dead_one_is_refused_with_its_word() {
+        let dir = std::env::temp_dir().join(format!("orgthread-serve-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let place = Place(dir);
+        let login =
+            Login::new("https://door.test", &password_hash("pw")).with_log(DoorLog::new(&place.0));
+        assert_eq!(caller(&login, ""), None);
+        assert_eq!(caller(&login, "not a live token"), None);
+
+        // A live token gives its client and no line.
+        let r = login
+            .register(&json!({"redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]}))
+            .unwrap();
+        let client = r["client_id"].as_str().unwrap();
+        let request = format!(
+            "client_id={client}&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&response_type=code&code_challenge={}&code_challenge_method=S256&password=pw",
+            challenge_of("v")
+        );
+        let back = login.approve(&request).unwrap();
+        let code = &parse_form(back.split_once('?').unwrap().1)["code"];
+        let t = login
+            .token(&format!(
+                "grant_type=authorization_code&code={code}&client_id={client}&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&code_verifier=v"
+            ))
+            .unwrap();
+        let access = t["access_token"].as_str().unwrap();
+        assert_eq!(caller(&login, access), Some(client.to_string()));
+
+        let file = std::fs::read_dir(&place.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let words: Vec<String> = std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .map(|l| l.split('\t').skip(1).collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(words[0], "no-token - - - -");
+        assert_eq!(words[1], "bad-token - - - -");
+        assert!(
+            !words.iter().skip(2).any(|w| w.contains("token")),
+            "{words:?}"
+        );
+    }
 
     #[test]
     fn each_tool_with_a_list_names_its_limit_of_25() {

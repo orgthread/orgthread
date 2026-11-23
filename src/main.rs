@@ -3,6 +3,7 @@ use orgthread::copy;
 use orgthread::delete;
 use orgthread::device;
 use orgthread::device_door::{self, DeviceDoor};
+use orgthread::door_log::DoorLog;
 use orgthread::dropbox::Dropbox;
 use orgthread::fingerprint::{Fingerprinter, fingerprint};
 use orgthread::list::{self, Options, Target};
@@ -1061,6 +1062,16 @@ fn logins_file() -> Result<PathBuf, String> {
     Ok(state.join("logins.json"))
 }
 
+/// Where the claude.ai door keeps its sign-in log: the folder of the write log, so
+/// `state` beside the program unless ORGTHREAD_LOG names another file.
+fn door_log_folder() -> Result<PathBuf, String> {
+    let log = settings::log(&program_folder()?);
+    Ok(match log.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder.to_path_buf(),
+        _ => PathBuf::from("."),
+    })
+}
+
 /// Where the door may listen. It speaks plain HTTP, so only on this machine, unless
 /// the settings say otherwise on purpose.
 fn listen_addresses(address: &str) -> Result<Vec<std::net::SocketAddr>, String> {
@@ -1098,7 +1109,9 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
             }
             let addresses = listen_addresses(address)?;
             let logins = logins_file()?;
-            serve::run_http(&addresses, &Login::with_file(&base, &hash, &logins), &exe)
+            let log = DoorLog::new(&door_log_folder()?);
+            let login = Login::with_file(&base, &hash, &logins).with_log(log);
+            serve::run_http(&addresses, &login, &exe)
         }
         [flag, address, device] if flag == "--http" && device == "--device" => {
             let door = device_door()?;
