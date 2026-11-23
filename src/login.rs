@@ -3,6 +3,7 @@
 //! the registered clients and the SHA-256 of each live token, never a token itself
 //! and never any text of a note. With no usable file, a chat simply logs in again.
 
+use crate::door_log::{DoorLog, Word};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -123,8 +124,9 @@ struct Code {
 struct Inner {
     clients: Vec<String>,
     codes: HashMap<String, Code>,
-    /// The SHA-256 of a live access token, and when it ends.
-    access: HashMap<String, u64>,
+    /// The SHA-256 of a live access token, its client, and when it ends. A token
+    /// saved in the old form, a plain number, has the client `?`.
+    access: HashMap<String, (String, u64)>,
     /// The SHA-256 of a live refresh token, its client, and when it ends.
     refresh: HashMap<String, (String, u64)>,
     fails: Vec<Instant>,
@@ -165,10 +167,15 @@ impl Inner {
         let extra = inner.clients.len().saturating_sub(MAX_CLIENTS);
         inner.clients.drain(..extra);
         let time = now();
-        for (hash, until) in v["access"].as_object()? {
-            let until = until.as_u64()?;
+        for (hash, entry) in v["access"].as_object()? {
+            let (client, until) = match entry {
+                Value::Number(until) => ("?", until.as_u64()?),
+                _ => (entry["client"].as_str()?, entry["until"].as_u64()?),
+            };
             if until > time {
-                inner.access.insert(hash.clone(), until);
+                inner
+                    .access
+                    .insert(hash.clone(), (client.to_string(), until));
             }
         }
         for (hash, entry) in v["refresh"].as_object()? {
@@ -184,18 +191,18 @@ impl Inner {
     }
 
     fn to_text(&self, owner: &str) -> String {
-        let refresh: serde_json::Map<String, Value> = self
-            .refresh
-            .iter()
-            .map(|(hash, (client, until))| {
-                (hash.clone(), json!({ "client": client, "until": until }))
-            })
-            .collect();
+        let entries = |map: &HashMap<String, (String, u64)>| -> serde_json::Map<String, Value> {
+            map.iter()
+                .map(|(hash, (client, until))| {
+                    (hash.clone(), json!({ "client": client, "until": until }))
+                })
+                .collect()
+        };
         json!({
             "owner": owner,
             "clients": self.clients,
-            "access": self.access,
-            "refresh": refresh,
+            "access": entries(&self.access),
+            "refresh": entries(&self.refresh),
         })
         .to_string()
     }
@@ -233,6 +240,8 @@ pub struct Login {
     /// The file that outlives a restart. Without one, logins live in memory only.
     file: Option<PathBuf>,
     inner: Mutex<Inner>,
+    /// The sign-in log. Without one, the door writes no line.
+    log: Option<DoorLog>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -249,7 +258,26 @@ impl Login {
             hash: hash.to_string(),
             file: None,
             inner: Mutex::new(Inner::default()),
+            log: None,
         }
+    }
+
+    /// The same door, with a line in `log` for each sign-in event and each call.
+    pub fn with_log(mut self, log: DoorLog) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    /// One line of the sign-in log, if the door has one. `client` is the raw id,
+    /// which the log cleans; the other fields must be fixed words or numbers.
+    pub fn note(&self, word: Word, client: &str, detail: &str, code: &str, ms: &str) {
+        if let Some(log) = &self.log {
+            log.write(word, client, detail, code, ms);
+        }
+    }
+
+    fn event(&self, word: Word, client: &str, detail: &str) {
+        self.note(word, client, detail, "", "");
     }
 
     /// The same door, with logins kept in `file` over a restart.
@@ -325,8 +353,12 @@ impl Login {
 
     /// A chat app names itself here. It only ever gets sent back to Claude.
     pub fn register(&self, body: &Value) -> Result<Value, String> {
-        let uris = body["redirect_uris"].as_array().ok_or("no redirect_uris")?;
+        let Some(uris) = body["redirect_uris"].as_array() else {
+            self.event(Word::BadRequest, "", "redirect-uri");
+            return Err("no redirect_uris".to_string());
+        };
         if uris.is_empty() || uris.iter().any(|u| u != REDIRECT) {
+            self.event(Word::BadRequest, "", "redirect-uri");
             return Err("that redirect_uri is not allowed".to_string());
         }
         let id = random().map_err(|e| e.to_string())?;
@@ -336,6 +368,8 @@ impl Login {
         }
         inner.clients.push(id.clone());
         self.save(&inner);
+        drop(inner);
+        self.event(Word::Registered, &id, "");
         Ok(json!({
             "client_id": id,
             "redirect_uris": [REDIRECT],
@@ -345,29 +379,38 @@ impl Login {
         }))
     }
 
+    /// Checks a request of the login page, and writes a line for a refusal.
     fn check(&self, p: &HashMap<String, String>) -> Result<(), String> {
         let get = |k: &str| p.get(k).map_or("", String::as_str);
+        let client = get("client_id");
+        let refuse = |word: Word, reason: &str, message: &str| {
+            self.event(word, client, reason);
+            Err(message.to_string())
+        };
         if !self
             .inner
             .lock()
             .unwrap()
             .clients
             .iter()
-            .any(|c| c == get("client_id"))
+            .any(|c| c == client)
         {
-            return Err("this client is not known".to_string());
+            return refuse(Word::UnknownClient, "", "this client is not known");
         }
         if get("redirect_uri") != REDIRECT {
-            return Err("that redirect_uri is not allowed".to_string());
+            let message = "that redirect_uri is not allowed";
+            return refuse(Word::BadRequest, "redirect-uri", message);
         }
         if get("response_type") != "code" {
-            return Err("response_type must be code".to_string());
+            let message = "response_type must be code";
+            return refuse(Word::BadRequest, "response-type", message);
         }
         if get("code_challenge").is_empty() || get("code_challenge_method") != "S256" {
-            return Err("S256 PKCE is required".to_string());
+            return refuse(Word::BadRequest, "pkce", "S256 PKCE is required");
         }
         if !get("resource").is_empty() && get("resource") != self.resource() {
-            return Err("that resource is not this server".to_string());
+            let message = "that resource is not this server";
+            return refuse(Word::BadRequest, "resource", message);
         }
         Ok(())
     }
@@ -403,16 +446,20 @@ impl Login {
         let p = parse_form(form);
         self.check(&p).map_err(Refused::BadRequest)?;
         let get = |k: &str| p.get(k).map_or("", String::as_str);
+        let client = get("client_id");
         let mut inner = self.inner.lock().unwrap();
         inner.fails.retain(|t| t.elapsed() < LOCK_LIFE);
         if inner.fails.len() >= MAX_FAILS {
+            self.event(Word::StillLocked, client, "");
             return Err(Refused::Locked);
         }
         if password_hash(get("password")) != self.hash {
             inner.fails.push(Instant::now());
             return Err(if inner.fails.len() >= MAX_FAILS {
+                self.event(Word::LockStarted, client, "");
                 Refused::Locked
             } else {
+                self.event(Word::WrongPassword, client, "");
                 Refused::WrongPassword
             });
         }
@@ -428,6 +475,7 @@ impl Login {
                 until: Instant::now() + CODE_LIFE,
             },
         );
+        self.event(Word::SignedIn, client, "password");
         let mut back = format!("{REDIRECT}?code={}", encode(&code));
         if !get("state").is_empty() {
             back.push_str(&format!("&state={}", encode(get("state"))));
@@ -444,11 +492,12 @@ impl Login {
             }
         };
         let time = now();
-        inner.access.retain(|_, until| *until > time);
+        inner.access.retain(|_, (_, until)| *until > time);
         inner.refresh.retain(|_, (_, until)| *until > time);
-        inner
-            .access
-            .insert(password_hash(&access), time + ACCESS_LIFE.as_secs());
+        inner.access.insert(
+            password_hash(&access),
+            (client.to_string(), time + ACCESS_LIFE.as_secs()),
+        );
         inner.refresh.insert(
             password_hash(&refresh),
             (client.to_string(), time + REFRESH_LIFE.as_secs()),
@@ -466,45 +515,80 @@ impl Login {
     pub fn token(&self, form: &str) -> Result<Value, &'static str> {
         let p = parse_form(form);
         let get = |k: &str| p.get(k).map_or("", String::as_str);
+        let given = get("client_id");
         if !get("resource").is_empty() && get("resource") != self.resource() {
+            self.event(Word::BadRequest, given, "resource");
             return Err("invalid_target");
         }
         let mut inner = self.inner.lock().unwrap();
         match get("grant_type") {
             "authorization_code" => {
                 // A code works once, also when the attempt fails.
-                let code = inner.codes.remove(get("code")).ok_or("invalid_grant")?;
-                let good = code.until > Instant::now()
-                    && code.client == get("client_id")
-                    && code.redirect == get("redirect_uri")
-                    && code.challenge == challenge_of(get("code_verifier"));
-                if !good {
+                let Some(code) = inner.codes.remove(get("code")) else {
+                    self.event(Word::CodeRefused, given, "used-or-unknown");
                     return Err("invalid_grant");
-                }
-                self.tokens(&mut inner, &code.client)
+                };
+                let reason = if code.until <= Instant::now() {
+                    "expired"
+                } else if code.client != given
+                    || code.redirect != get("redirect_uri")
+                    || code.challenge != challenge_of(get("code_verifier"))
+                {
+                    "mismatch"
+                } else {
+                    let tokens = self.tokens(&mut inner, &code.client);
+                    if tokens.is_ok() {
+                        self.event(Word::SignedIn, &code.client, "code");
+                    }
+                    return tokens;
+                };
+                self.event(Word::CodeRefused, &code.client, reason);
+                Err("invalid_grant")
             }
             "refresh_token" => {
                 // A refresh token works once, also when the attempt fails.
-                let (client, until) = inner
-                    .refresh
-                    .remove(&password_hash(get("refresh_token")))
-                    .ok_or("invalid_grant")?;
-                if until <= now() || client != get("client_id") {
+                let Some((client, until)) =
+                    inner.refresh.remove(&password_hash(get("refresh_token")))
+                else {
+                    self.event(Word::RenewRefused, given, "used-or-unknown");
+                    return Err("invalid_grant");
+                };
+                if until <= now() || client != given {
                     self.save(&inner);
+                    let reason = if until <= now() {
+                        "expired"
+                    } else {
+                        "other-client"
+                    };
+                    self.event(Word::RenewRefused, &client, reason);
                     return Err("invalid_grant");
                 }
-                self.tokens(&mut inner, &client)
+                let tokens = self.tokens(&mut inner, &client);
+                if tokens.is_ok() {
+                    self.event(Word::Renewed, &client, "");
+                }
+                tokens
             }
-            _ => Err("unsupported_grant_type"),
+            _ => {
+                self.event(Word::BadRequest, given, "grant-type");
+                Err("unsupported_grant_type")
+            }
         }
     }
 
     pub fn allows(&self, token: &str) -> bool {
+        self.client_of(token).is_some()
+    }
+
+    /// The client of a live access token, `?` for one saved in the old form, or
+    /// nothing when the token is not live.
+    pub fn client_of(&self, token: &str) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         inner
             .access
             .get(&password_hash(token))
-            .is_some_and(|until| *until > now())
+            .filter(|(_, until)| *until > now())
+            .map(|(client, _)| client.clone())
     }
 }
 
@@ -787,6 +871,293 @@ mod tests {
             &place.file(),
         );
         assert!(!moved.allows(&access));
+    }
+
+    /// The door of the place, with its sign-in log in the same folder.
+    fn logged(place: &Place) -> Login {
+        place.door().with_log(DoorLog::new(&place.0))
+    }
+
+    /// The lines of the sign-in log so far, without the time.
+    fn lines(place: &Place) -> Vec<String> {
+        let mut files: Vec<PathBuf> = fs::read_dir(&place.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".log"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|f| {
+                fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(|l| l.split_once('\t').unwrap().1.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn tag(client: &str) -> &str {
+        &client[..8]
+    }
+
+    #[test]
+    fn a_registration_and_a_refused_one_each_get_a_line() {
+        let place = Place::new("log-register");
+        let door = logged(&place);
+        let c = client(&door);
+        assert!(door.register(&json!({})).is_err());
+        let evil = json!({ "redirect_uris": ["https://evil.test/cb"] });
+        assert!(door.register(&evil).is_err());
+        assert_eq!(
+            lines(&place),
+            [
+                format!("registered\t{}\t-\t-\t-", tag(&c)),
+                "bad-request\t-\tredirect-uri\t-\t-".to_string(),
+                "bad-request\t-\tredirect-uri\t-\t-".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_refusal_of_the_login_page_says_why() {
+        let place = Place::new("log-page");
+        let door = logged(&place);
+        let c = client(&door);
+        let good = request(&c, "v1");
+        let bad = [
+            request("unknown", "v1"),
+            request("abc\tdef", "v1"),
+            good.replace(&encode(REDIRECT), &encode("https://evil.test/cb")),
+            good.replace("response_type=code", "response_type=token"),
+            good.replace("code_challenge_method=S256", "code_challenge_method=plain"),
+            good.replace(
+                &encode("https://door.test/mcp"),
+                &encode("https://other.test/mcp"),
+            ),
+        ];
+        for query in &bad {
+            assert!(door.page(query, "x").is_err(), "{query}");
+        }
+        // The same checks hold when the password comes in.
+        let posted = format!("{}&password=right+password", bad[5]);
+        assert!(matches!(door.approve(&posted), Err(Refused::BadRequest(_))));
+        assert!(door.page(&good, "x").is_ok());
+        let t = tag(&c);
+        assert_eq!(
+            lines(&place)[1..],
+            [
+                "unknown-client\t?\t-\t-\t-".to_string(),
+                "unknown-client\tabcdef\t-\t-\t-".to_string(),
+                format!("bad-request\t{t}\tredirect-uri\t-\t-"),
+                format!("bad-request\t{t}\tresponse-type\t-\t-"),
+                format!("bad-request\t{t}\tpkce\t-\t-"),
+                format!("bad-request\t{t}\tresource\t-\t-"),
+                format!("bad-request\t{t}\tresource\t-\t-"),
+            ],
+            "a page that is shown writes no line"
+        );
+    }
+
+    #[test]
+    fn wrong_passwords_the_lock_and_a_right_one_each_get_their_word() {
+        let place = Place::new("log-password");
+        let door = logged(&place);
+        let c = client(&door);
+        let form = |pw: &str| format!("{}&password={pw}", request(&c, "v1"));
+        assert!(door.approve(&form("right+password")).is_ok());
+        for _ in 0..4 {
+            assert_eq!(door.approve(&form("wrong")), Err(Refused::WrongPassword));
+        }
+        assert_eq!(door.approve(&form("wrong")), Err(Refused::Locked));
+        assert_eq!(door.approve(&form("right+password")), Err(Refused::Locked));
+        let t = tag(&c);
+        let mut expected = vec![format!("signed-in\t{t}\tpassword\t-\t-")];
+        expected.extend((0..4).map(|_| format!("wrong-password\t{t}\t-\t-\t-")));
+        expected.push(format!("lock-started\t{t}\t-\t-\t-"));
+        expected.push(format!("still-locked\t{t}\t-\t-\t-"));
+        assert_eq!(lines(&place)[1..], expected);
+    }
+
+    /// A login code for the client `c`, from the right password.
+    fn code_for(door: &Login, c: &str) -> String {
+        let back = door
+            .approve(&format!("{}&password=right+password", request(c, "v1")))
+            .unwrap();
+        code_from(&back)
+    }
+
+    fn redeeming(code: &str, c: &str, verifier: &str) -> String {
+        format!(
+            "grant_type=authorization_code&code={code}&client_id={c}&redirect_uri={}&code_verifier={verifier}",
+            encode(REDIRECT)
+        )
+    }
+
+    #[test]
+    fn a_login_code_used_refused_or_expired_says_why() {
+        let place = Place::new("log-code");
+        let door = logged(&place);
+        let c = client(&door);
+        let code = code_for(&door, &c);
+        assert!(door.token(&redeeming(&code, &c, "v1")).is_ok());
+        assert!(door.token(&redeeming(&code, &c, "v1")).is_err());
+        let code = code_for(&door, &c);
+        assert!(door.token(&redeeming(&code, &c, "wrong")).is_err());
+        let code = code_for(&door, &c);
+        assert!(door.token(&redeeming(&code, "0123456789", "v1")).is_err());
+        let code = code_for(&door, &c);
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        door.inner
+            .lock()
+            .unwrap()
+            .codes
+            .get_mut(&code)
+            .unwrap()
+            .until = past;
+        assert!(door.token(&redeeming(&code, &c, "v1")).is_err());
+        let t = tag(&c);
+        let found: Vec<String> = lines(&place)
+            .into_iter()
+            .filter(|l| !l.contains("password"))
+            .collect();
+        assert_eq!(
+            found[1..],
+            [
+                format!("signed-in\t{t}\tcode\t-\t-"),
+                format!("code-refused\t{t}\tused-or-unknown\t-\t-"),
+                format!("code-refused\t{t}\tmismatch\t-\t-"),
+                format!("code-refused\t{t}\tmismatch\t-\t-"),
+                format!("code-refused\t{t}\texpired\t-\t-"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_renewal_and_each_refused_one_say_why() {
+        let place = Place::new("log-renew");
+        let (c, _, first) = logged_in(&logged(&place));
+        let door = logged(&place);
+        let second = door.token(&refreshing(&c, &first)).unwrap();
+        let second = second["refresh_token"].as_str().unwrap().to_string();
+        assert!(door.token(&refreshing(&c, &first)).is_err());
+        assert!(door.token(&refreshing("0123456789", &second)).is_err());
+        let (c2, _, third) = logged_in(&door);
+        // A token past its time is dropped when the file is read and when a new pair
+        // is made, so only one still in memory can show `expired`.
+        for entry in door.inner.lock().unwrap().refresh.values_mut() {
+            entry.1 = now() - 1;
+        }
+        assert!(door.token(&refreshing(&c2, &third)).is_err());
+        let (t, t2) = (tag(&c), tag(&c2));
+        let found: Vec<String> = lines(&place)
+            .into_iter()
+            .filter(|l| l.starts_with("ren"))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                format!("renewed\t{t}\t-\t-\t-"),
+                format!("renew-refused\t{t}\tused-or-unknown\t-\t-"),
+                format!("renew-refused\t{t}\tother-client\t-\t-"),
+                format!("renew-refused\t{t2}\texpired\t-\t-"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrong_resource_or_grant_at_the_token_door_is_a_bad_request() {
+        let place = Place::new("log-token");
+        let door = logged(&place);
+        let wrong = format!(
+            "grant_type=refresh_token&refresh_token=x&client_id=ab12&resource={}",
+            encode("https://other.test/mcp")
+        );
+        assert_eq!(door.token(&wrong), Err("invalid_target"));
+        assert_eq!(
+            door.token("grant_type=password&client_id=cd34"),
+            Err("unsupported_grant_type")
+        );
+        assert_eq!(
+            lines(&place),
+            [
+                "bad-request\tab12\tresource\t-\t-",
+                "bad-request\tcd34\tgrant-type\t-\t-",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_access_token_keeps_its_client_over_a_restart() {
+        let place = Place::new("access-client");
+        let (c, access, _) = logged_in(&place.door());
+        assert_eq!(place.door().client_of(&access), Some(c));
+        assert_eq!(place.door().client_of("anything"), None);
+    }
+
+    #[test]
+    fn an_access_token_in_the_old_form_still_works_with_the_client_unknown() {
+        let place = Place::new("access-old");
+        let (c, access, refresh) = logged_in(&place.door());
+        let mut v: Value =
+            serde_json::from_str(&fs::read_to_string(place.file()).unwrap()).unwrap();
+        for (_, entry) in v["access"].as_object_mut().unwrap() {
+            *entry = entry["until"].clone();
+        }
+        fs::write(place.file(), v.to_string()).unwrap();
+        assert!(
+            fs::read_to_string(place.file())
+                .unwrap()
+                .contains("\"access\":{\"")
+        );
+        let door = place.door();
+        assert_eq!(door.client_of(&access), Some("?".to_string()));
+        // The next renewal gives a token that names its client again.
+        let t = door.token(&refreshing(&c, &refresh)).unwrap();
+        let new = t["access_token"].as_str().unwrap();
+        assert_eq!(place.door().client_of(new), Some(c));
+    }
+
+    #[test]
+    fn no_secret_of_a_login_is_in_the_log() {
+        let place = Place::new("log-secret");
+        let door = logged(&place);
+        let c = client(&door);
+        let code = code_for(&door, &c);
+        let t = door.token(&redeeming(&code, &c, "v1")).unwrap();
+        let (access, refresh) = (
+            t["access_token"].as_str().unwrap().to_string(),
+            t["refresh_token"].as_str().unwrap().to_string(),
+        );
+        let t2 = door.token(&refreshing(&c, &refresh)).unwrap();
+        assert!(door.token(&refreshing(&c, &refresh)).is_err());
+        door.note(
+            Word::Call,
+            &door.client_of(&access).unwrap(),
+            "read",
+            "0",
+            "3",
+        );
+        let _ = door.approve(&format!("{}&password=wrong+one", request(&c, "v1")));
+        let text = lines(&place).join("\n");
+        assert!(text.contains("renew-refused"), "{text}");
+        let secrets = [
+            "right password".to_string(),
+            "wrong one".to_string(),
+            password_hash("right password"),
+            code.clone(),
+            access.clone(),
+            refresh.clone(),
+            t2["access_token"].as_str().unwrap().to_string(),
+            t2["refresh_token"].as_str().unwrap().to_string(),
+        ];
+        for secret in &secrets {
+            assert!(!text.contains(secret.as_str()), "{secret} is in the log");
+            let hash = password_hash(secret);
+            assert!(!text.contains(&hash), "the hash of {secret} is in the log");
+        }
+        assert!(!text.contains(&c), "only 8 signs of the client");
     }
 
     #[test]
