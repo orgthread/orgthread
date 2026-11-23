@@ -281,7 +281,7 @@ pub const ALL: [Setting; 36] = [
         "state/writes.log beside the program",
         Both,
         FoldersAndLogs,
-        "The log file: one line per write, refusal and change of a setting, never a text.",
+        "The log file: one line per write, refusal and change of a setting, never a text. The sign-in log of serve --http goes into its folder, one file per month: door-YYYY-MM.log.",
     ),
     setting(
         READS,

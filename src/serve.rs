@@ -1350,8 +1350,10 @@ mod tests {
             fields(tool_call("read"), said("a text", false)),
             ("read", "0".into())
         );
-        let refused = said("exit code 4\nthe file changed", true);
-        assert_eq!(fields(tool_call("patch"), refused), ("patch", "4".into()));
+        let text = format!("exit code {}\nthe file changed", exit::CHANGED);
+        let refused = said(&text, true);
+        let changed = exit::CHANGED.to_string();
+        assert_eq!(fields(tool_call("patch"), refused), ("patch", changed));
         let failed = said("could not start the command: no such file", true);
         assert_eq!(fields(tool_call("read"), failed), ("read", String::new()));
         let wrong = Some(problem(json!(1), INVALID_PARAMS, "read needs who"));

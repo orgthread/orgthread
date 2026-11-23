@@ -48,7 +48,7 @@ The list holds all settings, of both doors. The doors: `local folder` is the doo
 |---|---|---|---|---|
 | `ORGTHREAD_ROOT` | The folder that all paths live in. | a path, not empty | ~/Library/CloudStorage/Dropbox | local folder |
 | `ORGTHREAD_LOCK_DIR` | The locks of orgthread, on this machine only. A path that does not start with / starts at the folder of the program. For a local folder, keep it on the same disk as ORGTHREAD_ROOT. | a path, not empty | .locks beside the program | both |
-| `ORGTHREAD_LOG` | The log file: one line per write, refusal and change of a setting, never a text. The sign-in log of `serve --http` goes into the same folder, one file per month, such as `door-2026-11.log` (see [mcp.md](mcp.md)). | a path, not empty | state/writes.log beside the program | both |
+| `ORGTHREAD_LOG` | The log file: one line per write, refusal and change of a setting, never a text. The sign-in log of serve --http goes into its folder, one file per month: door-YYYY-MM.log. | a path, not empty | state/writes.log beside the program | both |
 | `ORGTHREAD_READS` | The notes of what each name read. | a path, not empty | state/reads beside the program | both |
 | `ORGTHREAD_VERSIONS` | A copy of each version written, for 30 days, for the diff screen and the revert of watch. | a path, not empty | state/versions beside the program | local folder |
 
