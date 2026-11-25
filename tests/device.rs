@@ -1323,7 +1323,6 @@ fn a_door_without_the_new_settings_refuses_download_upload_and_trash() {
     assert!(text.contains("offers only list, read, patch"), "{text}");
     assert_eq!(door.root_file(PROGRESS_FILE), PROGRESS, "unchanged");
     assert_eq!(door.log().matches("\trefused\t").count(), 3);
-    // A download is no read either: the cap of the reads did not count it.
     assert!(!door.log().contains("\tdownloaded\t"));
     // Without a token, the new places are closed as /mcp is.
     assert_eq!(door.download("", &chapter).status, 401);
@@ -1394,6 +1393,8 @@ fn paths_outside_the_named_folders_are_refused() {
         "/notes//a.note".into(),
         "/notes/".into(),
         "/notes/.trash/2026-11-25/a.note".into(),
+        "/notes/.Trash/2026-11-25/a.note".into(),
+        "/notes/.TRASH/a.note".into(),
         "/notesx/a.note".into(),
     ] {
         let (code, text) = not_done(&door.download(&token, &file));

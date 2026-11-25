@@ -336,7 +336,11 @@ impl Rules {
         if path.ends_with('/') {
             return Err(format!("{} names a folder, not a file", shown(path)));
         }
-        if parts(path).contains(&TRASH) {
+        // Dropbox and most Mac disks ignore capitals: .Trash is the same folder.
+        if parts(path)
+            .iter()
+            .any(|part| part.eq_ignore_ascii_case(TRASH))
+        {
             return Err(format!(
                 "{} lies in a {TRASH} folder, which this door leaves to its owner",
                 shown(path)

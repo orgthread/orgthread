@@ -90,7 +90,7 @@ The rules of a device door are stricter than the limits of the other doors:
 - Where a list folder meets a read folder or a patch file, the list folder wins: a file in it is closed to `read` and `patch`, also when `ORGTHREAD_DEVICE_READ` or `ORGTHREAD_DEVICE_PATCH` names it. The door checks this at each call, so no overlap of two rules with a `*` can slip through, and a mistake in the settings closes a file, never opens it.
 - `ORGTHREAD_DEVICE_PATCH` names files. A device may read and patch them. `*` stands for any part of one name, and never for a `/`. So `/reading/progress-*.md` opens `/reading/progress-a.md`, and not `/reading/notes.md` or `/reading/old/progress-a.md`. A patch never makes a file: a file that does not exist gives exit code 6 on the read, and the patch is then refused.
 - `ORGTHREAD_DEVICE_DOWNLOAD`, `ORGTHREAD_DEVICE_UPLOAD` and `ORGTHREAD_DEVICE_TRASH` name folders in the form of `ORGTHREAD_DEVICE_READ`. Each opens every file in its folders, at any depth, for its one tool only. A folder rule fits a sync better than a file rule: a sync needs every file of a folder and of the folders in it, and a `*` in a file rule never covers a `/`. They do not open a `list`, a `read` or a `patch`: give the folder to `ORGTHREAD_DEVICE_LIST` too. A list folder does not close them.
-- No path with a part `.trash` is open to `download`, `upload` or `trash`, whatever the rules say. The trash belongs to the owner.
+- No path with a part `.trash` is open to `download`, `upload` or `trash`, whatever the rules say, also with other capitals, such as `.Trash`. The trash belongs to the owner.
 - In a local folder, a path that goes through a link is refused. Dropbox has no links.
 - A list with one closed folder is refused whole.
 
@@ -247,7 +247,7 @@ Content-Length: <size>
 The answer 200:
 
 ```
-{"exit": 0, "fingerprint": "<64 signs>", "size": 3000, "text": "written: /notes/a.note, 3000 bytes\n"}
+{"exit": 0, "fingerprint": "<64 signs>", "size": 3000, "text": "written: notes/a.note, 3000 bytes\n"}
 ```
 
 `fingerprint` is the one of the new file. The device keeps it as the version it saw. `exit` is 0, or 8 or 10 when the file is written but a log line or the clean-up failed.
@@ -277,12 +277,12 @@ It moves the file to `.trash/YYYY-MM-DD/` inside the folder of the rule, with th
 - `fingerprint` is required: only that version moves. If the file changed since, the result is exit code 4, and nothing moves.
 - The door runs `orgthread move`, so the log gets `moved`, and the text of the result names both paths, for example `moved: notes/sub/b.note -> notes/.trash/2026-11-25/sub/b (2).note, 3000 bytes, <fingerprint>`.
 - `tools/list` shows `trash` only where `ORGTHREAD_DEVICE_TRASH` is set. Without it, a call of `trash` is refused with exit code 2.
-- `ORGTHREAD_MOVE_ALLOW` and `ORGTHREAD_FIXED_FOLDERS` still count, as for every move. Do not name the folder itself in `ORGTHREAD_FIXED_FOLDERS`, or the first `.trash` folder is refused.
+- `ORGTHREAD_MOVE_ALLOW`, `ORGTHREAD_FIXED_FOLDERS` and `ORGTHREAD_BINARY_ALLOW` still count, as for every move. So a file that is not text goes to the trash only where `ORGTHREAD_BINARY_ALLOW` covers the trash folder, as `/notes/` does in the example. Do not name the folder itself in `ORGTHREAD_FIXED_FOLDERS`, or the first `.trash` folder is refused.
 
 ### The limits
 
 - One file has at most `ORGTHREAD_DEVICE_FILE_MB`, 20 MB by default. A larger file is refused with exit code 2, and no byte moves. `ORGTHREAD_DOWNLOAD_MB` and `ORGTHREAD_UPLOAD_MB` still count as well, so keep them at least as high.
-- Downloads and uploads of one device count together, at most `ORGTHREAD_DEVICE_CAP_MB_DAY` in 24 hours, 200 MB by default. A transfer counts when the door allows it, before the bytes move, with the size of the file. A refused one does not count. They do not count for the read cap, and reads do not count here.
+- Downloads and uploads of one device count together, at most `ORGTHREAD_DEVICE_CAP_MB_DAY` in 24 hours, 200 MB by default. A transfer counts when the door allows it, before the bytes move, with the size of the file. A transfer that the door refuses does not count. One that the command refuses after that still counts, such as an upload with a stale fingerprint, as its bytes did move. They do not count for the read cap, and reads do not count here.
 - Above the cap, the transfer is refused with exit code 2 and the time it opens again:
 
 ```

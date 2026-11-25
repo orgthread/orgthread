@@ -225,6 +225,8 @@ fn handle(mut stream: TcpStream, door: &DeviceDoor, exe: &Path) -> io::Result<()
     // after the token, the rules and the limits allow it.
     if head.method == "PUT" && head.path.strip_prefix(door.prefix.as_str()) == Some("/upload") {
         let Some(holder) = holder_of(&mut stream, door, &head.bearer)? else {
+            // So the device can read the 401, not a reset connection.
+            drop_body(&mut reader, &head, door.moved.file);
             return Ok(());
         };
         return upload(&mut stream, &mut reader, &head, door, exe, &holder);
