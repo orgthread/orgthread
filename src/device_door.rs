@@ -583,7 +583,7 @@ fn call(
                     "trash needs fingerprint, the 64 signs that list gives".into(),
                 ));
             }
-            let date = device::date_text(device::now());
+            let date = device::vienna_date(device::now());
             let place = door.rules.trash(file, &date).and_then(|to| {
                 door.no_link(file)?;
                 door.no_link(&to)?;

@@ -1514,7 +1514,7 @@ fn upload_refuses_a_stale_fingerprint_and_a_file_it_did_not_see() {
 fn trash_moves_into_the_trash_of_the_day_and_never_over_a_file() {
     let door = sync_door("sync-trash", &[]);
     let token = door.pair();
-    let day = device::date_text(device::now());
+    let day = device::vienna_date(device::now());
     let trash = door.dir.join(format!("root/notes/.trash/{day}"));
     // A file of the same name went to the trash earlier that day.
     fs::create_dir_all(trash.join("sub")).unwrap();

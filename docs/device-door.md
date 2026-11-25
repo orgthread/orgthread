@@ -272,7 +272,7 @@ conn.setRequestProperty("Authorization", "Bearer " + token);
  "params": {"name": "trash", "arguments": {"file": "/notes/sub/b.note", "fingerprint": "<64 signs>"}}}
 ```
 
-It moves the file to `.trash/YYYY-MM-DD/` inside the folder of the rule, with the rest of its path, on the day in UTC. So with the rule `/notes/`, `/notes/sub/b.note` goes to `/notes/.trash/2026-11-25/sub/b.note`. It never goes over a file: when that name is taken, it tries `b (2).note`, then `b (3).note`, up to `b (20).note`. Missing folders are made.
+It moves the file to `.trash/YYYY-MM-DD/` inside the folder of the rule, with the rest of its path. The day is the date in Vienna: UTC+1 in winter and UTC+2 in summer, by the EU rule. So a delete at 23:30 UTC on 2026-11-25 goes to the folder `2026-11-26`. So with the rule `/notes/`, `/notes/sub/b.note` goes to `/notes/.trash/2026-11-25/sub/b.note`. It never goes over a file: when that name is taken, it tries `b (2).note`, then `b (3).note`, up to `b (20).note`. Missing folders are made.
 
 - `fingerprint` is required: only that version moves. If the file changed since, the result is exit code 4, and nothing moves.
 - The door runs `orgthread move`, so the log gets `moved`, and the text of the result names both paths, for example `moved: notes/sub/b.note -> notes/.trash/2026-11-25/sub/b (2).note, 3000 bytes, <fingerprint>`.
