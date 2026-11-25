@@ -1566,3 +1566,40 @@ fn trash_moves_into_the_trash_of_the_day_and_never_over_a_file() {
     );
     assert!(reply.body.contains("-32602"), "{}", reply.body);
 }
+
+#[test]
+fn an_upload_that_waits_for_100_continue_gets_it_only_when_allowed() {
+    let door = sync_door("sync-continue", &[("ORGTHREAD_DEVICE_FILE_MB", "1")]);
+    let token = door.pair();
+    let send = |file: &str, size: usize| {
+        let mut s = TcpStream::connect(("127.0.0.1", door.port)).unwrap();
+        let head = format!(
+            "PUT {PREFIX}/upload?file={} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nExpect: 100-continue\r\nContent-Length: {size}\r\n\r\n",
+            encoded(file)
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        let mut first = [0u8; 25];
+        s.read_exact(&mut first).unwrap();
+        (s, String::from_utf8_lossy(&first).to_string())
+    };
+    // Too large: the answer comes at once, and no byte is sent.
+    let (_, first) = send("/notes/large.note", 2_000_000);
+    assert!(first.starts_with("HTTP/1.1 422"), "{first}");
+    // Allowed: 100 Continue, then the bytes, then the answer.
+    let (mut s, first) = send("/notes/c.note", 3000);
+    assert_eq!(first, "HTTP/1.1 100 Continue\r\n\r\n");
+    s.write_all(&note_bytes(3)).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert_eq!(door.root_bytes("/notes/c.note").unwrap(), note_bytes(3));
+    // A plus in a query is a space, as URLEncoder of Java gives it.
+    let extra = format!("Authorization: Bearer {token}\r\n");
+    let path = format!("{PREFIX}/upload?file=%2Fnotes%2Fmy+note.note");
+    let sent = door.raw_bytes("PUT", &path, &extra, &note_bytes(4));
+    assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+    assert_eq!(
+        door.root_bytes("/notes/my note.note").unwrap(),
+        note_bytes(4)
+    );
+}

@@ -8,9 +8,10 @@ A device door is a third door, for a device such as an e-reader. Think of a side
 - One door per app. The app is a name in the settings, such as `reader`.
 - One token per app and device. A lost device costs only its own token.
 - Only three tools: `list`, `read` and `patch`, and only on the paths that the settings name. Every other tool and every other path is refused with exit code 2, as a closed path is on the other doors.
+- A door for a sync can also turn on `download` and `upload` of exact bytes, and `trash`, a move into a trash folder. They are off by default. Only the folders of their own settings open them: see [Sync a folder](#sync-a-folder).
 - A folder can be open to `list` only: the device sees the names, sizes, times and fingerprints of the files, never their text.
 - No password and no OAuth. A device pairs once with a code of 8 signs, and then sends its token.
-- A read cap per device, with a push to the owner when a device reaches it.
+- A read cap per device, with a push to the owner when a device reaches it. A door for a sync also has a cap in MB per device and day.
 - No request and no answer goes into the log.
 
 | Server | Start it with | For | Login |
@@ -48,9 +49,23 @@ ORGTHREAD_DEVICE_NOTIFY=/home/example/orgthread-lessons/push.sh
 ORGTHREAD_PUBLIC_URL=https://lessons.example.com/a-third-long-invented-secret
 ```
 
-A device door needs at least one of `ORGTHREAD_DEVICE_READ`, `ORGTHREAD_DEVICE_PATCH` and `ORGTHREAD_DEVICE_LIST`, and any one of them is enough.
+A third example, for an invented app `desk` that keeps `/notes/` the same on the device and in the storage. It lists the folder with fingerprints, and moves whole files:
 
-Add the Dropbox settings of [settings.md](settings.md), as for the remote door. Do not set `ORGTHREAD_LOGIN_HASH`: a device door with a password refuses to start, as it then shares a folder with the other door. The other way round, `serve --http` without `--device` refuses to start where `ORGTHREAD_DEVICE_READ`, `ORGTHREAD_DEVICE_PATCH` or `ORGTHREAD_DEVICE_LIST` is set.
+```
+ORGTHREAD_STORAGE=dropbox
+ORGTHREAD_DEVICE_APP=desk
+ORGTHREAD_DEVICE_LIST=/notes/
+ORGTHREAD_DEVICE_DOWNLOAD=/notes/
+ORGTHREAD_DEVICE_UPLOAD=/notes/
+ORGTHREAD_DEVICE_TRASH=/notes/
+ORGTHREAD_BINARY_ALLOW=/notes/
+ORGTHREAD_DEVICE_NOTIFY=/home/example/orgthread-desk/push.sh
+ORGTHREAD_PUBLIC_URL=https://desk.example.com/a-fourth-long-invented-secret
+```
+
+A device door needs at least one of `ORGTHREAD_DEVICE_READ`, `ORGTHREAD_DEVICE_PATCH`, `ORGTHREAD_DEVICE_LIST`, `ORGTHREAD_DEVICE_DOWNLOAD`, `ORGTHREAD_DEVICE_UPLOAD` and `ORGTHREAD_DEVICE_TRASH`, and any one of them is enough.
+
+Add the Dropbox settings of [settings.md](settings.md), as for the remote door. Do not set `ORGTHREAD_LOGIN_HASH`: a device door with a password refuses to start, as it then shares a folder with the other door. The other way round, `serve --http` without `--device` refuses to start where any of these six settings is set.
 
 `ORGTHREAD_PUBLIC_URL` is optional here. With a path in it, everything lives under that path, and any other path gets an empty 404, as on the remote door.
 
@@ -74,6 +89,8 @@ The rules of a device door are stricter than the limits of the other doors:
 - `ORGTHREAD_DEVICE_LIST` names folders in the form of `ORGTHREAD_DEVICE_READ`, with `/` at both ends and `*` for any part of one folder name. A device may list them, and every folder in them, one level at a time, with `fingerprint`. A `read` or a `patch` of any file in them is refused with exit code 2, and the log gets a `refused` line with the path and the device, never a text of the file. So with `/lessons/`, a list of `/lessons/` and of `/lessons/archive/` works, and a read of `/lessons/lesson-1.pdf` is refused.
 - Where a list folder meets a read folder or a patch file, the list folder wins: a file in it is closed to `read` and `patch`, also when `ORGTHREAD_DEVICE_READ` or `ORGTHREAD_DEVICE_PATCH` names it. The door checks this at each call, so no overlap of two rules with a `*` can slip through, and a mistake in the settings closes a file, never opens it.
 - `ORGTHREAD_DEVICE_PATCH` names files. A device may read and patch them. `*` stands for any part of one name, and never for a `/`. So `/reading/progress-*.md` opens `/reading/progress-a.md`, and not `/reading/notes.md` or `/reading/old/progress-a.md`. A patch never makes a file: a file that does not exist gives exit code 6 on the read, and the patch is then refused.
+- `ORGTHREAD_DEVICE_DOWNLOAD`, `ORGTHREAD_DEVICE_UPLOAD` and `ORGTHREAD_DEVICE_TRASH` name folders in the form of `ORGTHREAD_DEVICE_READ`. Each opens every file in its folders, at any depth, for its one tool only. A folder rule fits a sync better than a file rule: a sync needs every file of a folder and of the folders in it, and a `*` in a file rule never covers a `/`. They do not open a `list`, a `read` or a `patch`: give the folder to `ORGTHREAD_DEVICE_LIST` too. A list folder does not close them.
+- No path with a part `.trash` is open to `download`, `upload` or `trash`, whatever the rules say. The trash belongs to the owner.
 - In a local folder, a path that goes through a link is refused. Dropbox has no links.
 - A list with one closed folder is refused whole.
 
@@ -167,9 +184,119 @@ orgthread: refused. This device reached its read cap of 8 in 60 minutes. It may 
 
 Each refused read logs `capped` with its path. The first one in an hour runs `ORGTHREAD_DEVICE_NOTIFY`. The times of the reads stay in the file of the tokens, so a restart does not reset the cap.
 
+## Sync a folder
+
+With the `desk` example above, a device keeps `/notes/` the same on both sides. It lists the folder with `fingerprint`, as in [A door that only lists](#a-door-that-only-lists), compares each fingerprint with its own copy, then moves each file that differs.
+
+A file can be larger than a message of `/mcp`, which takes at most 1 MiB. So `download` and `upload` are not MCP tools: they are two places of their own, with the raw bytes in the body. `trash` moves no bytes, so it is an MCP tool. A `tools/call` of `download` or `upload` is refused with exit code 2.
+
+Each place needs the token in `Authorization: Bearer <token>`. A missing or wrong token gets an empty 401, as at `/mcp`. Another method gets an empty 405.
+
+### The answers
+
+- Success: status 200.
+- A refusal or a failure: status 422, with a JSON body `{"exit": N, "text": "exit code N\norgthread: ..."}`. The exit code and the text are those of a refused tool, see [exit-codes.md](exit-codes.md). Exit code 2 is a refusal of the door or wrong use. A refusal of the door logs `refused` with the path and the device.
+
+### Download
+
+```
+GET /<secret path>/download?file=<path>
+Authorization: Bearer <token>
+```
+
+`<path>` is the full path from the root, such as `/notes/sub/a.note`, in the form of a query value: UTF-8, with `%XX` for each sign that is not a letter, a digit, `-`, `_`, `.` or `*`. `URLEncoder.encode(path, "UTF-8")` of Java gives this form. A `+` stands for a space.
+
+The answer 200:
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+X-Orgthread-Fingerprint: <64 signs>
+X-Orgthread-Exit: 0
+Content-Length: <size>
+
+<the exact bytes>
+```
+
+The fingerprint is the one of these bytes, the same as `list` with `fingerprint` shows. `X-Orgthread-Exit` is 0, or 8 when the bytes are whole but the log line failed. The door runs `orgthread download`, so the log gets `downloaded`, and `state/reads` notes the device.
+
+For example, with an invented token in `$TOKEN`:
+
+```
+curl -sS -o a.note -D - -H "Authorization: Bearer $TOKEN" \
+  'https://desk.example.com/a-fourth-long-invented-secret/download?file=%2Fnotes%2Fa.note'
+```
+
+### Upload
+
+```
+PUT /<secret path>/upload?file=<path>&fingerprint=<the fingerprint the device last saw>
+Authorization: Bearer <token>
+Content-Length: <size>
+
+<the exact bytes>
+```
+
+- `fingerprint` is the fingerprint of the version that the device last saw, from a `list` or a download. The upload replaces only that version. If the file changed since, the answer is 422 with exit code 4, and nothing is written. If the file is gone since, it is exit code 6.
+- With no `fingerprint`, the file must be new. If a file is at that path, the answer is 422 with exit code 5, and nothing is written. So an upload never goes over a file that the device did not see.
+- `Content-Length` is required. A chunked body is refused with exit code 2. An empty file is refused.
+- `Expect: 100-continue` works: the door then sends `100 Continue` only after the token, the rules and the limits allow the upload.
+- A file that is not text, such as a `.note`, also needs `ORGTHREAD_BINARY_ALLOW` for its folder, as every upload does.
+- The door runs `orgthread upload --expect <fingerprint>`, or `--new`. The write goes through a temporary file and a rename in a local folder, and through the Dropbox API with the same checks on a server, as every upload does.
+
+The answer 200:
+
+```
+{"exit": 0, "fingerprint": "<64 signs>", "size": 3000, "text": "written: /notes/a.note, 3000 bytes\n"}
+```
+
+`fingerprint` is the one of the new file. The device keeps it as the version it saw. `exit` is 0, or 8 or 10 when the file is written but a log line or the clean-up failed.
+
+When the door refuses before the body, it answers first and then drops at most the bytes of the file limit. A device sends the size before the bytes, so it checks a file against the limit before it sends it.
+
+From Java, with `HttpsURLConnection`, for example:
+
+```
+conn.setRequestMethod("PUT");
+conn.setDoOutput(true);
+conn.setFixedLengthStreamingMode(bytes.length);
+conn.setRequestProperty("Authorization", "Bearer " + token);
+```
+
+`setFixedLengthStreamingMode` sends a `Content-Length` and no chunks.
+
+### Trash
+
+```
+{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+ "params": {"name": "trash", "arguments": {"file": "/notes/sub/b.note", "fingerprint": "<64 signs>"}}}
+```
+
+It moves the file to `.trash/YYYY-MM-DD/` inside the folder of the rule, with the rest of its path, on the day in UTC. So with the rule `/notes/`, `/notes/sub/b.note` goes to `/notes/.trash/2026-11-25/sub/b.note`. It never goes over a file: when that name is taken, it tries `b (2).note`, then `b (3).note`, up to `b (20).note`. Missing folders are made.
+
+- `fingerprint` is required: only that version moves. If the file changed since, the result is exit code 4, and nothing moves.
+- The door runs `orgthread move`, so the log gets `moved`, and the text of the result names both paths, for example `moved: notes/sub/b.note -> notes/.trash/2026-11-25/sub/b (2).note, 3000 bytes, <fingerprint>`.
+- `tools/list` shows `trash` only where `ORGTHREAD_DEVICE_TRASH` is set. Without it, a call of `trash` is refused with exit code 2.
+- `ORGTHREAD_MOVE_ALLOW` and `ORGTHREAD_FIXED_FOLDERS` still count, as for every move. Do not name the folder itself in `ORGTHREAD_FIXED_FOLDERS`, or the first `.trash` folder is refused.
+
+### The limits
+
+- One file has at most `ORGTHREAD_DEVICE_FILE_MB`, 20 MB by default. A larger file is refused with exit code 2, and no byte moves. `ORGTHREAD_DOWNLOAD_MB` and `ORGTHREAD_UPLOAD_MB` still count as well, so keep them at least as high.
+- Downloads and uploads of one device count together, at most `ORGTHREAD_DEVICE_CAP_MB_DAY` in 24 hours, 200 MB by default. A transfer counts when the door allows it, before the bytes move, with the size of the file. A refused one does not count. They do not count for the read cap, and reads do not count here.
+- Above the cap, the transfer is refused with exit code 2 and the time it opens again:
+
+```
+exit code 2
+orgthread: refused. This device reached its cap of 200 MB in 24 hours for downloads and uploads. It may move files again after 2026-11-26 09:12 UTC.
+```
+
+Each refusal logs `capped` with its path. The first one in an hour runs `ORGTHREAD_DEVICE_NOTIFY`. `device list` shows the transfers of the last 24 hours of each device.
+
+The read cap keeps its own settings, 8 and 40 by default. A desk door that also reads text files can raise it in its own `.env`, for example `ORGTHREAD_DEVICE_CAP_HOUR=16` and `ORGTHREAD_DEVICE_CAP_DAY=80`.
+
 ## The push
 
-`ORGTHREAD_DEVICE_NOTIFY` names a program. The door runs it with one line of text as its only argument, does not wait for it, and drops its output. The line names the device and what happened, never a path or a text of a file:
+`ORGTHREAD_DEVICE_NOTIFY` names a program. The door runs it with one line of text as its only argument, does not wait for it, and drops its output. The line names the device and what happened, never a path or a text of a file. It comes at a pairing, at the read cap and at the cap in MB, for example:
 
 ```
 orgthread: the device tablet (reader) reached its read cap of 8 in 60 minutes. The door refuses its capped reads until 2026-11-17 15:05 UTC. To end its token: orgthread device revoke tablet
@@ -197,11 +324,11 @@ If the program cannot start, the log gets `not-notified`. With no setting, only 
 
 | Where | What |
 |---|---|
-| `state/devices.json`, or `ORGTHREAD_DEVICES` | The SHA-256 of each token and waiting code, the device, the app, the times, and the times of the capped reads of the last day. Mode 600. Never a raw token |
-| `state/writes.log` | One line for each pairing, wrong code, refusal, capped read, revoke, and each patch: the time, the word, the path and the device. Never a request or an answer |
+| `state/devices.json`, or `ORGTHREAD_DEVICES` | The SHA-256 of each token and waiting code, the device, the app, the times, the times of the capped reads of the last day, and the time and size of each download and upload of the last day. Mode 600. Never a raw token |
+| `state/writes.log` | One line for each pairing, wrong code, refusal, capped read or transfer, revoke, and each patch, download, upload and trash move: the time, the word, the path and the device. Never a request or an answer |
 | `state/reads` | The fingerprint of each file that a device read, under its name. Never a text |
 
-With Dropbox, no text of a file goes to the disk: a read passes through the memory of one command and goes to the device. A failed check after a patch can leave the text of the patched file in `.locks`, as on every door, so name only files with no book text in `ORGTHREAD_DEVICE_PATCH`. The door writes nothing about a request to its output, which a server sends to its journal. With a local folder, each patch keeps a copy of the patched file in `ORGTHREAD_VERSIONS`, as on every door.
+With Dropbox, no text of a file goes to the disk: a read, a download and an upload pass through the memory of the door and of one command, and go on. A failed check after a patch can leave the text of the patched file in `.locks`, as on every door, so name only files with no book text in `ORGTHREAD_DEVICE_PATCH`. The door writes nothing about a request to its output, which a server sends to its journal. With a local folder, each patch keeps a copy of the patched file in `ORGTHREAD_VERSIONS`, as on every door.
 
 ## T6: the check before the first real chapter
 
@@ -210,7 +337,7 @@ Run it on a test server, with invented text only. Write the result down.
 1. Make an invented chapter with a marker word that is in no other file, such as `quendelmorgenrot`, in a test folder of the rules, for example `/books/an-invented-book/chapter-01.txt`.
 2. Pair a test device with `device pair` and `/pair`. Pair the same code again: 400.
 3. Allowed calls: `tools/list` gives `read`, `patch` and `list` only. `list` of each read folder, `read` of the chapter, of a glossary, of a summary and of a progress file, then a `patch` of the progress file. All work. A `list` of the folder above a `*`, such as `/books/`, shows the book folders and no file.
-4. Every other tool: `write`, `delete`, `search`, `copy`, `move`, `download`, `upload`, `version`. Each gives `exit code 2`, and nothing changes.
+4. Every other tool: `write`, `delete`, `search`, `copy`, `move`, `download`, `upload`, `trash`, `version`. Each gives `exit code 2`, and nothing changes. On a door with no `ORGTHREAD_DEVICE_DOWNLOAD` and `ORGTHREAD_DEVICE_UPLOAD`, `GET /download` and `PUT /upload` give 422 with exit code 2 too.
 5. Path tricks, each with `read`: a `..` part, a `.` part, other capitals, no `/` at the start, a `//`, the folder name with a letter added, a file next to a progress file, a path outside every rule, and a file directly in the folder above a `*`, such as a whole book in `/books/`. Each gives `exit code 2`.
 6. A `patch` of a file in a read folder: `exit code 2`. A `read` and a `patch` of a progress file that does not exist: exit code 6, then 5, and no new file.
 7. With `ORGTHREAD_DEVICE_CAP_HOUR=2` for the test: the third chapter read gives `exit code 2` and the read cap. The log has `capped`, and the push came once.
