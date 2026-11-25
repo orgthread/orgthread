@@ -60,7 +60,9 @@ For a device, such as an e-reader, through a door of its own:
 
   orgthread serve --http <address> --device      only list, read and patch, on the paths of
                                                  ORGTHREAD_DEVICE_READ and ORGTHREAD_DEVICE_PATCH,
-                                                 and only list in ORGTHREAD_DEVICE_LIST
+                                                 and only list in ORGTHREAD_DEVICE_LIST, and
+                                                 download, upload and trash only where
+                                                 ORGTHREAD_DEVICE_DOWNLOAD, _UPLOAD and _TRASH say
   orgthread device pair <name>                   a code of 8 signs for the device, in a terminal only
   orgthread device list                          the paired devices, with no token
   orgthread device revoke <name>                 ends the token of a device at once
@@ -135,7 +137,9 @@ download without --to sends the bytes to its output, never to a terminal. It
 notes what this name read, as read does. upload takes --size too. A text file
 may go wherever write may write. A file that is not text may go only to the
 folders of ORGTHREAD_BINARY_ALLOW. With --check, either one only checks the
-rules and the size, and moves nothing.
+rules and the size, and moves nothing. upload --expect <fingerprint> replaces
+only that version, and upload --new only makes a new file, in place of the
+version this name read.
 
 delete removes one file, never a folder, and only in the folders of
 ORGTHREAD_DELETE_ALLOW. It needs the fingerprint of the version to delete: the
@@ -175,7 +179,13 @@ patch file names it. A link is never followed. Anything else is refused, code
 2, with the log word refused. Reads of the files
 of ORGTHREAD_DEVICE_CAPPED count for the read cap: 8 in 60 minutes and 40 in 24
 hours by default. Above it the door refuses, code 2, logs capped, and runs
-ORGTHREAD_DEVICE_NOTIFY once an hour. No request or response body is logged.
+ORGTHREAD_DEVICE_NOTIFY once an hour. Only with ORGTHREAD_DEVICE_DOWNLOAD,
+ORGTHREAD_DEVICE_UPLOAD or ORGTHREAD_DEVICE_TRASH may a device download a file
+at GET /download, upload one at PUT /upload, or move one into .trash/YYYY-MM-DD/
+with the tool trash, never over a file. Each file has at most
+ORGTHREAD_DEVICE_FILE_MB, 20 by default, and downloads and uploads together at
+most ORGTHREAD_DEVICE_CAP_MB_DAY in 24 hours, 200 by default. Above it the door
+refuses, code 2, and logs capped. No request or response body is logged.
 
 move moves one file to a new name in the same storage. A rename is a move in
 the same folder. If anything is at the new name, it is refused, code 5, and
@@ -1092,10 +1102,13 @@ fn cmd_serve(args: &[String]) -> Result<i32, String> {
         [flag, address] if flag == "--http" => {
             if device_settings_set() {
                 return Err(format!(
-                    "{}, {} or {} is set, so this folder holds a device door. Start it with serve --http <address> --device, or remove those settings",
+                    "{}, {}, {}, {}, {} or {} is set, so this folder holds a device door. Start it with serve --http <address> --device, or remove those settings",
                     settings::DEVICE_READ,
                     settings::DEVICE_PATCH,
-                    settings::DEVICE_LIST
+                    settings::DEVICE_LIST,
+                    settings::DEVICE_DOWNLOAD,
+                    settings::DEVICE_UPLOAD,
+                    settings::DEVICE_TRASH
                 ));
             }
             let base = settings::public_url();
@@ -1135,6 +1148,9 @@ fn device_settings_set() -> bool {
     !settings::device_read().trim().is_empty()
         || !settings::device_patch().trim().is_empty()
         || !settings::device_list().trim().is_empty()
+        || !settings::device_download().trim().is_empty()
+        || !settings::device_upload().trim().is_empty()
+        || !settings::device_trash().trim().is_empty()
 }
 
 /// The file of the tokens and codes: `state/devices.json` beside the program,
@@ -1172,13 +1188,21 @@ fn device_door() -> Result<DeviceDoor, String> {
         &settings::device_read(),
         &settings::device_patch(),
         &settings::device_list(),
+    )
+    .with_transfer(
+        &settings::device_download(),
+        &settings::device_upload(),
+        &settings::device_trash(),
     );
     if rules.is_empty() {
         return Err(format!(
-            "a device door needs {}, {} or {}: the paths a device may touch",
+            "a device door needs {}, {} or {}, or one of {}, {} and {}: the paths a device may touch",
             settings::DEVICE_READ,
             settings::DEVICE_PATCH,
-            settings::DEVICE_LIST
+            settings::DEVICE_LIST,
+            settings::DEVICE_DOWNLOAD,
+            settings::DEVICE_UPLOAD,
+            settings::DEVICE_TRASH
         ));
     }
     let cap = device::Cap {
@@ -1186,6 +1210,10 @@ fn device_door() -> Result<DeviceDoor, String> {
         day: settings::device_cap_day()?,
     };
     let capped = settings::device_capped().map(|list| device::split(&list));
+    let moved = device_door::Moved {
+        file: settings::device_file_limit()?,
+        day: settings::device_cap_bytes_day()?,
+    };
     let base = settings::public_url();
     let prefix = match base.strip_prefix("https://") {
         Some(after) => after.find('/').map_or("", |i| &after[i..]).to_string(),
@@ -1208,7 +1236,8 @@ fn device_door() -> Result<DeviceDoor, String> {
         stored.log,
         root,
         prefix,
-    ))
+    )
+    .with_moved(moved))
 }
 
 /// `orgthread device pair <name>`, `device list` and `device revoke <name>`.
@@ -1504,14 +1533,42 @@ fn cmd_download(args: &[String]) -> Result<i32, String> {
 /// the folders of ORGTHREAD_BINARY_ALLOW.
 fn cmd_upload(args: &[String]) -> Result<i32, String> {
     let (args, check) = without_check(args);
-    let args = parse_write(&args, "upload")?;
+    // --expect <fingerprint> or --new: the version the caller saw, in place
+    // of the one this name read. The device door gives one of them.
+    let mut given = None;
+    let mut rest = Vec::new();
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--expect" => {
+                let print = words.next().ok_or("--expect needs a fingerprint")?;
+                if print.trim().is_empty() {
+                    return Err("--expect needs the fingerprint you saw, and it is empty".into());
+                }
+                if given.replace(Expect::Fingerprint(print.clone())).is_some() {
+                    return Err("upload takes one of --expect and --new".into());
+                }
+            }
+            "--new" => {
+                if given.replace(Expect::Absent).is_some() {
+                    return Err("upload takes one of --expect and --new".into());
+                }
+            }
+            _ => rest.push(arg.clone()),
+        }
+    }
+    let args = parse_write(&rest, "upload")?;
     let settings = Settings::load()?;
     let reads = Reads::new(&settings.reads);
     let path = settings.file_of(&args.file)?;
     settings.limits(&path, true)?;
     let limit = transfer::upload_limit()?;
-    let Some(expect) = expected(&reads, &args.who, &path) else {
-        return Ok(exit::FAILED);
+    let expect = match given {
+        Some(expect) => expect,
+        None => match expected(&reads, &args.who, &path) {
+            Some(expect) => expect,
+            None => return Ok(exit::FAILED),
+        },
     };
     if check {
         // Only what can be known before the bytes come: they are checked again then.

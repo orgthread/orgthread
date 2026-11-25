@@ -55,6 +55,11 @@ pub const DEVICE_CAPPED: &str = "ORGTHREAD_DEVICE_CAPPED";
 pub const DEVICE_CAP_HOUR: &str = "ORGTHREAD_DEVICE_CAP_HOUR";
 pub const DEVICE_CAP_DAY: &str = "ORGTHREAD_DEVICE_CAP_DAY";
 pub const DEVICE_NOTIFY: &str = "ORGTHREAD_DEVICE_NOTIFY";
+pub const DEVICE_DOWNLOAD: &str = "ORGTHREAD_DEVICE_DOWNLOAD";
+pub const DEVICE_UPLOAD: &str = "ORGTHREAD_DEVICE_UPLOAD";
+pub const DEVICE_TRASH: &str = "ORGTHREAD_DEVICE_TRASH";
+pub const DEVICE_FILE_MB: &str = "ORGTHREAD_DEVICE_FILE_MB";
+pub const DEVICE_CAP_MB_DAY: &str = "ORGTHREAD_DEVICE_CAP_MB_DAY";
 pub const DEVICES: &str = "ORGTHREAD_DEVICES";
 
 /// The kind of value a setting takes. It decides what a right value is.
@@ -242,7 +247,7 @@ use Doors::{Both, Dropbox as DropboxDoor, Local};
 use Group::{Basics, Device, Dropbox as DropboxGroup, FoldersAndLogs, Limits, Server, Sizes};
 
 /// Every setting, in the order of the screen.
-pub const ALL: [Setting; 36] = [
+pub const ALL: [Setting; 41] = [
     setting(
         OWNER,
         Kind::Name,
@@ -476,12 +481,52 @@ pub const ALL: [Setting; 36] = [
         "The most capped reads of one device in 24 hours.",
     ),
     setting(
+        DEVICE_DOWNLOAD,
+        Kind::Folders,
+        "none, so download is refused",
+        Both,
+        Device,
+        "Comma-separated folders from which a device may download any file as exact bytes, at any depth, in the form of ORGTHREAD_DEVICE_READ, such as /notes/. A file in a .trash folder is refused. A download does not count for the read cap, but for ORGTHREAD_DEVICE_CAP_MB_DAY.",
+    ),
+    setting(
+        DEVICE_UPLOAD,
+        Kind::Folders,
+        "none, so upload is refused",
+        Both,
+        Device,
+        "Comma-separated folders to which a device may upload any file as exact bytes, at any depth, in the form of ORGTHREAD_DEVICE_READ. The device sends the fingerprint it last saw, or none for a new file, and a file that changed since is never replaced. A file that is not text also needs ORGTHREAD_BINARY_ALLOW.",
+    ),
+    setting(
+        DEVICE_TRASH,
+        Kind::Folders,
+        "none, so trash is refused",
+        Both,
+        Device,
+        "Comma-separated folders in which a device may move a file to the trash: into .trash/YYYY-MM-DD/ of the folder of the rule, with the rest of its path, never over a file. In the form of ORGTHREAD_DEVICE_READ.",
+    ),
+    setting(
+        DEVICE_FILE_MB,
+        Kind::Megabytes,
+        "20",
+        Both,
+        Device,
+        "The largest file of a device download or upload, in MB.",
+    ),
+    setting(
+        DEVICE_CAP_MB_DAY,
+        Kind::Megabytes,
+        "200",
+        Both,
+        Device,
+        "The most MB of downloads and uploads together of one device in 24 hours. Above it the door refuses, logs capped and runs ORGTHREAD_DEVICE_NOTIFY.",
+    ),
+    setting(
         DEVICE_NOTIFY,
         Kind::Path,
         "none: the log only",
         Both,
         Device,
-        "A program that sends you a push, when a device reaches its read cap or pairs. It gets one line of text as its only argument: the device and what happened, never a path or a text of a file.",
+        "A program that sends you a push, when a device reaches its read cap or its cap in MB, or pairs. It gets one line of text as its only argument: the device and what happened, never a path or a text of a file.",
     ),
     setting(
         DEVICES,
@@ -767,6 +812,31 @@ pub fn device_cap_hour() -> Result<u64, String> {
 /// The most capped reads of one device in 24 hours.
 pub fn device_cap_day() -> Result<u64, String> {
     count_from(&env_get, DEVICE_CAP_DAY)
+}
+
+/// The folders a device may download from, as a comma-separated list.
+pub fn device_download() -> String {
+    list(DEVICE_DOWNLOAD)
+}
+
+/// The folders a device may upload to, as a comma-separated list.
+pub fn device_upload() -> String {
+    list(DEVICE_UPLOAD)
+}
+
+/// The folders in which a device may move a file to the trash.
+pub fn device_trash() -> String {
+    list(DEVICE_TRASH)
+}
+
+/// The largest file of a device download or upload, in bytes.
+pub fn device_file_limit() -> Result<u64, String> {
+    megabytes(DEVICE_FILE_MB)
+}
+
+/// The most bytes of downloads and uploads of one device in 24 hours.
+pub fn device_cap_bytes_day() -> Result<u64, String> {
+    megabytes(DEVICE_CAP_MB_DAY)
 }
 
 /// The program that sends the owner a push, if set.
@@ -1111,7 +1181,7 @@ mod tests {
 
     #[test]
     fn the_list_has_each_setting_once_with_a_prefix_and_a_help_line() {
-        assert_eq!(ALL.len(), 36);
+        assert_eq!(ALL.len(), 41);
         for (i, s) in ALL.iter().enumerate() {
             assert!(s.name.starts_with(PREFIX), "{}", s.name);
             assert!(!s.help.is_empty() && !s.default.is_empty(), "{}", s.name);

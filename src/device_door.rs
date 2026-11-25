@@ -3,18 +3,22 @@
 //! It runs as its own process, from its own folder, with its own `.env`, log,
 //! locks and file of tokens. A device logs in with a token, not with OAuth. It
 //! gets three tools, `list`, `read` and `patch`, and only on the paths of the
-//! rules. Each tool call starts the command itself, as on the other doors, so
+//! rules. Only where the rules name their folders, it also gets `trash` as a
+//! tool, and the exact bytes of a file at `GET /download` and `PUT /upload`,
+//! outside MCP, as a file may be larger than a message. Each tool call starts the command itself, as on the other doors, so
 //! the lock, the checks and the refusals of the command hold as well.
 //!
 //! No request or response body goes into the log or to the error output: only
 //! the time, the word, the path and the device.
 
 use crate::device::{self, Cap, Holder, Listing, Rules, Store};
+use crate::fingerprint::fingerprint;
 use crate::log;
+use crate::login::parse_form;
 use crate::serve::{self, INVALID_PARAMS, INVALID_REQUEST, NO_METHOD, NOT_JSON};
 use crate::write::exit;
 use serde_json::{Value, json};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,6 +32,29 @@ const MAX_FAILS: usize = 5;
 const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// The tools of this door. Every other tool is refused.
 pub const TOOLS: [&str; 3] = ["list", "read", "patch"];
+/// The status of an answer at `/download` or `/upload` that is no success: a
+/// refusal or a failure of the command, with its exit code in the body.
+const NOT_DONE: &str = "422 Unprocessable Content";
+/// A trash move tries `a.note`, then `a (2).note` and so on, up to this many.
+const TRASH_TRIES: usize = 20;
+
+/// The limits of download and upload of a device, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moved {
+    /// The largest file.
+    pub file: u64,
+    /// The most bytes of downloads and uploads together in 24 hours.
+    pub day: u64,
+}
+
+impl Default for Moved {
+    fn default() -> Self {
+        Moved {
+            file: 20_000_000,
+            day: 200_000_000,
+        }
+    }
+}
 
 /// The settings of a device door, read once at its start.
 pub struct DeviceDoor {
@@ -37,6 +64,8 @@ pub struct DeviceDoor {
     /// The files whose reads count for the cap. `None`: every read counts.
     pub capped: Option<Vec<String>>,
     pub cap: Cap,
+    /// The limits of download and upload.
+    pub moved: Moved,
     pub store: Store,
     /// The program that sends the owner a push.
     pub notify: Option<PathBuf>,
@@ -67,6 +96,7 @@ impl DeviceDoor {
             rules,
             capped,
             cap,
+            moved: Moved::default(),
             store,
             notify,
             log,
@@ -74,6 +104,21 @@ impl DeviceDoor {
             prefix,
             fails: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The same door, with other limits for download and upload.
+    pub fn with_moved(mut self, moved: Moved) -> DeviceDoor {
+        self.moved = moved;
+        self
+    }
+
+    /// The tools that `tools/list` shows: `trash` only where its rules are set.
+    fn offered(&self) -> Vec<&'static str> {
+        let mut tools = TOOLS.to_vec();
+        if !self.rules.trash.is_empty() {
+            tools.push("trash");
+        }
+        tools
     }
 
     /// One line in the log: the time, the word, the path and the device.
@@ -176,6 +221,14 @@ fn handle(mut stream: TcpStream, door: &DeviceDoor, exe: &Path) -> io::Result<()
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let head = serve::read_head(&mut reader)?;
+    // An upload may be larger than any other request: its body is read only
+    // after the token, the rules and the limits allow it.
+    if head.method == "PUT" && head.path.strip_prefix(door.prefix.as_str()) == Some("/upload") {
+        let Some(holder) = holder_of(&mut stream, door, &head.bearer)? else {
+            return Ok(());
+        };
+        return upload(&mut stream, &mut reader, &head, door, exe, &holder);
+    }
     if head.length > MAX_BODY {
         return serve::respond(&mut stream, "413 Content Too Large", "", b"");
     }
@@ -187,17 +240,18 @@ fn handle(mut stream: TcpStream, door: &DeviceDoor, exe: &Path) -> io::Result<()
     };
     match (head.method.as_str(), path) {
         ("POST", "/pair") => pair(&mut stream, door, &body),
+        (method, "/download" | "/upload") => {
+            let Some(holder) = holder_of(&mut stream, door, &head.bearer)? else {
+                return Ok(());
+            };
+            match (method, path) {
+                ("GET", "/download") => download(&mut stream, &head, door, exe, &holder),
+                _ => serve::respond(&mut stream, "405 Method Not Allowed", "", b""),
+            }
+        }
         (method, "/mcp") => {
-            let holder = match door.store.holder(&door.app, &head.bearer, device::now()) {
-                Ok(Some(holder)) => holder,
-                Ok(None) => {
-                    let extra = "WWW-Authenticate: Bearer\r\n";
-                    return serve::respond(&mut stream, "401 Unauthorized", extra, b"");
-                }
-                Err(e) => {
-                    eprintln!("orgthread: could not read the tokens: {e}");
-                    return serve::respond(&mut stream, "500 Internal Server Error", "", b"");
-                }
+            let Some(holder) = holder_of(&mut stream, door, &head.bearer)? else {
+                return Ok(());
             };
             if method != "POST" {
                 return serve::respond(&mut stream, "405 Method Not Allowed", "", b"");
@@ -212,6 +266,29 @@ fn handle(mut stream: TcpStream, door: &DeviceDoor, exe: &Path) -> io::Result<()
             }
         }
         _ => serve::respond(&mut stream, "404 Not Found", "", b""),
+    }
+}
+
+/// The holder of the token of a request. Without one that works, the answer
+/// is an empty 401, or a 500 when the file of the tokens cannot be read, and
+/// the result is `None`.
+fn holder_of(
+    stream: &mut TcpStream,
+    door: &DeviceDoor,
+    bearer: &str,
+) -> io::Result<Option<Holder>> {
+    match door.store.holder(&door.app, bearer, device::now()) {
+        Ok(Some(holder)) => Ok(Some(holder)),
+        Ok(None) => {
+            let extra = "WWW-Authenticate: Bearer\r\n";
+            serve::respond(stream, "401 Unauthorized", extra, b"")?;
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("orgthread: could not read the tokens: {e}");
+            serve::respond(stream, "500 Internal Server Error", "", b"")?;
+            Ok(None)
+        }
     }
 }
 
@@ -263,7 +340,7 @@ fn answer(message: &Value, exe: &Path, door: &DeviceDoor, holder: &Holder) -> Op
     let result = match method.as_str() {
         Some("initialize") => Ok(serve::greeting(params)),
         Some("ping") => Ok(json!({})),
-        Some("tools/list") => Ok(tools()),
+        Some("tools/list") => Ok(tools(door)),
         Some("tools/call") => call(params, exe, door, holder),
         _ => Err((NO_METHOD, format!("there is no method {method}"))),
     };
@@ -273,10 +350,11 @@ fn answer(message: &Value, exe: &Path, door: &DeviceDoor, holder: &Holder) -> Op
     })
 }
 
-/// The three tools. There is no `who`: the door names the device itself.
-fn tools() -> Value {
+/// The three tools, and `trash` where its rules are set. There is no `who`:
+/// the door names the device itself.
+fn tools(door: &DeviceDoor) -> Value {
     let file = json!({"type": "string", "description": "The full path of the file, from the root: /books/a/chapter-01.txt"});
-    json!({"tools": [
+    let mut value = json!({"tools": [
         {
             "name": "read",
             "description": "Gives the exact text of a file, and notes that this device read it.",
@@ -336,7 +414,32 @@ fn tools() -> Value {
                 "required": ["folders"],
             },
         },
-    ]})
+    ]});
+    if !door.rules.trash.is_empty() {
+        let tool = json!({
+            "name": "trash",
+            "description": "Moves a file into .trash/YYYY-MM-DD/ of its folder, with the rest \
+                of its path, never over a file: a second file of the same name and day gets \
+                (2), and so on. Only the version of fingerprint moves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": file,
+                    "fingerprint": {"type": "string", "description": "The fingerprint this device saw, from list"},
+                },
+                "required": ["file", "fingerprint"],
+            },
+        });
+        if let Some(list) = value["tools"].as_array_mut() {
+            list.push(tool);
+        }
+    }
+    value
+}
+
+/// True when `text` is a fingerprint: 64 small hex signs.
+fn is_fingerprint(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A refusal of the door itself, with exit code 2 as for a closed path, and
@@ -469,16 +572,338 @@ fn call(
             }
             Ok(value)
         }
+        "trash" if !door.rules.trash.is_empty() => {
+            let file = text_of("file")?;
+            let print = text_of("fingerprint")?;
+            if !is_fingerprint(print) {
+                return Err((
+                    INVALID_PARAMS,
+                    "trash needs fingerprint, the 64 signs that list gives".into(),
+                ));
+            }
+            let date = device::date_text(device::now());
+            let place = door.rules.trash(file, &date).and_then(|to| {
+                door.no_link(file)?;
+                door.no_link(&to)?;
+                Ok(to)
+            });
+            let to = match place {
+                Ok(to) => to,
+                Err(why) => return Ok(refuse(door, holder, file, &why)),
+            };
+            let from = door.for_command(file);
+            let mut run = None;
+            for n in 1..=TRASH_TRIES {
+                let name = if n == 1 {
+                    to.clone()
+                } else {
+                    device::numbered(&to, n)
+                };
+                let target = door.for_command(&name);
+                let args = [
+                    "move",
+                    "--who",
+                    &who,
+                    "--fingerprint",
+                    print,
+                    "--",
+                    &from,
+                    &target,
+                ];
+                let done = serve::start(exe, &args, None);
+                let taken = matches!(&done, Ok(out) if out.status.code() == Some(exit::EXISTS));
+                run = Some(done);
+                if !taken {
+                    break;
+                }
+            }
+            let run = run.unwrap_or_else(|| Err(io::Error::other("no move was tried")));
+            Ok(tidied(door, Some("trash"), run))
+        }
         _ => {
             let path = arguments["file"].as_str().unwrap_or_default();
-            let reason = format!(
+            let mut reason = format!(
                 "refused. This door offers only {}, and not {}.",
-                TOOLS.join(", "),
+                door.offered().join(", "),
                 device::shown(name)
             );
+            let open = match name {
+                "download" => !door.rules.download.is_empty(),
+                "upload" => !door.rules.upload.is_empty(),
+                _ => false,
+            };
+            if open {
+                reason.push_str(" A device moves the bytes of a file with GET /download or PUT /upload, outside /mcp.");
+            }
             Ok(refuse(door, holder, path, &reason))
         }
     }
+}
+
+/// The answer at `/download` or `/upload` that is no success: 422, with the
+/// exit code and the text, in the form of a refused tool.
+fn not_done(stream: &mut TcpStream, code: i32, text: &str) -> io::Result<()> {
+    let answer = json!({"exit": code, "text": text});
+    serve::respond_json(stream, NOT_DONE, &answer)
+}
+
+/// A refusal of the door at `/download` or `/upload`: exit code 2 and one log
+/// line, as `refuse` gives for a tool.
+fn not_allowed(
+    stream: &mut TcpStream,
+    door: &DeviceDoor,
+    holder: &Holder,
+    path: &str,
+    reason: &str,
+) -> io::Result<()> {
+    let who = device::who(&holder.device, &holder.app);
+    door.log("refused", path, &who);
+    let text = format!("exit code {}\norgthread: {reason}\n", exit::USAGE);
+    not_done(stream, exit::USAGE, &text)
+}
+
+/// The text of a command that did not end with 0, tidied for the device.
+fn said(door: &DeviceDoor, out: &std::process::Output) -> String {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    match out.status.code() {
+        Some(code) => door.tidy(&format!("exit code {code}\n{text}")),
+        None => door.tidy(&format!("the command was stopped\n{text}")),
+    }
+}
+
+/// The one file of a request at `/download` or `/upload`: `?file=<path>`,
+/// with `%XX` and `+` decoded, as a form gives it.
+fn file_of(head: &serve::Head) -> Result<String, String> {
+    parse_form(&head.query)
+        .remove("file")
+        .filter(|file| !file.is_empty())
+        .ok_or_else(|| "needs ?file=<path>, the full path of the file from the root".into())
+}
+
+/// Counts `bytes` against the cap in MB of the day. `Ok(true)` means go on;
+/// `Ok(false)` means the answer is sent: capped, or the count failed.
+fn count_moved(
+    stream: &mut TcpStream,
+    door: &DeviceDoor,
+    holder: &Holder,
+    path: &str,
+    bytes: u64,
+) -> io::Result<bool> {
+    let who = device::who(&holder.device, &holder.app);
+    match door
+        .store
+        .count_bytes(holder, door.moved.day, bytes, device::now())
+    {
+        Ok(None) => Ok(true),
+        Ok(Some(capped)) => {
+            door.log("capped", path, &who);
+            if capped.warn {
+                door.notify(&device::moved_notice(holder, &capped), &who);
+            }
+            let text = format!(
+                "exit code {}\norgthread: refused. This device reached its cap of {} for downloads and uploads. It may move files again after {}.\n",
+                exit::USAGE,
+                capped.reached,
+                device::time_text(capped.until)
+            );
+            not_done(stream, exit::USAGE, &text)?;
+            Ok(false)
+        }
+        Err(e) => {
+            let text = format!(
+                "exit code {}\norgthread: could not count the transfer: {e}\n",
+                exit::FAILED
+            );
+            not_done(stream, exit::FAILED, &text)?;
+            Ok(false)
+        }
+    }
+}
+
+/// `GET /download?file=<path>`: the exact bytes of one file, with its
+/// fingerprint in the header `X-Orgthread-Fingerprint`.
+fn download(
+    stream: &mut TcpStream,
+    head: &serve::Head,
+    door: &DeviceDoor,
+    exe: &Path,
+    holder: &Holder,
+) -> io::Result<()> {
+    let file = match file_of(head) {
+        Ok(file) => file,
+        Err(why) => return not_allowed(stream, door, holder, "", &format!("download {why}")),
+    };
+    if door.rules.download.is_empty() {
+        let why = format!(
+            "refused. This door offers no download: {} is not set.",
+            crate::settings::DEVICE_DOWNLOAD
+        );
+        return not_allowed(stream, door, holder, &file, &why);
+    }
+    if let Err(why) = door
+        .rules
+        .download(&file)
+        .and_then(|()| door.no_link(&file))
+    {
+        return not_allowed(stream, door, holder, &file, &why);
+    }
+    let who = device::who(&holder.device, &holder.app);
+    let target = door.for_command(&file);
+    // First the size, so a file over a limit moves no byte.
+    let checked = serve::start(exe, &["download", "--check", "--who", &who, &target], None)?;
+    if !checked.status.success() {
+        let code = checked.status.code().unwrap_or(exit::FAILED);
+        return not_done(stream, code, &said(door, &checked));
+    }
+    let size: u64 = String::from_utf8_lossy(&checked.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(u64::MAX);
+    if size > door.moved.file {
+        let why = format!(
+            "refused. {} has {size} bytes, more than the limit of {} MB of a device file",
+            device::shown(&file),
+            door.moved.file / 1_000_000
+        );
+        return not_allowed(stream, door, holder, &file, &why);
+    }
+    if !count_moved(stream, door, holder, &file, size)? {
+        return Ok(());
+    }
+    let out = serve::start(exe, &["download", "--who", &who, &target], None)?;
+    let code = out.status.code().unwrap_or(exit::FAILED);
+    // 8: the bytes went out whole, only the log line failed.
+    if code != 0 && code != exit::NOT_LOGGED {
+        return not_done(stream, code, &said(door, &out));
+    }
+    if out.stdout.len() as u64 > door.moved.file {
+        let why = format!(
+            "refused. {} grew past the limit of {} MB of a device file during the download",
+            device::shown(&file),
+            door.moved.file / 1_000_000
+        );
+        return not_allowed(stream, door, holder, &file, &why);
+    }
+    let extra = format!(
+        "Content-Type: application/octet-stream\r\nX-Orgthread-Fingerprint: {}\r\nX-Orgthread-Exit: {code}\r\n",
+        fingerprint(&out.stdout)
+    );
+    serve::respond(stream, "200 OK", &extra, &out.stdout)
+}
+
+/// Reads and drops the body of a refused upload, so the device can read the
+/// answer, up to `max` bytes and for at most a few seconds.
+fn drop_body(reader: &mut BufReader<TcpStream>, head: &serve::Head, max: u64) {
+    if head.length == 0 || head.wants_continue {
+        return;
+    }
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(5)));
+    let rest = (head.length as u64).min(max);
+    let _ = io::copy(&mut reader.by_ref().take(rest), &mut io::sink());
+}
+
+/// `PUT /upload?file=<path>&fingerprint=<the version it replaces>`: the exact
+/// bytes of one file, written by the `upload` command. With no fingerprint,
+/// the file must be new. The answer gives the new fingerprint.
+fn upload(
+    stream: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    head: &serve::Head,
+    door: &DeviceDoor,
+    exe: &Path,
+    holder: &Holder,
+) -> io::Result<()> {
+    let limit = door.moved.file;
+    // The answer of a refusal comes before the body, which is then dropped.
+    let refused = |stream: &mut TcpStream,
+                   reader: &mut BufReader<TcpStream>,
+                   path: &str,
+                   why: &str|
+     -> io::Result<()> {
+        not_allowed(stream, door, holder, path, why)?;
+        drop_body(reader, head, limit);
+        Ok(())
+    };
+    let query = parse_form(&head.query);
+    let file = match file_of(head) {
+        Ok(file) => file,
+        Err(why) => return refused(stream, reader, "", &format!("upload {why}")),
+    };
+    if door.rules.upload.is_empty() {
+        let why = format!(
+            "refused. This door offers no upload: {} is not set.",
+            crate::settings::DEVICE_UPLOAD
+        );
+        return refused(stream, reader, &file, &why);
+    }
+    if let Err(why) = door.rules.upload(&file).and_then(|()| door.no_link(&file)) {
+        return refused(stream, reader, &file, &why);
+    }
+    let expect = match query.get("fingerprint").map(String::as_str) {
+        None | Some("") => None,
+        Some(print) if is_fingerprint(print) => Some(print.to_string()),
+        Some(_) => {
+            let why =
+                "upload needs fingerprint as the 64 signs that list gives, or none for a new file";
+            return refused(stream, reader, &file, why);
+        }
+    };
+    if !head.has_length {
+        let why = "upload needs a Content-Length, and takes no chunked body";
+        return refused(stream, reader, &file, why);
+    }
+    let length = head.length as u64;
+    if length > limit {
+        let why = format!(
+            "refused. The new file has {length} bytes, more than the limit of {} MB of a device file",
+            limit / 1_000_000
+        );
+        // Too large to drop in good time: the answer comes, and the rest stays unread.
+        not_allowed(stream, door, holder, &file, &why)?;
+        drop_body(reader, head, MAX_BODY as u64);
+        return Ok(());
+    }
+    if !count_moved(stream, door, holder, &file, length)? {
+        drop_body(reader, head, limit);
+        return Ok(());
+    }
+    if head.wants_continue {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+    }
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(60)));
+    let mut body = vec![0; head.length];
+    reader.read_exact(&mut body)?;
+    let print = fingerprint(&body);
+    let who = device::who(&holder.device, &holder.app);
+    let size = head.length.to_string();
+    let target = door.for_command(&file);
+    let mut args = vec!["upload", "--who", &who, "--size", &size];
+    match &expect {
+        Some(seen) => args.extend(["--expect", seen.as_str()]),
+        None => args.push("--new"),
+    }
+    args.push(&target);
+    let out = serve::start(exe, &args, Some(&body))?;
+    let code = out.status.code().unwrap_or(exit::FAILED);
+    // 8 and 10: written, with a log line or the clean-up left.
+    if code == 0 || code == exit::NOT_LOGGED || code == exit::LOCK_PROBLEM {
+        let text = door.tidy(&format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+        let answer = json!({"exit": code, "fingerprint": print, "size": length, "text": text});
+        return serve::respond_json(stream, "200 OK", &answer);
+    }
+    not_done(stream, code, &said(door, &out))
 }
 
 /// The result of a command, as the other doors give it. The text of a file

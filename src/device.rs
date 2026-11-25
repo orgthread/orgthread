@@ -281,7 +281,17 @@ pub struct Rules {
     /// Folders in the form of `read`, open to `list` only. A file in them is
     /// closed to `read` and `patch`, even where `read` or `patch` names it.
     pub list: Vec<String>,
+    /// Folders in the form of `read`, open to `download` of exact bytes.
+    pub download: Vec<String>,
+    /// Folders in the form of `read`, open to `upload` of exact bytes.
+    pub upload: Vec<String>,
+    /// Folders in the form of `read`, in which a file may go to the trash.
+    pub trash: Vec<String>,
 }
+
+/// The name of the trash folder inside a folder of the trash rules. No new
+/// tool touches a path with a part of this name: the trash is the owner's.
+pub const TRASH: &str = ".trash";
 
 /// How much of a folder a device may list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,11 +309,88 @@ impl Rules {
             read: split(read),
             patch: split(patch),
             list: split(list),
+            ..Rules::default()
         }
     }
 
+    /// The same rules, with the folders of `download`, `upload` and `trash`.
+    pub fn with_transfer(mut self, download: &str, upload: &str, trash: &str) -> Rules {
+        self.download = split(download);
+        self.upload = split(upload);
+        self.trash = split(trash);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.read.is_empty() && self.patch.is_empty() && self.list.is_empty()
+        self.read.is_empty()
+            && self.patch.is_empty()
+            && self.list.is_empty()
+            && self.download.is_empty()
+            && self.upload.is_empty()
+            && self.trash.is_empty()
+    }
+
+    /// `Ok` when `path` is a clean file with no `.trash` part.
+    fn transfer_file(path: &str) -> Result<(), String> {
+        clean(path)?;
+        if path.ends_with('/') {
+            return Err(format!("{} names a folder, not a file", shown(path)));
+        }
+        if parts(path).contains(&TRASH) {
+            return Err(format!(
+                "{} lies in a {TRASH} folder, which this door leaves to its owner",
+                shown(path)
+            ));
+        }
+        Ok(())
+    }
+
+    /// `Ok` when a device may download the exact bytes of the file `path`.
+    pub fn download(&self, path: &str) -> Result<(), String> {
+        Rules::transfer_file(path)?;
+        if under_a_rule(&self.download, &parts(path), true) {
+            return Ok(());
+        }
+        Err(format!(
+            "{} is outside the folders this door may download from",
+            shown(path)
+        ))
+    }
+
+    /// `Ok` when a device may upload the exact bytes of the file `path`.
+    pub fn upload(&self, path: &str) -> Result<(), String> {
+        Rules::transfer_file(path)?;
+        if under_a_rule(&self.upload, &parts(path), true) {
+            return Ok(());
+        }
+        Err(format!(
+            "{} is outside the folders this door may upload to",
+            shown(path)
+        ))
+    }
+
+    /// The place in the trash for the file `path` on the day `date`, such as
+    /// `/notes/.trash/2026-11-25/a/b.note` for `/notes/a/b.note` and the rule
+    /// `/notes/`: the folder of the rule, `.trash`, the day, and the rest of
+    /// the path.
+    pub fn trash(&self, path: &str, date: &str) -> Result<String, String> {
+        Rules::transfer_file(path)?;
+        let asked = parts(path);
+        let rule = self.trash.iter().map(|r| parts(r)).find(|rule| {
+            asked.len() > rule.len() && rule.iter().zip(&asked).all(|(r, p)| glob(r, p))
+        });
+        let Some(rule) = rule else {
+            return Err(format!(
+                "{} is outside the folders this door may move to the trash",
+                shown(path)
+            ));
+        };
+        let (folder, rest) = asked.split_at(rule.len());
+        Ok(format!(
+            "/{}/{TRASH}/{date}/{}",
+            folder.join("/"),
+            rest.join("/")
+        ))
     }
 
     fn in_read_folder(&self, path: &str) -> bool {
@@ -388,6 +475,18 @@ impl Rules {
     }
 }
 
+/// The `n`th name to try in the trash, from 2 on: `a (2).note` for
+/// `a.note`, so a second file of the same name and day never goes over the
+/// first.
+pub fn numbered(path: &str, n: usize) -> String {
+    let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let numbered = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    };
+    format!("{folder}/{numbered}")
+}
+
 /// `Ok` when no part of `path` below `root` is a link. A part that does not
 /// exist is fine: the command then says that the file is missing. Only a local
 /// folder has links: Dropbox has none.
@@ -431,6 +530,11 @@ pub struct Token {
     pub reads: Vec<u64>,
     /// When the owner was last told that this device reached its cap.
     pub warned: u64,
+    /// The time and the bytes of each download and upload of the last 24
+    /// hours.
+    pub moved: Vec<(u64, u64)>,
+    /// When the owner was last told that this device reached its cap in MB.
+    pub warned_moved: u64,
 }
 
 /// Everything the file holds.
@@ -473,6 +577,15 @@ impl Devices {
                         .map(|r| r.iter().map(number).collect())
                         .unwrap_or_default(),
                     warned: number(&t["warned"]),
+                    moved: t["moved"]
+                        .as_array()
+                        .map(|m| {
+                            m.iter()
+                                .map(|pair| (number(&pair[0]), number(&pair[1])))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    warned_moved: number(&t["warned_moved"]),
                 })
                 .collect(),
         }
@@ -486,6 +599,8 @@ impl Devices {
             "tokens": self.tokens.iter().map(|t| json!({
                 "hash": t.hash, "device": t.device, "app": t.app, "made": t.made,
                 "until": t.until, "reads": t.reads, "warned": t.warned,
+                "moved": t.moved.iter().map(|(at, bytes)| json!([at, bytes])).collect::<Vec<_>>(),
+                "warned_moved": t.warned_moved,
             })).collect::<Vec<_>>(),
         })
     }
@@ -496,6 +611,7 @@ impl Devices {
         self.tokens.retain(|t| t.until > now);
         for token in &mut self.tokens {
             token.reads.retain(|r| r + DAY > now);
+            token.moved.retain(|(at, _)| at + DAY > now);
         }
     }
 }
@@ -659,6 +775,8 @@ impl Store {
                 until,
                 reads: Vec::new(),
                 warned: 0,
+                moved: Vec::new(),
+                warned_moved: 0,
             });
             Some(Paired {
                 token,
@@ -734,6 +852,54 @@ impl Store {
         })
     }
 
+    /// Counts a download or an upload of `bytes` of `holder` against the cap
+    /// of `cap` bytes in 24 hours, or refuses it. A refused one does not
+    /// count. `Ok(None)` means the transfer may go on.
+    pub fn count_bytes(
+        &self,
+        holder: &Holder,
+        cap: u64,
+        bytes: u64,
+        now: u64,
+    ) -> io::Result<Option<Capped>> {
+        self.change(now, |d| {
+            let Some(token) = d.tokens.iter_mut().find(|t| t.hash == holder.hash) else {
+                return Some(Capped {
+                    reached: "a revoked token".into(),
+                    until: now,
+                    warn: false,
+                });
+            };
+            let used: u64 = token.moved.iter().map(|(_, b)| b).sum();
+            if used.saturating_add(bytes) <= cap {
+                token.moved.push((now, bytes));
+                return None;
+            }
+            // The next transfer of this size fits once enough of the oldest
+            // ones are older than a day.
+            let mut moved = token.moved.clone();
+            moved.sort_unstable();
+            let mut left = used;
+            let mut until = now + DAY;
+            for (at, b) in moved {
+                if left.saturating_add(bytes) <= cap {
+                    break;
+                }
+                left -= b;
+                until = at + DAY;
+            }
+            let warn = token.warned_moved + HOUR <= now;
+            if warn {
+                token.warned_moved = now;
+            }
+            Some(Capped {
+                reached: format!("{} MB in 24 hours", cap / 1_000_000),
+                until,
+                warn,
+            })
+        })
+    }
+
     /// Ends every token and code of `device`. False when it had none.
     pub fn revoke(&self, device: &str, now: u64) -> io::Result<bool> {
         self.change(now, |d| {
@@ -768,6 +934,15 @@ pub fn list_text(devices: &Devices, now: u64) -> String {
             hour,
             t.reads.len()
         ));
+        if !t.moved.is_empty() {
+            let bytes: u64 = t.moved.iter().map(|(_, b)| b).sum();
+            out.push_str(&format!(
+                "{}  downloads and uploads: {} in 24 hours, {} bytes\n",
+                who(&t.device, &t.app),
+                t.moved.len(),
+                bytes
+            ));
+        }
     }
     for c in &devices.codes {
         out.push_str(&format!(
@@ -784,6 +959,18 @@ pub fn list_text(devices: &Devices, now: u64) -> String {
 pub fn cap_notice(holder: &Holder, capped: &Capped) -> String {
     format!(
         "orgthread: the device {} reached its read cap of {}. The door refuses its capped reads until {}. To end its token: orgthread device revoke {}",
+        who(&holder.device, &holder.app),
+        capped.reached,
+        time_text(capped.until),
+        holder.device
+    )
+}
+
+/// The push when a device reaches its cap in MB. It names the device and the
+/// cap, never a path or a text of a file.
+pub fn moved_notice(holder: &Holder, capped: &Capped) -> String {
+    format!(
+        "orgthread: the device {} reached its cap of {} for downloads and uploads. The door refuses its downloads and uploads until {}. To end its token: orgthread device revoke {}",
         who(&holder.device, &holder.app),
         capped.reached,
         time_text(capped.until),
@@ -1174,5 +1361,77 @@ mod tests {
         for wrong in ["", "Tablet", "my tablet", "-x", "a\tb", &"x".repeat(33)] {
             assert!(check_name(wrong).is_err(), "{wrong:?}");
         }
+    }
+
+    #[test]
+    fn a_trash_place_keeps_the_rest_of_the_path_and_a_number_never_goes_over() {
+        let r = Rules::default().with_transfer("", "", "/notes/, /a/*/");
+        assert_eq!(
+            r.trash("/notes/sub/b.note", "2026-11-25").unwrap(),
+            "/notes/.trash/2026-11-25/sub/b.note"
+        );
+        assert_eq!(
+            r.trash("/a/x/c.note", "2026-11-25").unwrap(),
+            "/a/x/.trash/2026-11-25/c.note"
+        );
+        assert!(r.trash("/notes/", "2026-11-25").is_err());
+        assert!(
+            r.trash("/notes/.trash/2026-11-25/b.note", "2026-11-25")
+                .is_err()
+        );
+        assert!(
+            r.trash("/a/c.note", "2026-11-25").is_err(),
+            "the star needs a folder"
+        );
+        assert_eq!(numbered("/n/b.note", 2), "/n/b (2).note");
+        assert_eq!(numbered("/n/README", 3), "/n/README (3)");
+        assert_eq!(numbered("/n/.hidden", 2), "/n/.hidden (2)");
+    }
+
+    #[test]
+    fn the_cap_in_mb_counts_downloads_and_uploads_and_opens_after_a_day() {
+        let dir = std::env::temp_dir().join(format!("orgthread-moved-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::new(dir.join("devices.json"));
+        let now = 10 * DAY;
+        let code = store.issue("tablet", now).unwrap();
+        let paired = store.pair("desk", &code, now).unwrap().unwrap();
+        let holder = store.holder("desk", &paired.token, now).unwrap().unwrap();
+        let cap = 10_000_000;
+        assert_eq!(
+            store.count_bytes(&holder, cap, 6_000_000, now).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .count_bytes(&holder, cap, 3_000_000, now + 60)
+                .unwrap(),
+            None
+        );
+        let capped = store
+            .count_bytes(&holder, cap, 2_000_000, now + 120)
+            .unwrap()
+            .unwrap();
+        assert_eq!(capped.reached, "10 MB in 24 hours");
+        assert_eq!(capped.until, now + DAY, "once the first is a day old");
+        assert!(capped.warn);
+        let again = store
+            .count_bytes(&holder, cap, 2_000_000, now + 180)
+            .unwrap()
+            .unwrap();
+        assert!(!again.warn, "one push an hour");
+        assert_eq!(
+            store
+                .count_bytes(&holder, cap, 1_000_000, now + 240)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .count_bytes(&holder, cap, 2_000_000, now + DAY)
+                .unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

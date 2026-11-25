@@ -47,6 +47,14 @@ const LESSONS: [(&str, &str); 4] = [
     ),
 ];
 
+/// Invented bytes of a note, not text: every byte value, NUL included, in a
+/// pattern that differs with `seed`.
+fn note_bytes(seed: u8) -> Vec<u8> {
+    (0..3000u32)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+        .collect()
+}
+
 /// One door at a time, as for the other doors over HTTP.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -60,6 +68,27 @@ struct Door {
 struct Reply {
     status: u16,
     body: String,
+}
+
+/// An answer with its headers and its exact bytes.
+struct Bytes {
+    status: u16,
+    head: String,
+    body: Vec<u8>,
+}
+
+impl Bytes {
+    fn header(&self, name: &str) -> Option<String> {
+        self.head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
 }
 
 /// The sample folder: a book, its glossary, its summary, the progress file, a
@@ -100,6 +129,10 @@ fn sample(dir: &Path) {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(file, text).unwrap();
     }
+    let notes = root.join("notes");
+    fs::create_dir_all(notes.join("sub")).unwrap();
+    fs::write(notes.join("a.note"), note_bytes(1)).unwrap();
+    fs::write(notes.join("sub/b.note"), note_bytes(2)).unwrap();
     std::os::unix::fs::symlink(root.join("health"), book.join("sneaky")).unwrap();
     std::os::unix::fs::symlink(
         root.join("health/invented-health.md"),
@@ -237,6 +270,45 @@ impl Door {
             status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
             body: body.to_string(),
         }
+    }
+
+    fn raw_bytes(&self, method: &str, path: &str, extra: &str, body: &[u8]) -> Bytes {
+        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let text = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        s.write_all(text.as_bytes()).unwrap();
+        // A refusal may come before the whole body is read.
+        let _ = s.write_all(body);
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&out[..at]).to_string();
+        Bytes {
+            status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            head,
+            body: out[at + 4..].to_vec(),
+        }
+    }
+
+    fn download(&self, token: &str, file: &str) -> Bytes {
+        let extra = format!("Authorization: Bearer {token}\r\n");
+        let path = format!("{PREFIX}/download?file={}", encoded(file));
+        self.raw_bytes("GET", &path, &extra, b"")
+    }
+
+    fn upload(&self, token: &str, file: &str, seen: Option<&str>, bytes: &[u8]) -> Bytes {
+        let extra = format!("Authorization: Bearer {token}\r\n");
+        let mut path = format!("{PREFIX}/upload?file={}", encoded(file));
+        if let Some(seen) = seen {
+            path.push_str(&format!("&fingerprint={seen}"));
+        }
+        self.raw_bytes("PUT", &path, &extra, bytes)
+    }
+
+    fn root_bytes(&self, path: &str) -> Option<Vec<u8>> {
+        fs::read(self.dir.join("root").join(path.trim_start_matches('/'))).ok()
     }
 
     fn pair_with(&self, code: &str) -> Reply {
@@ -1178,4 +1250,319 @@ fn a_list_costs_no_read_and_a_list_folder_beats_a_read_folder() {
             .read(&token, "/reading/glossary/an-invented-book/glossary-01.md")
             .0
     );
+}
+
+// The tools of a sync: download, upload and trash.
+
+/// A path for a query, with `%XX` for each sign that is not plain, as
+/// `URLEncoder` of Java gives it, but with `%20` for a space.
+fn encoded(path: &str) -> String {
+    path.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The settings of a door for a sync of `/notes/`.
+const SYNC: [(&str, &str); 4] = [
+    ("ORGTHREAD_DEVICE_DOWNLOAD", "/notes/"),
+    ("ORGTHREAD_DEVICE_UPLOAD", "/notes/"),
+    ("ORGTHREAD_DEVICE_TRASH", "/notes/"),
+    ("ORGTHREAD_BINARY_ALLOW", "/notes/"),
+];
+
+fn sync_door(name: &str, more: &[(&str, &str)]) -> Door {
+    let mut change = SYNC.to_vec();
+    change.extend_from_slice(more);
+    Door::open_changed(name, "8", &change)
+}
+
+fn print_of(bytes: &[u8]) -> String {
+    orgthread::fingerprint::fingerprint(bytes)
+}
+
+/// The exit code and the text of an answer that is no success.
+fn not_done(reply: &Bytes) -> (i64, String) {
+    assert_eq!(
+        reply.status,
+        422,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let answer = reply.json();
+    (
+        answer["exit"].as_i64().unwrap(),
+        answer["text"].as_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn a_door_without_the_new_settings_refuses_download_upload_and_trash() {
+    let door = Door::open("no-sync");
+    let token = door.pair();
+    let chapter = format!("{BOOK}/chapter-01.txt");
+    let (code, text) = not_done(&door.download(&token, &chapter));
+    assert_eq!(code, 2);
+    assert!(text.starts_with("exit code 2\n"), "{text}");
+    assert!(text.contains("offers no download"), "{text}");
+    assert!(!text.contains("Kapitel"), "{text}");
+    let (code, text) = not_done(&door.upload(&token, PROGRESS_FILE, None, b"new\n"));
+    assert_eq!(code, 2);
+    assert!(text.contains("offers no upload"), "{text}");
+    assert_eq!(door.root_file(PROGRESS_FILE), PROGRESS, "unchanged");
+    let (refused, text) = door.call(
+        &token,
+        "trash",
+        json!({"file": PROGRESS_FILE, "fingerprint": "0".repeat(64)}),
+    );
+    assert!(refused && text.starts_with("exit code 2\n"), "{text}");
+    assert!(text.contains("offers only list, read, patch"), "{text}");
+    assert_eq!(door.root_file(PROGRESS_FILE), PROGRESS, "unchanged");
+    assert_eq!(door.log().matches("\trefused\t").count(), 3);
+    // A download is no read either: the cap of the reads did not count it.
+    assert!(!door.log().contains("\tdownloaded\t"));
+    // Without a token, the new places are closed as /mcp is.
+    assert_eq!(door.download("", &chapter).status, 401);
+    assert_eq!(door.upload("", PROGRESS_FILE, None, b"x").status, 401);
+}
+
+#[test]
+fn binary_bytes_round_trip_exactly() {
+    let door = sync_door("round-trip", &[]);
+    let token = door.pair();
+    let tools = door.mcp(&token, "tools/list", json!({}));
+    let tools: Value = serde_json::from_str(&tools.body).unwrap();
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["read", "patch", "list", "trash"]);
+
+    let got = door.download(&token, "/notes/a.note");
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.body, note_bytes(1), "the exact bytes");
+    let seen = got.header("X-Orgthread-Fingerprint").unwrap();
+    assert_eq!(seen, print_of(&note_bytes(1)));
+    assert_eq!(
+        got.header("Content-Type").unwrap(),
+        "application/octet-stream"
+    );
+
+    // The device changed the note and sends it back, with what it saw.
+    let mut changed = note_bytes(1);
+    changed.extend_from_slice(&[0, 255, 13, 10, 0]);
+    let sent = door.upload(&token, "/notes/a.note", Some(&seen), &changed);
+    assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+    let answer = sent.json();
+    assert_eq!(answer["exit"], 0, "{answer}");
+    assert_eq!(answer["fingerprint"], print_of(&changed), "{answer}");
+    assert_eq!(answer["size"], changed.len(), "{answer}");
+    assert_eq!(door.root_bytes("/notes/a.note").unwrap(), changed);
+    let again = door.download(&token, "/notes/a.note");
+    assert_eq!(again.body, changed);
+    assert_eq!(
+        again.header("X-Orgthread-Fingerprint").unwrap(),
+        print_of(&changed)
+    );
+
+    // A new note, in a new folder, with a space and an umlaut in its name.
+    let new = "/notes/2026 Woche/Übung 1.note";
+    let sent = door.upload(&token, new, None, &note_bytes(9));
+    assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+    assert_eq!(door.root_bytes(new).unwrap(), note_bytes(9));
+    assert!(door.log().contains("\twritten\t"), "{}", door.log());
+    assert!(door.log().contains("\tdownloaded\t"), "{}", door.log());
+}
+
+#[test]
+fn paths_outside_the_named_folders_are_refused() {
+    let door = sync_door("sync-paths", &[]);
+    let token = door.pair();
+    for file in [
+        format!("{BOOK}/chapter-01.txt"),
+        PROGRESS_FILE.to_string(),
+        "/notes/../books/an-invented-book/chapter-01.txt".into(),
+        "/notes/./a.note".into(),
+        "/Notes/a.note".into(),
+        "notes/a.note".into(),
+        "/notes//a.note".into(),
+        "/notes/".into(),
+        "/notes/.trash/2026-11-25/a.note".into(),
+        "/notesx/a.note".into(),
+    ] {
+        let (code, text) = not_done(&door.download(&token, &file));
+        assert_eq!(code, 2, "{file}: {text}");
+        let (code, text) = not_done(&door.upload(&token, &file, None, b"x"));
+        assert_eq!(code, 2, "{file}: {text}");
+        let (refused, text) = door.call(
+            &token,
+            "trash",
+            json!({"file": file, "fingerprint": print_of(&note_bytes(1))}),
+        );
+        assert!(
+            refused && text.starts_with("exit code 2\n"),
+            "{file}: {text}"
+        );
+    }
+    assert_eq!(door.root_file(PROGRESS_FILE), PROGRESS, "unchanged");
+    assert!(!door.dir.join("root/notesx").exists());
+    assert!(!door.dir.join("root/notes/.trash").exists());
+    assert!(door.log().matches("\trefused\t").count() >= 30);
+    // A link inside the folder is never followed.
+    std::os::unix::fs::symlink(
+        door.dir.join("root/health"),
+        door.dir.join("root/notes/sneaky"),
+    )
+    .unwrap();
+    let (code, text) = not_done(&door.download(&token, "/notes/sneaky/invented-health.md"));
+    assert_eq!(code, 2, "{text}");
+    assert!(!text.contains("private"), "{text}");
+}
+
+#[test]
+fn a_file_over_the_limit_is_refused() {
+    let door = sync_door("sync-limit", &[("ORGTHREAD_DEVICE_FILE_MB", "1")]);
+    let token = door.pair();
+    let big: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(door.dir.join("root/notes/big.note"), &big).unwrap();
+    let (code, text) = not_done(&door.download(&token, "/notes/big.note"));
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("more than the limit of 1 MB"), "{text}");
+    let seen = print_of(&note_bytes(1));
+    let (code, text) = not_done(&door.upload(&token, "/notes/a.note", Some(&seen), &big));
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("more than the limit of 1 MB"), "{text}");
+    assert_eq!(door.root_bytes("/notes/a.note").unwrap(), note_bytes(1));
+    // Below the limit, the same door moves the file.
+    assert_eq!(door.download(&token, "/notes/a.note").status, 200);
+}
+
+#[test]
+fn the_day_cap_refuses_logs_and_pushes_once() {
+    let door = sync_door("sync-cap", &[("ORGTHREAD_DEVICE_CAP_MB_DAY", "1")]);
+    let token = door.pair();
+    let half: Vec<u8> = (0..600_000u32).map(|i| (i % 249) as u8).collect();
+    fs::write(door.dir.join("root/notes/half.note"), &half).unwrap();
+    assert_eq!(door.download(&token, "/notes/half.note").status, 200);
+    for _ in 0..2 {
+        let (code, text) = not_done(&door.download(&token, "/notes/half.note"));
+        assert_eq!(code, 2, "{text}");
+        assert!(text.contains("cap of 1 MB in 24 hours"), "{text}");
+    }
+    // Uploads count in the same cap.
+    let seen = print_of(&half);
+    let (code, text) = not_done(&door.upload(&token, "/notes/half.note", Some(&seen), &half));
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("cap of 1 MB"), "{text}");
+    // A small file still fits.
+    assert_eq!(door.download(&token, "/notes/a.note").status, 200);
+    assert_eq!(door.log().matches("\tcapped\t").count(), 3);
+    wait_for(|| door.notified().contains("downloads and uploads"));
+    std::thread::sleep(Duration::from_millis(200));
+    let notified = door.notified();
+    assert_eq!(
+        notified.matches("downloads and uploads until").count(),
+        1,
+        "one push an hour: {notified}"
+    );
+    assert!(!notified.contains("half.note"), "no path: {notified}");
+    // The cap of the reads is not touched.
+    let devices = fs::read_to_string(door.dir.join("state/devices.json")).unwrap();
+    let devices: Value = serde_json::from_str(&devices).unwrap();
+    assert_eq!(devices["tokens"][0]["reads"], json!([]), "{devices}");
+}
+
+#[test]
+fn upload_refuses_a_stale_fingerprint_and_a_file_it_did_not_see() {
+    let door = sync_door("sync-stale", &[]);
+    let token = door.pair();
+    // Another device changed the note since this one saw it.
+    let seen = print_of(&note_bytes(1));
+    fs::write(door.dir.join("root/notes/a.note"), note_bytes(5)).unwrap();
+    let (code, text) = not_done(&door.upload(&token, "/notes/a.note", Some(&seen), &note_bytes(7)));
+    assert_eq!(code, 4, "{text}");
+    assert!(text.contains("changed"), "{text}");
+    assert_eq!(door.root_bytes("/notes/a.note").unwrap(), note_bytes(5));
+    // With no fingerprint, a file that exists is never replaced.
+    let (code, text) = not_done(&door.upload(&token, "/notes/sub/b.note", None, &note_bytes(7)));
+    assert_eq!(code, 5, "{text}");
+    assert_eq!(door.root_bytes("/notes/sub/b.note").unwrap(), note_bytes(2));
+    // A file that is gone since the device saw it is not made again.
+    fs::remove_file(door.dir.join("root/notes/sub/b.note")).unwrap();
+    let seen = print_of(&note_bytes(2));
+    let (code, text) =
+        not_done(&door.upload(&token, "/notes/sub/b.note", Some(&seen), &note_bytes(7)));
+    assert_eq!(code, 6, "{text}");
+    assert!(door.root_bytes("/notes/sub/b.note").is_none());
+    // A fingerprint that is no fingerprint is wrong use.
+    let (code, _) = not_done(&door.upload(&token, "/notes/a.note", Some("abc"), &note_bytes(7)));
+    assert_eq!(code, 2);
+    // The right one works.
+    let seen = print_of(&note_bytes(5));
+    let sent = door.upload(&token, "/notes/a.note", Some(&seen), &note_bytes(7));
+    assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+}
+
+#[test]
+fn trash_moves_into_the_trash_of_the_day_and_never_over_a_file() {
+    let door = sync_door("sync-trash", &[]);
+    let token = door.pair();
+    let day = device::date_text(device::now());
+    let trash = door.dir.join(format!("root/notes/.trash/{day}"));
+    // A file of the same name went to the trash earlier that day.
+    fs::create_dir_all(trash.join("sub")).unwrap();
+    fs::write(trash.join("sub/b.note"), b"an earlier invented note").unwrap();
+    // A stale fingerprint moves nothing.
+    let (refused, text) = door.call(
+        &token,
+        "trash",
+        json!({"file": "/notes/sub/b.note", "fingerprint": print_of(b"other")}),
+    );
+    assert!(refused && text.starts_with("exit code 4\n"), "{text}");
+    assert_eq!(door.root_bytes("/notes/sub/b.note").unwrap(), note_bytes(2));
+    let (refused, text) = door.call(
+        &token,
+        "trash",
+        json!({"file": "/notes/sub/b.note", "fingerprint": print_of(&note_bytes(2))}),
+    );
+    assert!(!refused, "{text}");
+    assert!(
+        text.contains(&format!("notes/.trash/{day}/sub/b (2).note")),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&door.dir.display().to_string()),
+        "no disk path: {text}"
+    );
+    assert_eq!(
+        fs::read(trash.join("sub/b.note")).unwrap(),
+        b"an earlier invented note",
+        "the earlier file stays"
+    );
+    assert_eq!(
+        fs::read(trash.join("sub/b (2).note")).unwrap(),
+        note_bytes(2)
+    );
+    assert!(door.root_bytes("/notes/sub/b.note").is_none());
+    // A file directly in the folder goes to the top of the trash of the day.
+    let (refused, text) = door.call(
+        &token,
+        "trash",
+        json!({"file": "/notes/a.note", "fingerprint": print_of(&note_bytes(1))}),
+    );
+    assert!(!refused, "{text}");
+    assert_eq!(fs::read(trash.join("a.note")).unwrap(), note_bytes(1));
+    // No fingerprint is wrong use, and moves nothing.
+    let reply = door.mcp(
+        &token,
+        "tools/call",
+        json!({"name": "trash", "arguments": {"file": "/notes/x.note"}}),
+    );
+    assert!(reply.body.contains("-32602"), "{}", reply.body);
 }
